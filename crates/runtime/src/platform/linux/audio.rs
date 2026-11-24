@@ -1,5 +1,5 @@
 //! SDL3 playback (PipeWire/PulseAudio/ALSA according to the installed SDL driver). The shared
-//! mixer retains its bounded grain queues; this backend limits queued output to 20 ms.
+//! mixer retains its bounded grain queues; this backend keeps two device buffers queued.
 use sdl3::sys::audio::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 static READY: AtomicBool = AtomicBool::new(false);
@@ -48,6 +48,13 @@ impl Output {
         super::DEVICE_CHANNELS.store(channels as u32, Ordering::Relaxed);
         Ok(output)
     }
+    /// The device's buffer in sample frames (PipeWire's quantum, 1024 at 48 kHz by default).
+    fn device_frames(&self) -> usize {
+        let mut spec = SDL_AudioSpec { format: SDL_AUDIO_F32, channels: 0, freq: 0 };
+        let mut frames: core::ffi::c_int = 0;
+        let ok = unsafe { SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(self.0), &mut spec, &mut frames) };
+        if ok && frames > 0 { frames as usize } else { 1024 }
+    }
     fn queued(&self) -> Result<usize, String> {
         let bytes = unsafe { SDL_GetAudioStreamQueued(self.0) };
         if bytes < 0 { Err(sdl3::get_error().to_string()) } else { Ok(bytes as usize) }
@@ -63,11 +70,17 @@ pub fn run() -> Result<(), String> {
         let channels = (super::OUT_CHANNELS.load(Ordering::Relaxed) as usize).clamp(2, 8);
         let generation = super::DEVICE_GEN.load(Ordering::Relaxed);
         let output = Output::new(channels)?;
-        crate::info!("audio: SDL3 output, 48000 Hz, {channels} channels");
         let frames = 480;
+        // Keep at least two device buffers queued: the device takes a whole buffer at a time
+        // (PipeWire's 1024-frame quantum is 21 ms), and a queue shorter than that is padded
+        // with silence on every pull, which sounds choppy and robotic.
+        let device_frames = output.device_frames();
+        let target_frames = (device_frames * 2).max(frames * 4);
+        let target_bytes = target_frames * channels * std::mem::size_of::<f32>();
+        crate::info!("audio: SDL3 output, 48000 Hz, {channels} channels, device buffer {device_frames} frames, {:.1} ms queued", target_frames as f64 * 1000.0 / 48000.0);
         let mut buffer = vec![0f32; frames * channels];
         while super::OUT_CHANNELS.load(Ordering::Relaxed) as usize == channels && super::DEVICE_GEN.load(Ordering::Relaxed) == generation {
-            if output.queued()? < buffer.len() * 4 * 2 {
+            if output.queued()? < target_bytes {
                 super::mix_into(&mut buffer, frames, channels);
                 output.push(&buffer)?;
             } else { std::thread::sleep(std::time::Duration::from_millis(1)); }
