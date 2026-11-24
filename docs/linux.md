@@ -2,8 +2,9 @@
 
 Regaliant runs the decrypted PS5 executable natively on Linux x86-64, with Vulkan graphics
 and SDL3 windowing, input and audio. Tutorial gameplay, save resumption and window-close
-checks have passed automated tests. A full physical play session and the full shader tour
-still need testing. Performance varies by scene; steady 60 fps is not yet established.
+checks have passed automated tests. Players have confirmed keyboard/controller gameplay and
+in-game audio. Movie audio, fractional-scale presentation and the full shader tour still need
+verification after the latest fixes. Performance varies by scene; steady 60 fps is not yet established.
 
 ## Build and play
 
@@ -39,6 +40,15 @@ testing. Click the window to capture the mouse; F1 releases or recaptures it. Al
 switches between windowed and borderless fullscreen. Closing the window flushes completed
 saves and shader records before exiting. Quit through the game menu when possible; closing
 during a game save cannot guarantee an unfinished save completes.
+
+On a scaled Wayland display, the window now requests a high-density drawable: the swapchain
+uses physical pixels, while SDL mouse coordinates are converted to match the UI. Both windowed
+and borderless modes follow compositor scaling. On a 3840×2160 screen, use **PC → Render Scale →
+100%** for native 4K rendering; **Visual Mode** keeps the title's usual 2560×1440 render size.
+The separate Resolution/Refresh Rate controls do not change Linux desktop modes; choose the
+monitor mode in your compositor. A 4K swapchain alone does not mean the game renders at 4K.
+Logs report logical and drawable sizes after resize/scale changes. Fractional-scale presentation
+still needs a physical-display check after this change.
 
 ## Files and diagnostics
 
@@ -80,14 +90,29 @@ relocation choices do not change that location on Linux.
 ## Prepare shaders
 
 ```sh
-target/release/dsport --app /path/to/PPSA01341-app0 --prepare-shaders 4
+python3 scripts/linux-prepare-shaders.py --app /path/to/PPSA01341-app0
 ```
 
-This runs hidden and silent with an isolated save: new game, compute preparation and the
-shared Windows multi-level self-play tour. It does not use or overwrite player saves. Four is
-the compiler thread count (1–64). The default time limit is four hours; add
-`--prepare-seconds 600` for a bounded attempt. Ctrl+C stops the current child and keeps progress.
-Run the same command to resume. Exit 12 means paused, not fully prepared.
+This runs the full multi-level tour hidden and silent, using an isolated save. It never uses or
+replaces your player saves. It uses eight allowed logical CPUs (preferring performance cores),
+nice 10, two shader compiler workers, and a 30 fps cap. The thermal guard pauses above 95 °C,
+resumes below 85 °C, and stops if cooling takes longer than 60 seconds. Missing temperature
+sensors stop the command. `DS_RELAY_CPUS` and `DS_COMPILE_WORKERS` adjust CPU limits; the relay
+thermal variables below also apply. Monitor records are fsynced under
+`local-data/linux-port/shader-preparation/`.
+
+Allow roughly an hour on a fast, unrestricted PC; with these CPU limits and cooling pauses,
+several hours may be needed. The full Linux tour has not yet been timed. Each attempt stops
+after four hours by default; `--seconds 600` makes a ten-minute attempt. Ctrl+C stops the
+children and preserves progress. Repeat the same command to resume. Exit 12 means paused;
+exit 75 means the guard stopped it. Do not run preparation while playing.
+
+Preparation uses the same XDG shader store and translation overrides as normal play, including
+`DS_PLAIN_MODES` and `DS_MAX_RECONV` from the environment or your settings folder's
+`diagnostics.txt`. Use the same environment for both commands. Changing translation settings or
+PC graphics settings restarts shader stages while retaining the isolated save. New effects and
+variants can still compile during play. The direct `--prepare-shaders N` runtime option remains
+available, but does not itself provide CPU affinity or a thermal guard.
 
 Progress, logs and checkpoints are in `prepare/linux-full` under the cache directory. A
 checkpoint is not proof of visual correctness. The full Linux tour remains unverified.
@@ -203,9 +228,52 @@ install stable and the Windows GNU target using those environment variables.
   Windows priority/power controls, hardware watchpoints and cross-thread stack sampling.
 - Windows save relocation, custom themed cursor, full IME composition/bidirectional shaping
   and font fallback. Basic character-name entry is implemented.
-- Full-tour preparation, physical input/audio playtesting and long-session stability.
+- Full-tour preparation, broader controller/audio hardware coverage and long-session stability.
 
 The platform layer leaves host FS/TLS intact and patches supported guest FS accesses to GS.
 Signal handlers use alternate stacks and avoid allocator/logger/mutex/Vulkan calls on direct
 recovery. Shutdown persists completed saves and shader records, then ends process-lifetime
 workers with `_exit`; it is not a reusable in-process renderer teardown.
+
+## Resolution and combat-UI diagnostics
+
+Linux NVIDIA devices now retain the subgroup translation modes; maximal reconvergence is off
+by default with them. This fixes the reported Blackwell rainbow-speck scene. Windows keeps its
+upstream device policy. `DS_PLAIN_MODES` and `DS_MAX_RECONV` remain explicit overrides, including
+in shader preparation.
+
+Render Scale **100%** on a 4K display renders the scene at 3840×2160. Choose **Visual Mode** for
+the title's usual 2560×1440 scene while keeping the sharp 4K swapchain and UI. The runtime logs
+the actual render-size changes; a message saying “the mode's was 2560x1440” describes the size
+being replaced, not the active size. Comparing 4K fullscreen with 1440p offscreen is not a
+regression measurement. First-use shader compilation can also dominate short FPS averages.
+
+For a controlled relay, export `DS_GAME_DIR`, `DS_RELAY_SAVE_SEED` (an isolated snapshot containing
+`saves/`) and `DS_RELAY_SHADER_SEED`. Build first, then run one case at a time:
+
+```sh
+python3 scripts/linux-playtest.py --case 1440
+python3 scripts/linux-playtest.py --case 4k
+```
+
+Each case opens a visible fullscreen window, uses null audio and scripted input, and runs for
+at most 180 seconds (timeout 210). Both use the same copied save, a 4K-capable drawable, and an
+explicit guest render size. They retain the thermal guard, eight-CPU placement and two compile
+workers. `--repeat 2` reuses the first run's caches. `--pipeline-cache --repeat 2` compares the
+ordinary Vulkan pipeline cache when the driver refuses stored KHR pipeline binaries; this is
+an experiment, not the play default. Output is under `local-data/linux-port/playtest/`.
+Read per-session `metrics.json`, `thread-summary.txt`, `waits-*/wait-summary.txt`, presentation
+percentiles and the runtime's `pipeline-reuse.json`. No GPU timestamps or validation are enabled
+in these timing cases. A thermal pause invalidates a measurement.
+
+`--case diagnostic` instead runs offscreen, capped at 30 fps, for at most 300 seconds (timeout
+330). It traces clear-metadata writes/bindings and dumps two gameplay frames' target images and
+command descriptions around a camera move after the scripted movement. These readbacks
+invalidate timings. The save must put a visible enemy nearby to reproduce floating health
+bars; the script does not assert that combat happened. Inspect `ui-clear-probe-*` PNGs,
+`capture-*.txt`, `targets-*/stats.txt` and the `trace clears` lines. The attachment-cache
+invalidation fix has a CPU clear-routing regression test; whether it resolves the reported
+combat trail still needs this GPU check. It does not clear targets unconditionally each frame.
+
+`python3 scripts/linux-session-report.py /path/to/dsport.log` summarizes an existing log without
+modifying it. Hitch spans overlap across threads and cannot establish a per-thread CPU profile.

@@ -231,6 +231,18 @@ fn ensure(streams: &mut Vec<Stream>, id: usize) {
     }
 }
 
+// SDL pulls in device-sized bursts, unlike a steady one-grain consumer. V1 movie ports
+// must hold a complete refill plus one mix chunk while their producer is waking up.
+#[cfg(target_os = "linux")]
+static LEGACY_BUFFER_FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2528);
+
+pub fn legacy_queue_depth(grain_frames: usize) -> usize {
+    #[cfg(windows)]
+    { let _ = grain_frames; 3 }
+    #[cfg(target_os = "linux")]
+    { LEGACY_BUFFER_FRAMES.load(Ordering::Relaxed).div_ceil(grain_frames.max(1)).max(3) }
+}
+
 /// Queues one stereo interleaved grain on stream `id`, blocking while the
 /// stream already holds `depth` grains.
 pub fn push_stream(id: usize, grain: Vec<f32>, depth: usize) {
@@ -488,3 +500,30 @@ mod host;
 mod host;
 #[cfg(target_os = "linux")]
 pub use host::{initialize, smoke_test};
+
+#[cfg(all(test, target_os = "linux"))]
+mod movie_tests {
+    // The actual v1 queue and mixer, with no output device or sleeps. A 1024-frame device
+    // consumption causes up to three 480-frame mixes before Bink's producer runs again.
+    #[test]
+    fn movie_grains_survive_device_refill_bursts() {
+        // Initialize only the queue: a real/null output thread would race our synthetic clock.
+        assert!(super::MIXER.set(super::Mixer { streams: parking_lot::Mutex::new(Vec::new()), cv: parking_lot::Condvar::new() }).is_ok());
+        let id = super::new_stream();
+        let depth = super::legacy_queue_depth(256);
+        let mut out = [0.0; 960];
+        for _ in 0..100 {
+            while super::queued_grains(id) < depth {
+                super::push_stream(id, vec![0.25; 512], depth);
+            }
+            for _ in 0..3 {
+                super::mix_into(&mut out, 480, 2);
+                assert!(out.iter().all(|v| *v == 0.25));
+            }
+        }
+        let mut streams = super::mixer().streams.lock();
+        assert_eq!(streams[id].dry_frames, 0);
+        eprintln!("movie queue: 100 device refill bursts, 144000 frames, depth={depth}, gaps={} frames", streams[id].dry_frames);
+        streams[id] = super::Stream::default();
+    }
+}

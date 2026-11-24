@@ -34,6 +34,32 @@ A Windows GPU reproduction was not obtained, so this is not claimed to be a Linu
 The translation store is keyed by `rdna::SOURCE_HASH` and serialized specialization modes.
 Pipeline binaries also validate the driver key and translated SPIR-V fingerprint. The latter
 now salts maximal reconvergence with `0x4d524331`, preventing reuse across declaration changes.
-Blackwell, AMD and Intel use upstream's portable compute modes by default; RTX 40 retains the
-previous checked specializations. Linux preparation checkpoints include this policy revision,
+Windows Blackwell, AMD and Intel use upstream's portable compute modes by default; Linux
+NVIDIA now retains the checked subgroup specializations on all designs. Linux preparation checkpoints include this policy revision,
 so an old completed tour does not incorrectly skip rebuilding changed pipelines.
+
+## Portable-mode artifacts on Linux
+
+A later Blackwell Linux play test reported rainbow geometry with portable modes and maximal
+reconvergence enabled; earlier subgroup-mode captures rendered the tutorial correctly. This
+is distinct from the NaN classifier bug. The reported device has fixed 32-lane subgroups, so
+an unexpectedly selected 64-lane Vulkan subgroup does not explain that report. No
+Windows-only translation branches were found. Portable mode instead selects the wave-mask /
+workgroup-LDS synchronization paths described in `rdna/src/translate/mod.rs`; the checked
+specializations can avoid those paths. A driver/control-flow failure is a hypothesis, not a
+confirmed diagnosis.
+
+The startup log now records the **effective** portable/reconvergence policy, including explicit
+overrides; the older device-policy line alone describes defaults. `Spec::hash` includes
+per-lane, lane-vote, no-lockstep, subgroup-wave and append modes. Compute and graphics pipeline
+loads validate translated-code fingerprints, including the maximal-reconvergence salt.
+Preparation previously dropped the player's overrides; it now passes them to its children and
+includes them and PC graphics settings in its checkpoint identity. This prevents a preparation
+run from claiming completion for different player settings, without deleting compatible caches.
+
+For a controlled comparison, use `DS_PLAIN_MODES=0 DS_MAX_RECONV=0` for both preparation and
+play. If that fixes the scene, comparing `1/0` and `0/1` separately distinguishes the translation
+path from the reconvergence declaration. Keep the Windows policy unchanged until there is GPU
+evidence; shader caches need not be deleted for this comparison. The comparison confirmed correct rendering with subgroup modes and rainbow artifacts with
+portable modes on Linux Blackwell; Linux NVIDIA now defaults to subgroup modes with maximal
+reconvergence off. The exact translator/driver failure within the portable path is still unknown. The arithmetic NaN tests remain required in every mode.

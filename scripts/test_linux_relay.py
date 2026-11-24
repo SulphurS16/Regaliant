@@ -167,7 +167,9 @@ class Accounting(unittest.TestCase):
         self.assertEqual(relay.session_environment({}, 'present-validation')['DS_VK_VALIDATION'], '1')
         old = relay.session_environment({}, 'sparse-original')
         new = relay.session_environment({}, 'mprotect-1')
-        self.assertEqual({k for k in old if old[k] != new[k]}, {'DS_LINUX_COALESCE_SPARSE'})
+        self.assertEqual(old['DS_LINUX_COALESCE_SPARSE'], '0')
+        self.assertEqual(new['DS_LINUX_COALESCE_SPARSE'], '0')
+        self.assertEqual(relay.session_environment({'DS_LINUX_COALESCE_SPARSE':'1'}, 'present-fifo')['DS_LINUX_COALESCE_SPARSE'], '0')
 
     def test_pipeline_reuse_uses_actual_hits_and_interval_deltas(self):
         with tempfile.TemporaryDirectory() as tmp:

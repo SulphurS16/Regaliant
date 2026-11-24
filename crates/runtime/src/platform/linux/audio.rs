@@ -53,7 +53,9 @@ impl Output {
         let mut spec = SDL_AudioSpec { format: SDL_AUDIO_F32, channels: 0, freq: 0 };
         let mut frames: core::ffi::c_int = 0;
         let ok = unsafe { SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(self.0), &mut spec, &mut frames) };
-        if ok && frames > 0 { frames as usize } else { 1024 }
+        // SDL_GetAudioStreamQueued is in input (48 kHz) frames, while the device can
+        // negotiate e.g. 44.1 kHz. Convert the quantum before sizing either queue.
+        if ok && frames > 0 && spec.freq > 0 { (frames as usize * 48000).div_ceil(spec.freq as usize) } else { 1024 }
     }
     fn queued(&self) -> Result<usize, String> {
         let bytes = unsafe { SDL_GetAudioStreamQueued(self.0) };
@@ -76,6 +78,7 @@ pub fn run() -> Result<(), String> {
         // with silence on every pull, which sounds choppy and robotic.
         let device_frames = output.device_frames();
         let target_frames = (device_frames * 2).max(frames * 4);
+        super::LEGACY_BUFFER_FRAMES.store(target_frames + frames, Ordering::Relaxed);
         let target_bytes = target_frames * channels * std::mem::size_of::<f32>();
         crate::info!("audio: SDL3 output, 48000 Hz, {channels} channels, device buffer {device_frames} frames, {:.1} ms queued", target_frames as f64 * 1000.0 / 48000.0);
         let mut buffer = vec![0f32; frames * channels];

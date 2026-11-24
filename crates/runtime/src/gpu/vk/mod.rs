@@ -2349,8 +2349,8 @@ mod validation_switch_tests {
     fn subgroup_policy_includes_blackwell_boundary() {
         assert!(super::modes_checked_on(0x10de, 0x2684));
         assert!(super::modes_checked_on(0x10de, 0x2b7f));
-        assert!(!super::modes_checked_on(0x10de, 0x2b80));
-        assert!(!super::modes_checked_on(0x10de, 0x2bb1));
+        assert_eq!(super::modes_checked_on(0x10de, 0x2b80), cfg!(target_os = "linux"));
+        assert_eq!(super::modes_checked_on(0x10de, 0x2bb1), cfg!(target_os = "linux"));
         assert!(!super::modes_checked_on(0x1002, 0x744c));
         assert!(!super::modes_checked_on(0x8086, 0x56a0));
     }

@@ -76,6 +76,8 @@ pub fn reuse_report() -> serde_json::Value {
         "captured":PB[3].load(Ordering::Relaxed), "capture_failed":PB[6].load(Ordering::Relaxed),
         "source_create_calls":SOURCE_CALLS.load(Ordering::Relaxed), "source_create_ms":SOURCE_NS.load(Ordering::Relaxed) as f64/1e6,
         "binary_total_ms":PB[1].load(Ordering::Relaxed) as f64/1e6,
+        "cache_create_calls":LAPS[7].load(Ordering::Relaxed), "cache_create_ms":LAPS[2].load(Ordering::Relaxed) as f64/1e6,
+        "cache_file_hits":STATS[0].load(Ordering::Relaxed), "cache_files_written":STATS[1].load(Ordering::Relaxed),
         "store":DIR.get(), "identity":IDENTITY.get(), "events":&*PB_EVENTS.lock(),
         "note":"Source creates may hit driver caches. Binary hits bypass shader compilation but still instantiate Vulkan objects. Events capped at256."})
 }

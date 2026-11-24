@@ -1322,6 +1322,30 @@ impl Play {
             self.shot(&format!("movement-pass-{pass}-after"));
             self.relay_capture_barrier()?;
         }
+        if std::env::var("DS_RELAY_UI_PROBE").ok().as_deref() == Some("1") {
+            // Separate diagnostic session only: target readbacks and clear tracing invalidate
+            // timings. Two captures bracket a camera move; no user input is consumed.
+            struct Trace;
+            impl Drop for Trace { fn drop(&mut self) { crate::gpu::images::CLEAR_PROBE.store(false, Relaxed); } }
+            let _trace = Trace;
+            crate::gpu::images::CLEAR_PROBE.store(true, Relaxed);
+            for frame in 0..2 {
+                self.step(&format!("ui-clear-probe-{frame}-begin"));
+                crate::info!("UI clear probe metadata:\n{}", crate::gpu::images::with(|im| im.meta_report()).join("\n"));
+                let before = crate::gpu::capture::completed_flip();
+                crate::gpu::capture::arm_next();
+                let start = Instant::now();
+                while crate::gpu::capture::completed_flip() == before && start.elapsed() < Duration::from_secs(90) {
+                    self.check_stop()?;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if crate::gpu::capture::completed_flip() == before { return Err(End::Failed("UI target capture timed out".into())); }
+                self.shot(&format!("ui-clear-probe-{frame}-end"));
+                crate::info!("UI clear probe completed frame {frame}");
+                self.press("rs_right", 200);
+                self.sleep(0.3)?;
+            }
+        }
         if std::env::var("DS_RELAY_SHORT").ok().as_deref() != Some("1") { self.menu()?; }
         self.sleep(1.0)
     }

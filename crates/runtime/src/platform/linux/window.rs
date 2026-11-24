@@ -38,7 +38,7 @@ impl State {
         // SDL's default selects the available compositor backend; SDL_VIDEO_DRIVER can force
         // wayland or x11. No protocol code, mouse grab or focus request lives in this backend.
         let mut builder = video.window(title, width, height);
-        builder.vulkan().resizable();
+        builder.vulkan().resizable().high_pixel_density();
         if hidden {
             builder.hidden();
         }
@@ -105,7 +105,13 @@ impl State {
                     win_event: WindowEvent::FocusGained,
                     ..
                 } => self.focused = true,
-                Event::Window { win_event: WindowEvent::DisplayChanged(_), .. } => note_display(&self.window),
+                Event::Window { win_event: WindowEvent::DisplayChanged(_), .. } => {
+                    note_display(&self.window);
+                    RESIZED.store(true, Ordering::Release);
+                }
+                Event::Window { win_event: WindowEvent::PixelSizeChanged(_, _), .. } => {
+                    RESIZED.store(true, Ordering::Release);
+                }
                 Event::TextInput { text, .. } => {
                     for c in text.encode_utf16() {
                         crate::hle::libs::ime_dialog::char_typed(c, false, 0);
@@ -187,8 +193,9 @@ impl State {
                     self.input.relative.1 += yrel;
                     if !CAPTURED.load(Ordering::Relaxed) {
                         use crate::pcsettings::pointer::{CLIENT_X, CLIENT_Y, MOVES};
-                        CLIENT_X.store(x as i32, Ordering::Relaxed);
-                        CLIENT_Y.store(y as i32, Ordering::Relaxed);
+                        let (px, py) = pointer_pixels_at((x, y), self.window.size(), self.window.size_in_pixels());
+                        CLIENT_X.store(px, Ordering::Relaxed);
+                        CLIENT_Y.store(py, Ordering::Relaxed);
                         MOVES.fetch_add(1, Ordering::Relaxed);
                         crate::input::note_device(crate::input::DEVICE_KBM);
                     }
@@ -348,6 +355,7 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
         let state = State::new(hidden, title, width, height)?;
         note_display(&state.window);
         let (w, h) = state.window.size_in_pixels();
+        crate::info!("SDL drawable: logical {:?}, pixels {w}x{h} (high pixel density enabled)", state.window.size());
         CLIENT_W.store(w, Ordering::Relaxed);
         CLIENT_H.store(h, Ordering::Relaxed);
         let hwnd = state.window.raw() as isize;
@@ -422,12 +430,6 @@ pub fn poll() -> bool {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(s) = s.as_mut() else { return false };
-        let (w, h) = s.window.size_in_pixels();
-        let width_changed = CLIENT_W.swap(w, Ordering::Relaxed) != w;
-        let height_changed = CLIENT_H.swap(h, Ordering::Relaxed) != h;
-        if width_changed || height_changed {
-            RESIZED.store(true, Ordering::Release);
-        }
         let requested = REQUESTED_MODE.load(Ordering::Relaxed);
         if !s.hidden && requested != APPLIED_MODE.load(Ordering::Relaxed) {
             match s.window.set_fullscreen(requested != 0) {
@@ -444,6 +446,17 @@ pub fn poll() -> bool {
             }
         }
         let open = s.poll();
+        // Query after pumping: SDL applies fractional scale/pixel-size changes here, including
+        // display-scale events not exposed by this version of the Rust event wrapper.
+        let (w, h) = s.window.size_in_pixels();
+        let width_changed = CLIENT_W.swap(w, Ordering::Relaxed) != w;
+        let height_changed = CLIENT_H.swap(h, Ordering::Relaxed) != h;
+        if width_changed || height_changed {
+            RESIZED.store(true, Ordering::Release);
+        }
+        if width_changed || height_changed {
+            crate::info!("SDL drawable: logical {:?}, pixels {w}x{h}", s.window.size());
+        }
         if !open {
             CLOSED.store(true, Ordering::Release);
         }
@@ -632,5 +645,21 @@ mod tests {
         assert!(key_down(b'W') && key_down(0x10) && key_down(0x12));
         assert_eq!(MOUSE_BUTTONS.load(Ordering::Relaxed), 1);
         publish(&Input::default(), false);
+    }
+}
+
+/// SDL pointer events are logical; the UI letterbox calculation uses drawable pixels.
+fn pointer_pixels_at((x, y): (f32, f32), (w, h): (u32, u32), (pw, ph): (u32, u32)) -> (i32, i32) {
+    ((x * pw as f32 / w.max(1) as f32).round() as i32,
+     (y * ph as f32 / h.max(1) as f32).round() as i32)
+}
+
+#[cfg(test)]
+mod hidpi_tests {
+    #[test]
+    fn fractional_pointer_matches_drawable() {
+        assert_eq!(super::pointer_pixels_at((1200.0, 675.0), (2400, 1350), (3840, 2160)), (1920, 1080));
+        assert_eq!(super::pointer_pixels_at((100.0, 50.0), (1100, 760), (1760, 1216)), (160, 80));
+        assert_eq!(super::pointer_pixels_at((100.0, 50.0), (1100, 760), (1100, 760)), (100, 50));
     }
 }

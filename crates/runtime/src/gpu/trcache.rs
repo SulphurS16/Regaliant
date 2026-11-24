@@ -24,7 +24,7 @@ const MAGIC: &[u8; 8] = b"DSTRANS4";
 
 /// Environment switches the translator reads (`rdna`; the dumps write files
 /// while translating): any of them set keeps the store off.
-const TRANSLATOR_ENV: [&str; 17] = [
+pub(crate) const TRANSLATOR_ENV: [&str; 17] = [
     "DS_EXEC_PARTIAL",
     "DS_LOOP_LIMIT",
     "DS_LOCKSTEP",

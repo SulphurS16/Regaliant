@@ -53,7 +53,7 @@ impl Frontend {
         // SDL's default selects the available compositor backend; SDL_VIDEO_DRIVER can force
         // wayland or x11. No protocol code, mouse grab or focus request lives in this backend.
         let mut builder = video.window("Regaliant — Linux bootstrap", 1280, 720);
-        builder.vulkan().resizable();
+        builder.vulkan().resizable().high_pixel_density();
         if hidden { builder.hidden(); }
         let window = builder.build().map_err(|e| e.to_string())?;
         let extensions: Vec<_> = window.vulkan_instance_extensions().map_err(|e| e.to_string())?.iter()

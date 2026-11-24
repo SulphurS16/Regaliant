@@ -185,7 +185,7 @@ def session_environment(inherited, profile):
         'DS_NAN_PROBE', 'DS_NAN_EARLY', 'DS_PROFILE_GPU', 'DS_PROFILE_GPU_STAMPS',
         'DS_BATCH_STAMPS', 'DS_CAPTURE_CODE', 'DS_CAPTURE_TARGETS_FRAME', 'DS_RELAY_TARGETS',
         'DS_CULLREAD_DIAG', 'DS_RECORD_PROFILE', 'DS_STEP_LAPS', 'DS_OP_CENSUS', 'DS_WW_CENSUS', 'DS_RELAY_CPU_PROFILE', 'DS_LINUX_FAULT_TIMING', 'DS_LINUX_INTERVAL_SHOTS', 'DS_SCREENSHOT')})
-    env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_VK_VALIDATION='1', DS_LINUX_VOLATILE_BACKOFF='0', DS_LINUX_WRITE_WATCH='mprotect', DS_LINUX_VBLANK_GRID='0', DS_FRAME_STALLS='1', DS_LINUX_COALESCE_SPARSE='1', DS_RELAY_CLOSE_WINDOW='0', DS_WINDOW_SHOT='0')
+    env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_VK_VALIDATION='1', DS_LINUX_VOLATILE_BACKOFF='0', DS_LINUX_WRITE_WATCH='mprotect', DS_LINUX_VBLANK_GRID='0', DS_FRAME_STALLS='1', DS_LINUX_COALESCE_SPARSE='0', DS_RELAY_CLOSE_WINDOW='0', DS_WINDOW_SHOT='0')
     if profile in ('clean', 'warm', 'legacy'):
         env.update(DS_RELAY_GAMEPLAY_SECONDS='60', DS_VK_VALIDATION='0')
     elif profile == 'gpu-timing':
@@ -254,13 +254,18 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     run.mkdir()
     env = session_environment(os.environ, profile)
     env['DS_LINUX_SHADER_CACHE'] = str(cache)
-    env.update(DS_LINUX_HIDDEN='1' if mode == 'offscreen' else '0', DS_LINUX_WINDOW_SIZE='800x450')
+    env.update(DS_LINUX_HIDDEN='1' if mode == 'offscreen' else '0', DS_LINUX_WINDOW_SIZE=env.get('DS_RELAY_WINDOW_SIZE', '800x450'))
+    if env.get('DS_RELAY_RENDER_SIZE'): env['DS_RENDER_SIZE'] = env['DS_RELAY_RENDER_SIZE']
+    if env.get('DS_RELAY_UI_PROBE') == '1':
+        env.update(DS_CAPTURE_TARGETS_FRAME='1', DS_CAPTURE_CODE='1', DS_VK_VALIDATION='0', DS_RELAY_CLOSE_WINDOW='0')
     gentle = env.get('DS_RELAY_FULL', '0') != '1'
     env['DS_RELAY_FPS_LIMIT'] = '0' if profile_kind(profile) in ('clean', 'present') else '30'
     if run.name == 'seed-newgame': env['DS_RELAY_FPS_LIMIT'] = '30'
     if gentle:
         env.update(DS_RELAY_GAMEPLAY_SECONDS='30', DS_RELAY_SHORT='1')
         if mode == 'offscreen': env['DS_RELAY_IDLE_COMPARE'] = '1'
+    if env.get('DS_RELAY_UI_PROBE') == '1':
+        env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_RELAY_IDLE_COMPARE='0', DS_RELAY_FPS_LIMIT='30')
     driver_cache = driver_cache or run.parent/('driver-'+profile.replace('warm', 'clean'))
     driver_cache.mkdir(exist_ok=True)
     for name in ('mesa', 'nvidia', 'cuda'): (driver_cache/name).mkdir(exist_ok=True)
@@ -402,6 +407,12 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     metrics['effective_validation'] = effective_validation(text)
     metrics['measurement_valid'] = profile_kind(profile) in ('clean', 'legacy', 'present') and 'flips_per_second' in metrics and metrics['effective_validation'] is False and metrics['thermal']['measurement_valid'] and code == 0
     if not metrics['thermal']['measurement_valid'] or profile_kind(profile) not in ('clean', 'legacy', 'present'):
+        for key in list(metrics):
+            if key.endswith(('_per_second', '_per_flip')): del metrics[key]
+    if env.get('DS_RELAY_UI_PROBE') == '1':
+        metrics['measurement_valid'] = False
+        metrics['ui_probe'] = True
+        metrics['ui_probe_complete'] = all(f'UI clear probe completed frame {i}' in text for i in range(2))
         for key in list(metrics):
             if key.endswith(('_per_second', '_per_flip')): del metrics[key]
     metrics['nan_probe'] = linux_nan_summary.summarize(run)

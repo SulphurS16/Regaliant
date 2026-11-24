@@ -107,6 +107,25 @@ pub fn validate_child(root: &Path, paths: &dsconfig::paths::Paths) -> Result<(),
     Ok(())
 }
 
+// Keep player translation choices through the isolated child environment. The parent has
+// already applied diagnostics.txt, with explicit environment variables taking precedence.
+const POLICY_ENV: &[&str] = &[
+    "DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "DS_SG_APPENDS",
+    "DS_MARKS_PART", "DS_IMG_DIM_INST", "DS_FMT_SEED", "DS_FMT_RT_ONLY",
+    "DS_SUBGROUP32", "DS_BARY_GS", "DS_GPU_COMPAT", "DS_OUTPUT_SIZE", "DS_RENDER_SIZE",
+];
+fn policy_switch(key: &str) -> bool {
+    POLICY_ENV.contains(&key) || crate::gpu::trcache::TRANSLATOR_ENV.contains(&key) || key.starts_with("RDNA_")
+}
+fn policy_identity(mut switches: Vec<(String, String)>, settings: &str, display: &[u8]) -> Result<String, String> {
+    switches.retain(|(k, _)| policy_switch(k));
+    switches.sort();
+    let bytes = serde_json::to_vec(&(rdna::SOURCE_HASH, "portable-modes-mrc1", switches, settings, display)).map_err(|e| e.to_string())?;
+    let mut hash = dsconfig::sha::Sha256::new().map_err(|e| e.to_string())?;
+    hash.update(&bytes).map_err(|e| e.to_string())?;
+    Ok(dsconfig::sha::hex(&hash.finish().map_err(|e| e.to_string())?))
+}
+
 pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
     let game = dsconfig::game::check(app).map_err(|e| e.to_string())?;
     super::files::protect_game(&game.app).map_err(|e| e.to_string())?;
@@ -125,18 +144,20 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
     for name in ["user", "tmp", "driver", "xdg-cache", "xdg-data", "xdg-config", "xdg-state"] {
         std::fs::create_dir_all(root.join(name)).map_err(|e| e.to_string())?;
     }
-    let translation = format!("{}:portable-modes-mrc1", rdna::SOURCE_HASH);
+    // Refresh copied graphics settings on resume too. Save paths/import requests never cross
+    // into the isolated save; changing graphics choices replays shader stages, not new game.
+    let settings = std::fs::read_to_string(paths.settings_file()).unwrap_or_default();
+    let settings = settings.lines().filter(|l| !l.trim_start().starts_with("Setting_PC_SaveFolder") && !l.trim_start().starts_with("Setting_PC_ImportSaves")).collect::<Vec<_>>().join("\n");
+    let display = std::fs::read(paths.display_file()).unwrap_or_default();
+    let translation = policy_identity(std::env::vars().collect(), &settings, &display)?;
+    atomic_write(&user.join("pcsettings.txt"), settings.as_bytes())?;
+    atomic_write(&user.join("display.txt"), &display)?;
+    println!("Preparation policy {translation}; shared shaders {}", shaders.display());
     let selection = ["DS_PREPARE_LEVELS", "DS_PREPARE_TOUR"].map(|k| std::env::var(k).unwrap_or_default()).join(";");
     let limited = selection != ";";
     let mut state = if root.join("state.json").exists() {
         serde_json::from_slice::<State>(&std::fs::read(root.join("state.json")).map_err(|e| e.to_string())?).map_err(|e| format!("preparation state: {e}"))?
     } else {
-        // Copy settings only, never a player's saves or save-folder redirection.
-        if let Ok(t) = std::fs::read_to_string(paths.settings_file()) {
-            let t = t.lines().filter(|l| !l.trim_start().starts_with("Setting_PC_SaveFolder") && !l.trim_start().starts_with("Setting_PC_ImportSaves")).collect::<Vec<_>>().join("\n");
-            atomic_write(&user.join("pcsettings.txt"), t.as_bytes())?;
-        }
-        if let Ok(b) = std::fs::read(paths.display_file()) { atomic_write(&user.join("display.txt"), &b)?; }
         let mut completed = Vec::new();
         // Development relay only: a copy of its immutable tutorial seed, never player data.
         if let Some(seed) = std::env::var_os("DS_PREPARE_SEED") {
@@ -185,7 +206,7 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
             let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
             let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
             for (k, _) in std::env::vars_os() {
-                if k.to_string_lossy().starts_with("DS_") && !["DS_PREPARE_LEVELS", "DS_PREPARE_TOUR", "DS_PREPARE_SHOTS", "DS_READONLY_ROOTS", "DS_COMPILE_WORKERS", "DS_COMPILE_AHEAD", "DS_PRECOMPILE_WORKERS", "DS_ASYNC_GFX_WORKERS", "DS_RELAY_FPS_LIMIT", "DS_RELAY_STOP_FILE"].contains(&k.to_string_lossy().as_ref()) { cmd.env_remove(k); }
+                if k.to_string_lossy().starts_with("DS_") && !policy_switch(&k.to_string_lossy()) && !["DS_PREPARE_LEVELS", "DS_PREPARE_TOUR", "DS_PREPARE_SHOTS", "DS_READONLY_ROOTS", "DS_COMPILE_WORKERS", "DS_COMPILE_AHEAD", "DS_PRECOMPILE_WORKERS", "DS_ASYNC_GFX_WORKERS", "DS_RELAY_FPS_LIMIT", "DS_RELAY_STOP_FILE"].contains(&k.to_string_lossy().as_ref()) { cmd.env_remove(k); }
             }
             cmd.args([std::ffi::OsStr::new("--app"), game.app.as_os_str()]).arg("--offscreen")
                 .env("DSPORT_HOME", &user).env("DS_LINUX_SHADER_CACHE", &shaders)
@@ -252,6 +273,16 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preparation_identity_tracks_player_translation_and_settings() {
+        let base = policy_identity(vec![], "", b"").unwrap();
+        for k in ["DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "RDNA_LANE_GUARDS"] {
+            assert!(policy_switch(k));
+            assert_ne!(base, policy_identity(vec![(k.into(), "0".into())], "", b"").unwrap());
+        }
+        assert_eq!(base, policy_identity(vec![("DS_COMPILE_WORKERS".into(), "2".into())], "", b"").unwrap());
+        assert_ne!(base, policy_identity(vec![], "Setting_PC_RenderScale=5", b"").unwrap());
+    }
     #[test]
     fn child_failure_timeout_and_success() {
         let stop = std::env::temp_dir().join(format!("regaliant-prepare-test-{}.stop", std::process::id()));

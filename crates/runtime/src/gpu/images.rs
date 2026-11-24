@@ -85,9 +85,10 @@ static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// `DS_TRACE_CLEARS=1` (diagnosis): fast clears made pending and applied, with the flip and
 /// thread (`trace clears` lines).
+pub(crate) static CLEAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn trace_clears() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
+    CLEAR_PROBE.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
 }
 
 /// A pending fast clear: its metadata address, the value a fill gave it (None: a write of
@@ -200,6 +201,40 @@ mod clear_tests {
 
     fn key(base: u64) -> ImageKey {
         ImageKey { base, format: vk::Format::R8_UNORM, width: 512, height: 512, layers: 1, levels: 1, ty3d: false, cube: false }
+    }
+
+    #[test]
+    fn fractional_ui_clear_after_metadata_rebind() {
+        // CPU offscreen model: 240x135 logical at 1.6 density, two moving UI rectangles.
+        // Vulkan is deliberately not needed; exercise the real attachment memo invalidation
+        // and pending-clear routing. Merely repainting the new rectangle leaves a trail.
+        let mut a = key(0x1000); a.width = 384; a.height = 216;
+        let mut b = a; b.width = 240; b.height = 135;
+        let surface = Surface { base: a.base, format: a.format, width: a.width, height: a.height,
+            layers: 1, levels: 1, ty3d: false, mip: 0, slice: 0, stencil_base: 0, meta: 0x8000, clear: [0; 2] };
+        let target = Target { key: a, image: vk::Image::null(), view: vk::ImageView::null(),
+            used: UseStamp::new(0), format: a.format, width: a.width, height: a.height };
+        let mut metadata = std::collections::BTreeMap::new();
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [0; 2])));
+        tls(|m| { m.targets.insert(surface_key(&surface), target); });
+        let mut pixels = vec![0u8; 384 * 216];
+        for x in 32..64 { pixels[32 * 384 + x] = 255; }
+        // A differently sized incarnation is bound between frames.
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (b, [0; 2])));
+        let cached = tls(|m| m.targets.get(&surface_key(&surface)).copied());
+        assert!(cached.is_none(), "stale attachment would leave the clear routed to the other image");
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [0; 2])));
+        let mut pending = std::collections::HashMap::new();
+        merge_clear(&mut pending, metadata[&surface.meta].0, surface.meta, Some(0), 0);
+        if pending.remove(&a).is_some() { pixels.fill(0); }
+        for x in 48..80 { pixels[48 * 384 + x] = 255; }
+        assert!(pixels[32 * 384 + 32..32 * 384 + 64].iter().all(|v| *v == 0));
+        assert!(pixels[48 * 384 + 48..48 * 384 + 80].iter().all(|v| *v == 255));
+        let generation = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        assert!(!bind_clear_metadata(&mut metadata, surface.meta, (a, [0; 2])));
+        assert_eq!(LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), generation);
+        // Same image with different clear words must invalidate too.
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [1; 2])));
     }
 
     #[test]
@@ -415,6 +450,23 @@ type SurfaceKey = (u64, i32, u32, u32, u32, u32, bool, u32, u32, u64, u64, [u32;
 
 fn surface_key(s: &Surface) -> SurfaceKey {
     (s.base, s.format.as_raw(), s.width, s.height, s.layers, s.levels, s.ty3d, s.mip, s.slice, s.stencil_base, s.meta, s.clear)
+}
+
+/// Register a target's clear-metadata binding. Attachment and fixed-draw memos must not
+/// hide a later rebind after another layout/image used the same metadata allocation.
+/// NOTE_GEN alone invalidates write notes, not those attachment lookups.
+pub(crate) static METADATA_REBINDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn bind_clear_metadata(map: &mut std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>, meta: u64, binding: (ImageKey, [u32; 2])) -> bool {
+    let previous = map.insert(meta, binding);
+    if previous == Some(binding) { return false; }
+    if previous.is_some() {
+        METADATA_REBINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        if trace_clears() {
+            crate::info!("trace clears: metadata {meta:#x} rebound from {:?} to {:?}; attachment memos invalidated", previous, binding);
+        }
+    }
+    true
 }
 
 /// Entries the memos of T# lookups hold before they are emptied (the
@@ -6446,7 +6498,7 @@ impl Images {
                 crate::info!("layer bind: {:#x} {}x{} {:?} slice {} of {} (image {} layers), metadata {:#x}, flip {}", s.base, s.width, s.height, s.format, s.slice, s.layers, k.layers, s.meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             }
         }
-        if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
+        if s.meta != 0 && bind_clear_metadata(&mut self.meta_of, s.meta, (k, s.clear)) {
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }

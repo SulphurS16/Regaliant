@@ -293,6 +293,8 @@ fn run() -> Result<(), String> {
                 info!("{}", gpu::resident::linux_fault_timing());
                 info!("{}", platform::write_watch::status());
                 info!("{}", platform::sparse::status());
+                info!("{}", audio::status());
+                info!("attachment metadata rebindings: {}", gpu::images::METADATA_REBINDS.load(std::sync::atomic::Ordering::Relaxed));
             }
         }).map_err(|e| e.to_string())?;
     }

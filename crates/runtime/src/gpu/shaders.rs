@@ -2294,7 +2294,7 @@ pub(crate) fn apply_modes(spec: &mut rdna::translate::Spec, code_hash: u64) {
 /// portable mode is the default since then. `DS_PLAIN_MODES=1` / `0` forces it on or off (an
 /// A/B: the stored specs are keyed with the modes, so their programs then compile at their first
 /// dispatch).
-fn plain_modes() -> bool {
+pub(crate) fn plain_modes() -> bool {
     static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     let forced = *FORCED.get_or_init(|| match std::env::var("DS_PLAIN_MODES").ok().as_deref() {
         Some("1") => Some(true),
