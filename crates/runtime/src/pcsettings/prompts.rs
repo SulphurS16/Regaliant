@@ -1066,6 +1066,7 @@ fn draw_into(c: &mut Canvas, art: &Art, (ox, oy, size): (f32, f32, f32)) {
 /// A label's coverage on the canvas (S x S, 0..255), centred at (cx, cy) in glyph texels and
 /// fitted into max_w x max_h: Arial Bold through GDI, drawn without smoothing at the canvas's
 /// 4x (the average to the glyph's size smooths it).
+#[cfg(windows)]
 fn text_mask(text: &str, cx: f32, cy: f32, max_w: f32, max_h: f32) -> Option<Vec<u8>> {
     use windows_sys::Win32::Foundation::SIZE;
     use windows_sys::Win32::Graphics::Gdi::*;
@@ -1239,3 +1240,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn text_mask(text: &str, cx: f32, cy: f32, max_w: f32, max_h: f32) -> Option<Vec<u8>> { crate::platform::text::mask(text, S, S, (cx * U, cy * U, max_w * U, max_h * U)) }

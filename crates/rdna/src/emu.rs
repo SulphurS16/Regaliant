@@ -1435,7 +1435,7 @@ impl<'a, E: Env> Group<'a, E> {
                 "v_max3_f32" => Self::fres(&v, fmax(fmax(fs(0)?, fs(1)?), fs(2)?)),
                 "v_med3_f32" => {
                     let (a, b, c) = (fs(0)?, fs(1)?, fs(2)?);
-                    Self::fres(&v, fmax(fmin(a, b), fmin(fmax(a, b), c)))
+                    Self::fres(&v, if a.is_nan() || b.is_nan() || c.is_nan() { fmin(fmin(a, b), c) } else { fmax(fmin(a, b), fmin(fmax(a, b), c)) })
                 }
                 "v_mul_i32_i24" => (sext(us(0)?, 24) as i32).wrapping_mul(sext(us(1)?, 24) as i32) as u32,
                 "v_mul_hi_i32_i24" => ((sext(us(0)?, 24) as i32 as i64 * sext(us(1)?, 24) as i32 as i64) >> 32) as u32,
@@ -1793,9 +1793,9 @@ impl<'a, E: Env> Group<'a, E> {
             }
         };
         for &l in &active {
-            let a = self.waves[w].v[addr][l];
+            let a = if name.ends_with("_addtid_b32") { self.waves[w].s[M0].wrapping_add(l as u32 * 4) } else { self.waves[w].v[addr][l] };
             match name {
-                "ds_write_b32" | "ds_write_b64" | "ds_write_b96" | "ds_write_b128" => {
+                "ds_write_b32" | "ds_write_b64" | "ds_write_b96" | "ds_write_b128" | "ds_write_addtid_b32" => {
                     let n = nb(name) / 4;
                     for k in 0..n {
                         let x = self.waves[w].v[d0 + k][l];
@@ -1821,7 +1821,7 @@ impl<'a, E: Env> Group<'a, E> {
                     }
                     self.lds_wr(a.wrapping_add(off16), n, x as u64);
                 }
-                "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128" => {
+                "ds_read_b32" | "ds_read_b64" | "ds_read_b96" | "ds_read_b128" | "ds_read_addtid_b32" => {
                     let n = nb(name) / 4;
                     for k in 0..n {
                         let x = self.lds_rd(a.wrapping_add(off16) + 4 * k as u32, 4) as u32;
@@ -2241,11 +2241,11 @@ impl<'a, E: Env> Group<'a, E> {
                     }
                 }
                 "image_sample_l" | "image_sample_lz" | "image_sample" => {
-                    // 2D and 2D-array sampling at an explicit LOD (`_l`) or LOD 0 (`_lz`, and
+                    // 2D, 3D and 2D-array sampling at an explicit LOD (`_l`) or LOD 0 (`_lz`, and
                     // plain sampling: no derivatives in compute), as the sampler filters: point
                     // or bilinear texels, no, nearest or linear mips, its LOD clamp and wrap
                     // modes (the check of the spawn programs, 2026-11-14).
-                    if dim != 1 && dim != 5 {
+                    if dim != 1 && dim != 2 && dim != 5 {
                         return Err(format!("{:#x}: {name} (dim {dim}) not emulated", ins.pc));
                     }
                     if !float {
@@ -2253,7 +2253,7 @@ impl<'a, E: Env> Group<'a, E> {
                     }
                     let (uu, vv) = (f(ar(0)), f(ar(1)));
                     let slice = if dim == 5 { f(ar(2)).round().max(0.0) as u32 } else { 0 };
-                    let lod_in = if name == "image_sample_l" { f(ar(if dim == 5 { 3 } else { 2 })) } else { 0.0 };
+                    let lod_in = if name == "image_sample_l" { f(ar(if dim == 5 || dim == 2 { 3 } else { 2 })) } else { 0.0 };
                     let span = t.last_level.saturating_sub(t.base_level);
                     let (min_lod, max_lod) = (bits(samp[1], 0, 12) as f32 / 256.0, bits(samp[1], 12, 12) as f32 / 256.0);
                     let lod = lod_in.max(min_lod).min(max_lod).clamp(0.0, span as f32);
@@ -2297,20 +2297,37 @@ impl<'a, E: Env> Group<'a, E> {
                             let (x0, y0) = (x0 as i32, y0 as i32);
                             vec![(x0, y0, (1.0 - ax) * (1.0 - ay)), (x0 + 1, y0, ax * (1.0 - ay)), (x0, y0 + 1, (1.0 - ax) * ay), (x0 + 1, y0 + 1, ax * ay)]
                         };
+                        let dl = (t.depth >> level).max(1);
+                        let ztaps = if dim == 2 {
+                            let fz = f(ar(2)) * if unnorm { 1.0 } else { dl as f32 };
+                            if xy_filter & 1 == 0 {
+                                vec![(fz.floor() as i32, 1.0)]
+                            } else {
+                                let gz = fz - 0.5;
+                                let z = gz.floor();
+                                vec![(z as i32, 1.0 - (gz - z)), (z as i32 + 1, gz - z)]
+                            }
+                        } else {
+                            vec![(slice as i32, 1.0)]
+                        };
                         for (i, j, tap) in taps {
-                            let raw = match (wrap(i, wl, clamp_x), wrap(j, hl, clamp_y)) {
-                                (Some(x), Some(y)) => self.env.texel(&tw, x, y, slice, level),
-                                _ => None,
-                            };
-                            let vals = match raw {
-                                Some(r) => {
-                                    let (v, _) = unpack(t.format, &r).ok_or_else(|| format!("{:#x}: image format {} not emulated", ins.pc, t.format))?;
-                                    swizzle(&v, t.dst_sel, float)
+                            for &(zi, zw) in &ztaps {
+                                if dim == 2 && tap * zw == 0.0 { continue; }
+                                let z = if dim == 2 { wrap(zi, dl, bits(samp[0], 6, 3)) } else { Some(slice) };
+                                let raw = match (wrap(i, wl, clamp_x), wrap(j, hl, clamp_y), z) {
+                                    (Some(x), Some(y), Some(z)) => self.env.texel(&tw, x, y, z, level),
+                                    _ => None,
+                                };
+                                let vals = match raw {
+                                    Some(r) => {
+                                        let (v, _) = unpack(t.format, &r).ok_or_else(|| format!("{:#x}: image format {} not emulated", ins.pc, t.format))?;
+                                        swizzle(&v, t.dst_sel, float)
+                                    }
+                                    None => [0; 4],
+                                };
+                                for (a, v) in acc.iter_mut().zip(vals) {
+                                    *a += weight * tap * zw * f(v);
                                 }
-                                None => [0; 4],
-                            };
-                            for (a, v) in acc.iter_mut().zip(vals) {
-                                *a += weight * tap * f(v);
                             }
                         }
                     }
@@ -2454,6 +2471,92 @@ fn cube(name: &str, x: f32, y: f32, z: f32) -> f32 {
             "v_cubesc_f32" => if x < 0.0 { z } else { -z },
             "v_cubetc_f32" => -y,
             _ => 2.0 * x,
+        }
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+    struct Volume {
+        nan: bool,
+    }
+    impl Env for Volume {
+        fn read(&mut self, _: u64, _: &mut [u8]) -> bool {
+            false
+        }
+        fn write(&mut self, _: u64, _: &[u8]) {
+            panic!("unexpected write")
+        }
+        fn texel(&mut self, _: &[u32; 8], _: u32, _: u32, z: u32, _: u32) -> Option<[u32; 4]> {
+            Some([if self.nan { f32::NAN } else { 2.0 + z as f32 * 4.0 }.to_bits(), 0, 0, 0])
+        }
+        fn store_texel(&mut self, _: &[u32; 8], _: u32, _: u32, _: u32, _: u32, _: [u32; 4]) {
+            panic!("unexpected image write")
+        }
+    }
+    fn launch() -> Launch {
+        Launch {
+            wave64: true,
+            local_size: [8, 8, 1],
+            rsrc2: 0,
+            user: vec![],
+            group: [0; 3],
+            lds_bytes: 1024,
+            code_base: 0,
+            probe: None,
+        }
+    }
+    fn ins(enc: Enc, w0: u32, w1: u32) -> Inst {
+        Inst {
+            enc,
+            op: 0,
+            pc: 0,
+            len: 2,
+            w0,
+            w1,
+            lit: None,
+            ext: Ext::None,
+            nsa: [0; 12],
+        }
+    }
+    #[test]
+    fn volume_sampling_interpolates_depth_and_rejects_nan_history() {
+        for nan in [false, true] {
+            let mut e = Volume { nan };
+            let mut g = Group::new(&[], &mut e, launch());
+            // Synthetic 1x1x2 R32_FLOAT, identity R swizzle, trilinear clamp sampler.
+            g.waves[0].s[..8].copy_from_slice(&[0, 22 << 20, 0, (10 << 28) | 0x924, 1, 0, 0, 0]);
+            g.waves[0].s[12] = 2 | (2 << 3) | (2 << 6);
+            g.waves[0].s[14] = 1 << 20;
+            for v in &mut g.waves[0].v[..3] {
+                *v = [0.5f32.to_bits(); 64];
+            }
+            g.image(0, &ins(Enc::Mimg, (2 << 3) | (1 << 8), (3 << 21) | (4 << 8)), "image_sample_lz").unwrap();
+            let value = f32::from_bits(g.waves[0].v[4][0]);
+            if nan {
+                assert!(value.is_nan());
+                assert!(!class_f32(value, 56));
+            } else {
+                assert_eq!(value, 4.0);
+            }
+        }
+    }
+    #[test]
+    fn lane_addressed_spill_keeps_both_wave64_halves_and_exec_mask() {
+        let mut e = Volume { nan: false };
+        let mut g = Group::new(&[], &mut e, launch());
+        g.waves[0].s[M0] = 128;
+        for l in 0..64 {
+            g.waves[0].v[3][l] = l as u32 + 100;
+        }
+        g.waves[0].set_exec(0xffff_ffff_ffff_fffe);
+        g.ds(0, &ins(Enc::Ds, 0, 3 << 8), "ds_write_addtid_b32").unwrap();
+        g.waves[0].set_exec(u64::MAX);
+        g.ds(0, &ins(Enc::Ds, 0, 4 << 24), "ds_read_addtid_b32").unwrap();
+        assert_eq!(g.waves[0].v[4][0], 0);
+        for l in 1..64 {
+            assert_eq!(g.waves[0].v[4][l], l as u32 + 100);
         }
     }
 }

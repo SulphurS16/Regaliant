@@ -256,6 +256,8 @@ fn vblank_thread() {
             None => {}
         }
         let grid = crate::gpu::tune::flip_grid() && !vrr;
+        #[cfg(target_os = "linux")]
+        let grid = grid && crate::displayclock::timer_grid();
         // The frame limit off the grid: the least time between flips (the title's flip rate
         // and `tune frame_cap` count there as on the timer's grid).
         let limit_gap = |flip_rate: u32| -> Duration {
@@ -267,6 +269,8 @@ fn vblank_thread() {
             if cap > 0 { own.max(Duration::from_secs_f64(1.0 / cap as f64)) } else { own }
         };
         let now = Instant::now();
+        let pace_mark = crate::gpu::timeline::mark();
+        let ready_at_wait = pace_mark.is_some() && PORT.lock().as_ref().is_some_and(|p| p.pending.front().is_some_and(|f| f.ready));
         if grid {
             if next > now {
                 crate::thread::short_sleep(next - now);
@@ -286,6 +290,7 @@ fn vblank_thread() {
                 crate::thread::sleep_or_wake(next - now, &FLIP_READY);
             }
         }
+        crate::gpu::timeline::end("vblank", pace_mark, || if ready_at_wait { "wait: pacing (ready frame)".into() } else { "idle: no ready frame".into() });
         let now = Instant::now();
         let tick = now >= next;
         // The tick's own time: the flip shown at it counts from there, not from this wake. A
@@ -416,6 +421,7 @@ fn vblank_thread() {
             crate::gpu::timeline::flipped(n as u64);
         }
         if let Some(b) = show {
+            let present_mark = crate::gpu::timeline::mark();
             let (n, attr) = PORT.lock().as_ref().map(|p| (p.count, p.sets.get(b.set as usize).copied().flatten())).unwrap_or((0, None));
             if let Some(a) = attr {
                 crate::gpu::capture::note_display_size(a.width, a.height);
@@ -424,6 +430,7 @@ fn vblank_thread() {
             crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
             crate::displayclock::note_present();
             present_buffer(&b);
+            crate::gpu::timeline::end("vblank", present_mark, || "present/readback/overlay".into());
         }
     }
 }
@@ -804,6 +811,11 @@ fn crop_rgba(rgba: &[u8], w: u32, h: u32, c: (u32, u32, u32, u32)) -> (Vec<u8>, 
 /// Screenshots being converted, encoded and written on threads of their own
 /// (`maybe_screenshot`); `wait_shots` waits for them at shutdown.
 static SHOTS_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+pub fn shots_idle() -> bool {
+    SHOT_REQUEST.lock().is_none() && SHOTS_PENDING.load(std::sync::atomic::Ordering::Acquire) == 0
+}
 
 /// Waits (at most 10 s) for the screenshots still being written.
 pub fn wait_shots() {

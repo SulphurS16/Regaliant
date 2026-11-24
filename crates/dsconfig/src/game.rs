@@ -87,7 +87,7 @@ impl std::fmt::Display for Problem {
 }
 
 fn has_param(d: &Path) -> bool {
-    d.join("sce_sys").join("param.json").is_file()
+    Source::Dir(d.to_path_buf()).is_file("sce_sys/param.json")
 }
 
 /// The application folder at or under `dir`: `dir` itself, its `PPSA01341-app0`, or one
@@ -218,20 +218,17 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
     Ok(Game { id, app, code, source, code_dir: code_dir.to_string(), version })
 }
 
-/// Whether the executable is the one the port was tested with (its SHA-256).
-pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
+/// SHA-256 of the executable the loader will run (including rebuilt decrypted SELF files).
+pub fn executable_hash(g: &Game) -> std::io::Result<String> {
     let rel = if g.code_dir.is_empty() { "eboot.bin".to_string() } else { format!("{}/eboot.bin", g.code_dir) };
-    // (A decrypted SELF container: the ELF it holds, rebuilt byte for byte, is what is compared.)
     let f = g.source.open_file(&rel)?;
+    // Hash the rebuilt ELF, as the loader sees it, for both folders and archives.
     let mut head = [0u8; 4];
     if f.read_at(0, &mut head)? == 4 && crate::self_file::is_self(&head) {
         let elf = executable_bytes(&g.source, &rel).map_err(std::io::Error::other)?;
         let mut sha = crate::sha::Sha256::new()?;
         sha.update(&elf)?;
-        return Ok(crate::sha::hex(&sha.finish()?) == TESTED_EBOOT);
-    }
-    if let Source::Dir(_) = &g.source {
-        return Ok(crate::sha::file_sha256(&g.code.join("eboot.bin"))? == TESTED_EBOOT);
+        return Ok(crate::sha::hex(&sha.finish()?));
     }
     let mut sha = crate::sha::Sha256::new()?;
     let mut buf = vec![0u8; 8 << 20];
@@ -244,7 +241,12 @@ pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
         sha.update(&buf[..n])?;
         off += n as u64;
     }
-    Ok(crate::sha::hex(&sha.finish()?) == TESTED_EBOOT)
+    Ok(crate::sha::hex(&sha.finish()?))
+}
+
+/// Whether the executable matches the tested release.
+pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
+    Ok(executable_hash(g)? == TESTED_EBOOT)
 }
 
 #[cfg(test)]
@@ -326,17 +328,65 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn folded_source_and_boundaries() {
+        let tmp = std::env::temp_dir().join(format!("dsconfig-game-folded-{}", std::process::id()));
+        let app = fake(&tmp, VERSION, true);
+        std::fs::rename(app.join("sce_sys"), app.join("SCE_SYS")).unwrap();
+        std::fs::rename(app.join("decrypted"), app.join("Decrypted")).unwrap();
+        let g = check(&app).unwrap();
+        assert_eq!(g.source.read("decrypted/EBOOT.BIN").unwrap(), b"\x7fELF....");
+        assert!(executable_hash(&g).is_ok());
+        assert!(g.source.read("../anything").is_err());
+        assert!(g.source.read("/etc/passwd").is_err());
+        std::fs::write(tmp.join("outside"), b"outside").unwrap();
+        std::os::unix::fs::symlink(tmp.join("outside"), app.join("link")).unwrap();
+        assert!(g.source.read("link").is_err());
+        std::fs::write(app.join("ui/A"), b"a").unwrap();
+        std::fs::write(app.join("ui/a"), b"b").unwrap();
+        assert_eq!(g.source.read("UI/A").unwrap(), b"a");
+        std::fs::write(app.join("ui/TEST"), b"a").unwrap();
+        std::fs::write(app.join("ui/Test"), b"b").unwrap();
+        assert!(g.source.read("ui/test").is_err());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn hashes_rebuilt_self_in_folders_and_archives() {
+        let tmp = std::env::temp_dir().join(format!("dsconfig-self-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let app = fake(&tmp.join("dump"), VERSION, false);
+        let (elf, container) = crate::self_file::tests::sample();
+        std::fs::write(app.join("eboot.bin"), &elf).unwrap();
+        let expected = executable_hash(&check(&app).unwrap()).unwrap();
+        std::fs::write(app.join("eboot.bin"), &container).unwrap();
+        assert_eq!(executable_hash(&check(&app).unwrap()).unwrap(), expected);
+        let zar = tmp.join("game.zar");
+        crate::zar::write_folder(&app, &zar, 3, 2, &|_, _| true).unwrap();
+        assert_eq!(executable_hash(&check(&zar).unwrap()).unwrap(), expected);
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::rename(app.join("eboot.bin"), app.join("EBOOT.BIN")).unwrap();
+            assert_eq!(executable_hash(&check(&app).unwrap()).unwrap(), expected);
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
     fn archives() {
         let tmp = std::env::temp_dir().join(format!("dsconfig-game-zar-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let dump = tmp.join("dump");
         let app = fake(&dump, VERSION, true);
+        #[cfg(target_os = "linux")]
+        assert!(crate::zar::write_folder(&dump, &app.join("bad.zar"), 3, 2, &|_, _| true).is_err());
         let zar = tmp.join("game.zar");
         crate::zar::write_folder(&dump, &zar, 3, 2, &|_, _| true).unwrap();
         let g = check(&zar).unwrap();
         assert_eq!(g.code_dir, "decrypted");
         assert!(g.source.is_archive() && g.app == zar);
         assert!(!tested_executable(&g).unwrap());
+        assert_eq!(executable_hash(&g).unwrap(), executable_hash(&check(&dump).unwrap()).unwrap());
         // The folder's own check: as before, the source its folder.
         let f = check(&dump).unwrap();
         assert_eq!((f.app.clone(), f.code.clone(), f.code_dir.as_str()), (app.clone(), app.join("decrypted"), "decrypted"));

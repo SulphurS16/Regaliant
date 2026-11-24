@@ -17,7 +17,7 @@
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use windows_sys::Win32::System::Memory::*;
+use crate::platform::os::Win32::System::Memory::*;
 
 pub const GUEST_BASE: u64 = 0x4_0000_0000; // 16 GiB
 pub const GUEST_END: u64 = 0x800_0000_0000; // 8 TiB (the title reserves ~1 TiB for virtual textures)
@@ -903,7 +903,7 @@ pub fn mapped(a: u64, len: u64) -> bool {
 /// `os_readable` asks the operating system, from the table (bulk readers
 /// under `GUEST_READERS` use it from before the lock: `table_view_held`).
 pub fn host_readable(a: u64, len: u64) -> bool {
-    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    use crate::platform::os::Win32::System::Memory::PAGE_NOACCESS;
     let st = MEM.lock();
     let end = a.saturating_add(len.max(1));
     let mut p = a;
@@ -960,7 +960,7 @@ pub fn win_prot(prot: u32) -> u32 {
 }
 
 fn last_error() -> u32 {
-    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+    unsafe { crate::platform::os::Win32::Foundation::GetLastError() }
 }
 
 static RESERVED_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -972,7 +972,7 @@ static WRITE_WATCH_ERROR: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// Whether environment variable `name` (ASCII) equals `value`, read without
 /// allocating (the heap may not be set up yet).
 pub fn env_is(name: &str, value: &str) -> bool {
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    use crate::platform::os::Win32::System::Environment::GetEnvironmentVariableW;
     let mut n = [0u16; 64];
     if name.len() >= n.len() {
         return false;
@@ -1083,7 +1083,7 @@ fn mixed_window() -> u64 {
 /// Environment variable `name` (ASCII) as a decimal number, read without
 /// allocating (`env_is`).
 fn env_u32(name: &str) -> Option<u32> {
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    use crate::platform::os::Win32::System::Environment::GetEnvironmentVariableW;
     let mut n = [0u16; 64];
     if name.len() >= n.len() {
         return None;
@@ -1902,10 +1902,10 @@ fn note_host_call(k: usize, t0: std::time::Instant) {
 
 /// This process's page faults so far.
 fn page_faults() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use crate::platform::os::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    let ok = unsafe { GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb) };
+    let ok = unsafe { GetProcessMemoryInfo(crate::platform::os::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb) };
     if ok != 0 { c.PageFaultCount as u64 } else { 0 }
 }
 
@@ -2143,7 +2143,7 @@ pub fn table_view_held_for(g0: u64, start: u64, end: u64) -> bool {
 /// Whether every page of [a, a+len) is committed and readable now (operating
 /// system query; takes none of our locks).
 pub fn os_readable(a: u64, len: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    use crate::platform::os::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     let end = a.saturating_add(len.max(1));
     let mut p = a;
     while p < end {
@@ -2172,7 +2172,7 @@ pub fn os_readable(a: u64, len: u64) -> bool {
 /// The operating system's regions over [a, a+len): one clause each
 /// (state, protection, type), at most `max` (diagnostics of failed imports).
 pub fn os_regions(a: u64, len: u64, max: usize) -> String {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use crate::platform::os::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let end = a.saturating_add(len.max(1));
     let mut p = a;
     let mut out = Vec::new();
@@ -2220,6 +2220,7 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
     use std::sync::atomic::Ordering::Relaxed;
     // Mirror mode: no-access pages with GPU-written dwords first.
     crate::gpu::resident::release_range(base, len);
+    crate::platform::file_hooks::prepare_kernel_io(base, len, into_guest);
     const TRIES: u32 = 8;
     let mut tries = 0;
     let traced = crate::gpu::fe2::traced(base & !4095, base.saturating_add(len));
@@ -2232,7 +2233,7 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
             crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it ended (try {tries}): {}", if r.is_ok() { "ok".to_string() } else { format!("{:?}", r.as_ref().err().and_then(|e| e.raw_os_error())) }));
         }
         match &r {
-            Err(e) if matches!(e.raw_os_error(), Some(998 | 1784)) && tries < TRIES => {
+            Err(e) if crate::platform::file_hooks::is_memory_fault(e) && tries < TRIES => {
                 if tries == 0 && KERNEL_IO[0].fetch_add(1, Relaxed) < 32 {
                     crate::warn!("{}: {e}; retrying ({})", what(), describe_host(base, len));
                 }
@@ -2248,6 +2249,7 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
                 crate::hostcensus::release(base, len);
                 crate::gpu::fe2::c4_release_sync(base, len, false);
                 crate::hosted::disarm(base, len);
+                crate::platform::file_hooks::prepare_kernel_io(base, len, into_guest);
                 std::thread::sleep(std::time::Duration::from_millis(1 << tries.min(5)));
                 continue;
             }

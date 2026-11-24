@@ -96,13 +96,16 @@ fn addon_labels() -> &'static (Vec<String>, std::path::PathBuf) {
 }
 
 fn scan_addons(dir: &std::path::Path, depth: u32, out: &mut Vec<String>) {
+    if !crate::platform::files::import_file_type(dir).is_some_and(|t| t.is_dir()) { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
+        let Some(ty) = crate::platform::files::import_file_type(&e.path()) else { continue };
+        if !ty.is_dir() && !ty.is_file() { continue; }
         if let Some(l) = addon_label(&e.file_name().to_string_lossy()) {
             out.push(l);
         }
         // (Not into junctions or links: `file_type` does not follow them.)
-        if depth > 0 && e.file_type().is_ok_and(|t| t.is_dir()) {
+        if depth > 0 && ty.is_dir() {
             scan_addons(&e.path(), depth - 1, out);
         }
     }
@@ -472,6 +475,28 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::addon_label;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn addon_scan_skips_symlinks() {
+        let base = std::env::temp_dir().join(format!("dsport-addons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("Add-ons");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("DEMONSSOULSGIFT2.pkg"), b"fixture").unwrap();
+        std::fs::write(dir.join("DEMONSSOULSGIFT1.pkg"), b"fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked-folder")).unwrap();
+        std::os::unix::fs::symlink(outside.join("DEMONSSOULSGIFT2.pkg"), dir.join("DEMONSSOULSGIFT2.pkg")).unwrap();
+        let mut got = Vec::new();
+        super::scan_addons(&dir, 3, &mut got);
+        assert_eq!(got, ["DEMONSSOULSGIFT1"]);
+        got.clear();
+        super::scan_addons(&dir.join("linked-folder"), 3, &mut got);
+        assert!(got.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     /// Add-on labels from package names as players have them (2026-11-24: the pre-order GIFT1
     /// and GIFT2 packages, as a .pkg file or the folders unpacked from it).

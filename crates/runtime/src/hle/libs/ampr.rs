@@ -23,7 +23,7 @@ use crate::{reg, sysv};
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::os::windows::fs::FileExt;
+use crate::platform::files::FileExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -221,7 +221,7 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     if md.is_dir {
         return Err(EISDIR);
     }
-    let mem = crate::pcsettings::generated(guest);
+    let mem = crate::platform::file_hooks::generated(guest);
     let mut g = FILES.lock();
     let t = g.get_or_insert_with(Default::default);
     // Another thread may have registered the path meanwhile.
@@ -374,7 +374,7 @@ fn submit(cb: u64, prio: u32, result: u64) -> Result<u32, i32> {
 
 fn worker(n: usize, q: &'static Queue) {
     crate::log::set_thread_name(&format!("apr{n}"));
-    crate::exception::arm_watch_current_thread(false);
+    crate::platform::loader_hooks::arm_watch_current_thread(false);
     loop {
         let s = {
             let mut g = q.pending.lock();
@@ -414,7 +414,7 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
         return Err(EINVAL);
     }
     if let Some(d) = &f.mem {
-        let _w = crate::gpu::track::host_write(dest, size);
+        let _w = crate::platform::file_hooks::host_write(dest, size);
         let what = || format!("apr: read {} [{offset:#x}] into {dest:#x} (memory)", f.path);
         let src = &d[offset as usize..(offset + size) as usize];
         crate::mem::kernel_io(&what, dest, size, true, || {
@@ -444,8 +444,8 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
         crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x}", f.path);
     }
     // The kernel writes the buffer: write-tracked pages cannot fault.
-    let _w = crate::gpu::track::host_write(dest, size);
-    crate::gpu::exec::trace_writes(|| format!("apr read of {} [{offset:#x}]", f.path), dest, size);
+    let _w = crate::platform::file_hooks::host_write(dest, size);
+    crate::platform::file_hooks::trace_writes(|| format!("apr read of {} [{offset:#x}]", f.path), dest, size);
     let buf = unsafe { std::slice::from_raw_parts_mut(dest as *mut u8, size as usize) };
     let mut done = 0usize;
     while done < buf.len() {

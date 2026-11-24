@@ -74,7 +74,7 @@ pub fn note_alloc(p: *mut u8, size: usize) {
         return;
     }
     let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); FRAMES];
-    let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(2, FRAMES as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    let n = unsafe { crate::platform::os::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(2, FRAMES as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for f in &frames[..n] {
         h = (h ^ *f as u64).wrapping_mul(0x100_0000_01b3);

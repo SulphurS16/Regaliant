@@ -7,7 +7,9 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(dsport_pgo_gen)");
     // Keep bottom-up allocations (heaps, stacks) in the low 4 GiB so the guest
     // address range (16 GiB .. 8 TiB) can be reserved at startup. Image ASLR stays on.
-    println!("cargo:rustc-link-arg-bins=/HIGHENTROPYVA:NO");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/HIGHENTROPYVA:NO");
+    }
     // The program icon, also the game window's (`gpu::vk::window`).
     link_icon(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/regaliant.ico"));
 

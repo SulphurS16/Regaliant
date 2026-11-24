@@ -377,7 +377,7 @@ static EXACT_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 fn exact_writer() {
     crate::log::set_thread_name("exact-specs");
     unsafe {
-        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+        crate::platform::os::Win32::System::Threading::SetThreadPriority(crate::platform::os::Win32::System::Threading::GetCurrentThread(), crate::platform::os::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
     }
     loop {
         let busy = EXACT_BUSY.lock();
@@ -742,14 +742,14 @@ pub(crate) fn boostable_thread() -> Option<isize> {
 /// A command processor waits for a pipeline a precompile thread is making:
 /// that thread runs above normal until its job ends (`worker`).
 pub(crate) fn boost(h: isize) {
-    use windows_sys::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    use crate::platform::os::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
     unsafe { SetThreadPriority(h as _, THREAD_PRIORITY_ABOVE_NORMAL) };
     BOOSTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The lowest priority again (after each job).
 fn lower() {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+    use crate::platform::os::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
 }
 
@@ -772,7 +772,7 @@ fn ensure_workers() {
                 // A real handle (the pseudo-handle names the caller) lets a
                 // waiting thread raise this one (`boost`).
                 unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_LIMITED_INFORMATION};
+                    use crate::platform::os::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_LIMITED_INFORMATION};
                     let h = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, 0, GetCurrentThreadId());
                     if !h.is_null() {
                         HANDLE.with(|c| c.set(Some(h as isize)));

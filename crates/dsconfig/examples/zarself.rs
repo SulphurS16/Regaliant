@@ -14,6 +14,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let app = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
     let parent = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
+    #[cfg(target_os = "linux")]
+    dsconfig::files::archive_output(&app, &parent).expect("scratch must be outside read-only trees");
     std::fs::create_dir_all(&parent).unwrap();
     let (a, p) = (std::fs::canonicalize(&app).unwrap(), std::fs::canonicalize(&parent).unwrap());
     if a.starts_with(&p) || p.starts_with(&a) {
@@ -28,11 +30,12 @@ fn main() {
     let dir = scratch.join("PPSA01341-app0");
     std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
     std::fs::create_dir_all(dir.join("sce_module")).unwrap();
-    std::fs::copy(app.join("sce_sys").join("param.json"), dir.join("sce_sys").join("param.json")).unwrap();
+    let source = dsconfig::zar::Source::Dir(app.clone());
+    std::fs::write(dir.join("sce_sys").join("param.json"), source.read("sce_sys/param.json").unwrap()).unwrap();
     let mut files = vec!["eboot.bin".to_string()];
     files.extend(game::MODULES.iter().map(|m| format!("sce_module/{m}")));
     for f in &files {
-        let head = std::fs::read(app.join(f)).unwrap();
+        let head = source.read(f).unwrap();
         println!("{f}: {} bytes, a SELF container: {}", head.len(), dsconfig::self_file::is_self(&head));
         std::fs::write(dir.join(f), head).unwrap();
     }
@@ -41,7 +44,7 @@ fn main() {
         std::fs::write(dir.join(d).join("stub.txt"), b"stub").unwrap();
     }
     let zar = scratch.join("selfs.zar");
-    let w = dsconfig::zar::write_folder(&scratch, &zar, dsconfig::zar::LEVEL, 4, &|_, _| true).unwrap();
+    let w = dsconfig::zar::write_folder(&dir, &zar, dsconfig::zar::LEVEL, 4, &|_, _| true).unwrap();
     println!("archive: {} ({} bytes): {w:?}", zar.display(), std::fs::metadata(&zar).unwrap().len());
     let r = game::check(&zar);
     match &r {

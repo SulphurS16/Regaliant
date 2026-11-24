@@ -8,8 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 serde_json = "1"
-# The game as a .zar archive: its 64 KiB blocks are zstd frames (`zar`).
+# The game archive uses independently compressed zstd blocks.
 zstd = { version = "0.13", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
@@ -17,3 +19,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sha2 = "0.10"

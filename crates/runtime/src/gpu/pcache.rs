@@ -57,6 +57,29 @@ static PB: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 static PB_STALE: AtomicU64 = AtomicU64::new(0);
 /// Stored binaries made under another global key (the driver's: a store it no longer takes).
 static PB_OTHER_KEY: AtomicU64 = AtomicU64::new(0);
+// Source creation includes internal-driver/cache hits; it is not proof of a compiler run.
+static SOURCE_CALLS: AtomicU64 = AtomicU64::new(0);
+static SOURCE_NS: AtomicU64 = AtomicU64::new(0);
+static PB_MISSING: AtomicU64 = AtomicU64::new(0);
+static PB_INVALID: AtomicU64 = AtomicU64::new(0);
+static PB_EVENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+fn reuse_event(kind: char, key: u64, fp: u64, reason: &str) {
+    let mut events = PB_EVENTS.lock();
+    if events.len() < 256 { events.push(serde_json::json!({"key":format!("{kind}{key:016x}"), "fingerprint":format!("{fp:016x}"), "reason":reason})); }
+}
+/// Machine-readable actual binary reuse, independent of asynchronous scheduling counters.
+#[cfg(target_os = "linux")]
+pub fn reuse_report() -> serde_json::Value {
+    serde_json::json!({"binary_mode":super::vk::try_ctx().is_some_and(|c| c.pbin.is_some()), "binary_hits":PB[0].load(Ordering::Relaxed), "binary_refused":PB[2].load(Ordering::Relaxed),
+        "missing":PB_MISSING.load(Ordering::Relaxed), "invalid":PB_INVALID.load(Ordering::Relaxed),
+        "other_driver":PB_OTHER_KEY.load(Ordering::Relaxed), "other_code":PB_STALE.load(Ordering::Relaxed),
+        "captured":PB[3].load(Ordering::Relaxed), "capture_failed":PB[6].load(Ordering::Relaxed),
+        "source_create_calls":SOURCE_CALLS.load(Ordering::Relaxed), "source_create_ms":SOURCE_NS.load(Ordering::Relaxed) as f64/1e6,
+        "binary_total_ms":PB[1].load(Ordering::Relaxed) as f64/1e6,
+        "store":DIR.get(), "identity":IDENTITY.get(), "events":&*PB_EVENTS.lock(),
+        "note":"Source creates may hit driver caches. Binary hits bypass shader compilation but still instantiate Vulkan objects. Events capped at256."})
+}
+
 
 /// File header of data stored without its shared block: the magic, the
 /// block's offset and length (u32 each) and its hash (u64), then the data
@@ -289,7 +312,7 @@ fn write_file(p: &Path, bytes: &[u8]) -> bool {
     if READ_ONLY.load(Ordering::Relaxed) {
         return false;
     }
-    let tmp = p.with_extension(format!("{:x}.tmp", std::thread::current().id().as_u64_compat()));
+    let tmp = p.with_extension(format!("{}-{:x}.tmp", std::process::id(), std::thread::current().id().as_u64_compat()));
     let write = || {
         if sim_disk_full() {
             Err(std::io::Error::other("there is not enough space on the disk (DS_SIM_DISK_FULL, a test)"))
@@ -346,14 +369,14 @@ fn sim_disk_full() -> bool {
 
 /// The free bytes on the store's drive (None: no store, or unknown).
 pub fn store_free_bytes() -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
+    use crate::platform::os::OsStrExt;
     let dir = DIR.get()?;
     if sim_disk_full() {
         return Some(100 << 20);
     }
     let w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut free = 0u64;
-    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(w.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let ok = unsafe { crate::platform::os::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(w.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
     (ok != 0).then_some(free)
 }
 
@@ -916,7 +939,7 @@ fn confirm_left_suspects() {
 
 /// Whether process `pid` still runs (a suspect's session beside this one).
 fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use crate::platform::os::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     if pid == 0 {
         return false;
     }
@@ -927,7 +950,7 @@ fn process_alive(pid: u32) -> bool {
         }
         let mut code = 0u32;
         let ok = GetExitCodeProcess(h, &mut code) != 0;
-        windows_sys::Win32::Foundation::CloseHandle(h);
+        crate::platform::os::Win32::Foundation::CloseHandle(h);
         ok && code == 259 // STILL_ACTIVE
     }
 }
@@ -938,6 +961,16 @@ fn process_alive(pid: u32) -> bool {
 /// `fp`), else made anew with its binaries captured into the store; without
 /// them through its cache file (`with_cache`).
 pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
+    let create = |via: Via<'_>| {
+        let source = via.binaries.is_none();
+        let t = std::time::Instant::now();
+        let result = create(via);
+        if source {
+            SOURCE_CALLS.fetch_add(1, Ordering::Relaxed);
+            SOURCE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        result
+    };
     // (A pipeline whose compile crashed this driver before (`crashed.txt`) is not made again,
     // however it is asked for: its draw or dispatch goes without it. Until 2026-11-21 night only
     // background compiles left it out, so a draw needing it crashed every session that reached
@@ -970,7 +1003,14 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     let keep = ctx().validation || READ_ONLY.load(Ordering::Relaxed);
     if let Some(p) = &path {
         let t = std::time::Instant::now();
-        let stored = std::fs::read(p).ok().and_then(|b| decode_pb(&b, &pb.global, fp));
+        let stored = match std::fs::read(p) {
+            Ok(b) => {
+                let decoded = decode_pb(&b, &pb.global, fp);
+                if decoded.is_none() { PB_INVALID.fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, "invalid file, driver key or code fingerprint"); }
+                decoded
+            }
+            Err(e) => { PB_MISSING.fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, &format!("read: {e}")); None }
+        };
         PB[7].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Some(stored) = stored {
             let tb = std::time::Instant::now();
@@ -1006,6 +1046,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                     return Ok(pipe);
                 }
                 Err(e) => {
+                    reuse_event(kind, key, fp, &e);
                     if PB[2].fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::warn!("pipeline cache: the binaries of {kind}{key:016x} were not used ({e}); made anew");
                     }
@@ -1347,6 +1388,7 @@ fn sim_refuse() -> bool {
 static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 
 pub fn set_identity(device: &str, cache_id: &str) {
+    crate::info!("pipeline store identity: {device}; {cache_id}; {:?}", DIR.get());
     let _ = IDENTITY.set((device.to_string(), cache_id.to_string()));
 }
 

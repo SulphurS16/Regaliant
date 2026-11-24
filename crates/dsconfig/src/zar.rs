@@ -20,7 +20,10 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(target_os = "linux")]
+use crate::files::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -167,7 +170,7 @@ impl Archive {
             return Err(bad("too short"));
         }
         let mut ft = [0u8; FOOTER_BYTES];
-        f.seek_read_exact(&mut ft, size - FOOTER_BYTES as u64)?;
+        SeekReadExact::seek_read_exact(&f, &mut ft, size - FOOTER_BYTES as u64)?;
         let sec: Vec<(u64, u64)> = (0..6).map(|i| (be64(&ft[i * 16..]), be64(&ft[i * 16 + 8..]))).collect();
         let (total, version, magic) = (be64(&ft[128..]), be32(&ft[136..]), be32(&ft[140..]));
         if magic != MAGIC || version != VERSION1 {
@@ -184,7 +187,7 @@ impl Archive {
                 return Err(bad("a section is too large"));
             }
             let mut v = vec![0u8; s as usize];
-            f.seek_read_exact(&mut v, o)?;
+            SeekReadExact::seek_read_exact(&f, &mut v, o)?;
             Ok(v)
         };
         let rec = read(sec[1], u32::MAX as u64)?;
@@ -366,10 +369,10 @@ impl Archive {
         let (off, stored) = self.block_at(i)?;
         let at = self.data_off + off;
         if stored == BLOCK {
-            return self.with_handle(|h| h.seek_read_exact(out, at));
+            return self.with_handle(|h| SeekReadExact::seek_read_exact(h, out, at));
         }
         let mut src = vec![0u8; stored];
-        self.with_handle(|h| h.seek_read_exact(&mut src, at))?;
+        self.with_handle(|h| SeekReadExact::seek_read_exact(h, &mut src, at))?;
         decode(&src, out)
     }
 
@@ -393,7 +396,7 @@ impl Archive {
         STORED.with(|b| -> io::Result<()> {
             let mut src = b.borrow_mut();
             src.resize(len, 0);
-            self.with_handle(|h| h.seek_read_exact(&mut src[..len], self.data_off + start))?;
+            self.with_handle(|h| SeekReadExact::seek_read_exact(h, &mut src[..len], self.data_off + start))?;
             let src = &src[..len];
             let threads = THREADS.load(std::sync::atomic::Ordering::Relaxed).min(count.div_ceil(PAR_MIN / 2) as usize);
             if threads <= 1 || count < PAR_MIN {
@@ -621,23 +624,23 @@ impl Source {
         }
     }
 
-    fn host(&self, rel: &str) -> PathBuf {
+    fn host(&self, rel: &str) -> io::Result<PathBuf> {
         match self {
-            Source::Dir(d) => parts(rel).fold(d.clone(), |p, c| p.join(c)),
-            Source::Zar { .. } => PathBuf::new(),
+            Source::Dir(d) => crate::files::game_path(d, rel),
+            Source::Zar { .. } => Err(bad("archive has no host path")),
         }
     }
 
     pub fn is_file(&self, rel: &str) -> bool {
         match self {
-            Source::Dir(_) => self.host(rel).is_file(),
+            Source::Dir(_) => self.host(rel).is_ok_and(|p| p.is_file()),
             Source::Zar { .. } => self.node(rel).is_some_and(|(a, n)| a.is_file(n)),
         }
     }
 
     pub fn is_dir(&self, rel: &str) -> bool {
         match self {
-            Source::Dir(_) => self.host(rel).is_dir(),
+            Source::Dir(_) => self.host(rel).is_ok_and(|p| p.is_dir()),
             Source::Zar { .. } => self.node(rel).is_some_and(|(a, n)| a.is_dir(n)),
         }
     }
@@ -645,7 +648,7 @@ impl Source {
     /// A file's write time (in an archive, the archive's own).
     pub fn modified(&self, rel: &str) -> Option<std::time::SystemTime> {
         match self {
-            Source::Dir(_) => std::fs::metadata(self.host(rel)).ok()?.modified().ok(),
+            Source::Dir(_) => std::fs::metadata(self.host(rel).ok()?).ok()?.modified().ok(),
             Source::Zar { archive, .. } => self.node(rel).and(archive.modified()),
         }
     }
@@ -653,7 +656,7 @@ impl Source {
     /// A file's size.
     pub fn len(&self, rel: &str) -> io::Result<u64> {
         match self {
-            Source::Dir(_) => Ok(std::fs::metadata(self.host(rel))?.len()),
+            Source::Dir(_) => Ok(std::fs::metadata(self.host(rel)?)?.len()),
             Source::Zar { .. } => match self.node(rel) {
                 Some((a, n)) if a.is_file(n) => Ok(a.file_size(n)),
                 _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{rel}: not in the archive"))),
@@ -664,7 +667,7 @@ impl Source {
     /// A file whole.
     pub fn read(&self, rel: &str) -> io::Result<Vec<u8>> {
         match self {
-            Source::Dir(_) => std::fs::read(self.host(rel)),
+            Source::Dir(_) => std::fs::read(self.host(rel)?),
             Source::Zar { .. } => match self.node(rel) {
                 Some((a, n)) if a.is_file(n) => a.read_all(n),
                 _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{rel}: not in the archive"))),
@@ -675,7 +678,7 @@ impl Source {
     /// A file open for reads at any offset.
     pub fn open_file(&self, rel: &str) -> io::Result<SourceFile> {
         match self {
-            Source::Dir(_) => Ok(SourceFile::Host(File::open(self.host(rel))?)),
+            Source::Dir(_) => Ok(SourceFile::Host(File::open(self.host(rel)?)?)),
             Source::Zar { .. } => match self.node(rel) {
                 Some((a, n)) if a.is_file(n) => Ok(SourceFile::Zar { archive: a.clone(), node: n }),
                 _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("{rel}: not in the archive"))),
@@ -688,10 +691,14 @@ impl Source {
         match self {
             Source::Dir(_) => {
                 let mut out = Vec::new();
-                for e in std::fs::read_dir(self.host(rel))?.flatten() {
+                for e in std::fs::read_dir(self.host(rel)?)?.flatten() {
                     let md = e.metadata()?;
                     out.push(DirEntry { name: e.file_name().to_string_lossy().into_owned(), dir: md.is_dir(), size: if md.is_dir() { 0 } else { md.len() }, modified: md.modified().ok() });
                 }
+                // Match NTFS/archive enumeration on Linux too: shader discovery order affects
+                // which duplicate program supplies its resource variants and fingerprint.
+                #[cfg(target_os = "linux")]
+                out.sort_by(|x, y| x.name.bytes().map(|c| c.to_ascii_uppercase()).cmp(y.name.bytes().map(|c| c.to_ascii_uppercase())));
                 Ok(out)
             }
             Source::Zar { .. } => match self.node(rel) {
@@ -711,7 +718,7 @@ impl Source {
     pub fn files_under(&self, rel: &str) -> Vec<String> {
         match self {
             Source::Dir(_) => {
-                let root = self.host(rel);
+                let Ok(root) = self.host(rel) else { return Vec::new() };
                 let mut out = Vec::new();
                 let mut stack = vec![(root, String::new())];
                 while let Some((d, p)) = stack.pop() {
@@ -788,6 +795,8 @@ struct Node {
 /// and an `Interrupted` error returned). The archive is written beside `out` and renamed to it
 /// once complete.
 pub fn write_folder(src: &Path, out: &Path, level: i32, threads: usize, progress: &dyn Fn(u64, u64) -> bool) -> io::Result<Written> {
+    #[cfg(target_os = "linux")]
+    crate::files::archive_output(src, out)?;
     // The tree, in a stable order: names sorted (the format's order) within each folder.
     let mut nodes = vec![Node { name: String::new(), file: None, children: Vec::new() }];
     let mut files: Vec<(usize, PathBuf, u64)> = Vec::new();
@@ -1171,6 +1180,8 @@ mod tests {
         assert!(zar.is_archive() && !dir.is_archive());
         // (The game in a folder of the archive: found by its param.json.)
         assert!(matches!(&zar, Source::Zar { base, .. } if base == "PPSA01341-app0"));
+        assert_eq!(dir.list("misc").unwrap().iter().map(|e| &e.name).collect::<Vec<_>>(),
+                   zar.list("misc").unwrap().iter().map(|e| &e.name).collect::<Vec<_>>());
         for s in [&dir, &zar] {
             for (p, data) in &files {
                 assert!(s.is_file(p), "{p}");

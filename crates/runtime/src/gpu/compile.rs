@@ -541,3 +541,61 @@ pub fn status() -> String {
         s[BATCHED_RT]
     ) + &gfx
 }
+
+/// Optional aggregate limit for driver shader compiles, shared by foreground, compute,
+/// graphics and preparation callers. Relay pools are small too, but separate pools must
+/// not each consume the whole CPU budget. Unset preserves normal Windows/player policy.
+struct CompileGate {
+    active: Mutex<usize>,
+    wake: Condvar,
+    limit: usize,
+}
+impl CompileGate {
+    fn enter(&self) -> CompilePermit<'_> {
+        let mut active = self.active.lock();
+        while *active >= self.limit { self.wake.wait(&mut active); }
+        *active += 1;
+        CompilePermit(Some(self))
+    }
+}
+pub struct CompilePermit<'a>(Option<&'a CompileGate>);
+impl Drop for CompilePermit<'_> {
+    fn drop(&mut self) {
+        if let Some(gate) = self.0 {
+            *gate.active.lock() -= 1;
+            gate.wake.notify_one();
+        }
+    }
+}
+pub fn driver_permit() -> CompilePermit<'static> {
+    static GATE: std::sync::OnceLock<Option<CompileGate>> = std::sync::OnceLock::new();
+    match GATE.get_or_init(|| std::env::var("DS_COMPILE_WORKERS").ok().and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0).map(|n| CompileGate { active: Mutex::new(0), wake: Condvar::new(), limit: n.min(16) })) {
+        Some(gate) => gate.enter(),
+        None => CompilePermit(None),
+    }
+}
+
+#[cfg(test)]
+mod compile_limit_tests {
+    use super::*;
+    #[test]
+    fn aggregate_limit_and_release() {
+        let gate = CompileGate { active: Mutex::new(0), wake: Condvar::new(), limit: 2 };
+        let peak = AtomicUsize::new(0);
+        let live = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _permit = gate.enter();
+                    let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert!((1..=2).contains(&peak.load(Ordering::SeqCst)));
+        assert_eq!(*gate.active.lock(), 0);
+    }
+}

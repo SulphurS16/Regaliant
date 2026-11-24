@@ -1064,7 +1064,8 @@ pub fn float_stats(format: vk::Format, raw: &[u8]) -> Option<String> {
             format!("{n} [{:.4}, {:.4}] mean {mean:.4} nan {} inf {}", s.0, s.1, s.4, s.5)
         })
         .collect();
-    Some(parts.join("; "))
+    let prefix = if matches!(format, F::R32_UINT | F::R32_SINT) { "integer target interpreted as f32 bits: " } else { "" };
+    Some(format!("{prefix}{}", parts.join("; ")))
 }
 
 /// A render target or depth/stencil attachment.
@@ -1895,6 +1896,7 @@ fn record_batched(staging: (vk::Buffer, vk::DeviceMemory), bytes: u64, f: &dyn F
 /// open (`tune upload_batch`: ahead of every batch, `exec::submit_batch`,
 /// and of the cache's own submissions), and frees what completed ones held.
 pub fn flush_uploads() {
+    let _trace = super::timeline::section("submit uploads");
     if BATCHED_LIVE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
@@ -3310,7 +3312,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
     if holder_trace() {
         let l = std::panic::Location::caller();
         *HOLDER_AT.lock() = (crate::log::thread_name(), l.file(), l.line());
-        HOLDER.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
+        HOLDER.store(unsafe { crate::platform::os::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
     }
     let held_from = holds_on().then(std::time::Instant::now);
     if let (Some(a), Some(b)) = (asked, held_from) {
@@ -6818,6 +6820,12 @@ impl Images {
 
     /// `read_back_aspect` of one mip level (`width`, `height`: that level's size).
     pub fn read_back_level(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32, level: u32) -> Result<Vec<u8>, String> {
+        self.read_back_slice(image, format, aspect, width, height, level, 0, 1, 1)
+    }
+
+    /// Readback of consecutive array layers, or a whole 3D mip (depth > 1).
+    #[allow(clippy::too_many_arguments)]
+    fn read_back_slice(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32, level: u32, layer: u32, depth: u32, layers: u32) -> Result<Vec<u8>, String> {
         let bpp = if aspect == vk::ImageAspectFlags::STENCIL {
             1
         } else if aspect == vk::ImageAspectFlags::DEPTH {
@@ -6825,15 +6833,15 @@ impl Images {
         } else {
             texel_bytes(format) as u64
         };
-        let size = bpp * width as u64 * height as u64;
+        let size = bpp * width as u64 * height as u64 * depth as u64 * layers as u64;
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
         self.one_shot(|cmd| unsafe {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: level, base_array_layer: 0, layer_count: 1 })
-                .image_extent(vk::Extent3D { width, height, depth: 1 });
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: level, base_array_layer: layer, layer_count: layers })
+                .image_extent(vk::Extent3D { width, height, depth });
             c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
             let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
@@ -6845,6 +6853,24 @@ impl Images {
             c.device.free_memory(mem, None);
         }
         Ok(out)
+    }
+
+    /// Read an existing cache incarnation only: observing a draw must not create a new
+    /// target, upload guest bytes or change alias ownership. Return the actual selected key.
+    pub fn diagnostic_read(&mut self, wanted: ImageKey, level: u32, slice: u32, attachment: bool, storage: bool) -> Result<(ImageKey, Vec<u8>), String> {
+        let key = if attachment {
+            if self.map.contains_key(&wanted) { Some(wanted) } else { self.alias(&wanted, false) }
+        } else { self.lookup(&wanted, storage).map(|(k, _)| k) }.ok_or("no cached image (not created/uploaded yet)")?;
+        if level >= key.levels || (!key.ty3d && slice >= key.layers) { return Err("subresource outside cached image".into()); }
+        let (w, h) = ((key.width >> level).max(1), (key.height >> level).max(1));
+        let depth = if key.ty3d { (key.layers >> level).max(1) } else { 1 };
+        // Sampled/storage array views can read/write every layer, not only layer zero.
+        let layers = if !attachment && !key.ty3d { key.layers - slice } else { 1 };
+        let aspect = if is_depth(key.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+        if is_compressed(key.format) || texel_bytes(key.format) == 0 { return Err("compressed/unknown-format diagnostic read skipped".into()); }
+        if w as u64 * h as u64 * depth as u64 * layers as u64 * texel_bytes(key.format) as u64 > 64 << 20 { return Err("diagnostic image exceeds 64 MiB limit".into()); }
+        let raw = self.read_back_slice(self.map[&key].image, key.format, aspect, w, h, level, if key.ty3d { 0 } else { slice }, depth, layers)?;
+        Ok((key, raw))
     }
 
     /// Share of zero bytes in the cached image a T# resolves to, at the T#'s
@@ -7146,15 +7172,40 @@ impl Images {
     /// Writes the GPU-written color images (mip 0, layer 0) to `dir` as PNG
     /// files named <address>_<width>x<height>_<format>.png (frame captures).
     pub fn dump_targets(&mut self, dir: &std::path::Path) -> usize {
-        let mut keys: Vec<ImageKey> = self.map.values().filter(|i| i.gpu_written && !is_depth(i.key.format)).map(|i| i.key).collect();
+        self.dump_targets_inner(dir, None)
+    }
+
+    /// Targets bound for writing in one captured frame, including raw texels and a manifest.
+    /// No address-sorted cap: it could exclude the scene while retaining old menu targets.
+    pub fn dump_frame_targets(&mut self, dir: &std::path::Path, bases: &std::collections::BTreeSet<u64>) -> usize {
+        self.dump_targets_inner(dir, Some(bases))
+    }
+
+    fn dump_targets_inner(&mut self, dir: &std::path::Path, bases: Option<&std::collections::BTreeSet<u64>>) -> usize {
+        let selected = |i: &&Image| i.gpu_written && bases.is_none_or(|b| b.contains(&i.key.base));
+        let mut keys: Vec<ImageKey> = self.map.values().filter(selected).filter(|i| !is_depth(i.key.format)).map(|i| i.key).collect();
         keys.sort_by_key(|k| (k.base, k.format.as_raw()));
         let _ = std::fs::create_dir_all(dir);
         let mut n = 0;
-        let mut stats = String::new();
-        for k in keys.into_iter().take(256) {
+        let mut stats = String::from("Snapshots at frame end, mip 0 / layer 0. Raw files: little-endian u32 width,height then native-format texels. Match addresses to cb/depth/written image bindings in capture-<flip>.txt; targets may be reused within a frame.
+");
+        for k in keys.into_iter().take(if bases.is_some() { usize::MAX } else { 256 }) {
             let image = self.map[&k].image;
-            let Ok(raw) = self.read_back(image, k.format, k.width, k.height) else { continue };
-            let name = format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format);
+            let name = if bases.is_some() {
+                format!("{:010x}_{}x{}_{:?}_levels{}_layers{}_3d{}_cube{}", k.base, k.width, k.height, k.format, k.levels, k.layers, k.ty3d, k.cube)
+            } else { format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format) };
+            let raw = match self.read_back(image, k.format, k.width, k.height) {
+                Ok(raw) => raw,
+                Err(e) => { stats.push_str(&format!("{name}: readback failed: {e}\n")); continue; }
+            };
+            if bases.is_some() {
+                let mut bytes = Vec::with_capacity(8 + raw.len());
+                bytes.extend_from_slice(&k.width.to_le_bytes());
+                bytes.extend_from_slice(&k.height.to_le_bytes());
+                bytes.extend_from_slice(&raw);
+                if let Err(e) = std::fs::write(dir.join(format!("{name}.raw")), bytes) { stats.push_str(&format!("{name}: write failed: {e}\n")); }
+                stats.push_str(&format!("{name}: {} bytes, {} nonzero bytes, {} levels, {} layers\n", raw.len(), raw.iter().filter(|&&b| b != 0).count(), k.levels, k.layers));
+            }
             if let Some(s) = float_stats(k.format, &raw) {
                 stats.push_str(&format!("{name}: {s}\n"));
             }
@@ -7164,13 +7215,22 @@ impl Images {
             }
         }
         // Depth surfaces: depth statistics and the stencil values present.
-        let mut dkeys: Vec<ImageKey> = self.map.values().filter(|i| i.gpu_written && is_depth(i.key.format)).map(|i| i.key).collect();
+        let mut dkeys: Vec<ImageKey> = self.map.values().filter(selected).filter(|i| is_depth(i.key.format)).map(|i| i.key).collect();
         dkeys.sort_by_key(|k| k.base);
-        for k in dkeys.into_iter().take(64) {
+        for k in dkeys.into_iter().take(if bases.is_some() { usize::MAX } else { 64 }) {
             let image = self.map[&k].image;
-            let name = format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format);
+            let name = if bases.is_some() {
+                format!("{:010x}_{}x{}_{:?}_levels{}_layers{}_3d{}_cube{}", k.base, k.width, k.height, k.format, k.levels, k.layers, k.ty3d, k.cube)
+            } else { format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format) };
             if aspects(k.format).contains(vk::ImageAspectFlags::DEPTH) {
                 if let Ok(raw) = self.read_back_aspect(image, k.format, vk::ImageAspectFlags::DEPTH, k.width, k.height) {
+                    if bases.is_some() {
+                        let mut bytes = Vec::with_capacity(8 + raw.len());
+                        bytes.extend_from_slice(&k.width.to_le_bytes());
+                        bytes.extend_from_slice(&k.height.to_le_bytes());
+                        bytes.extend_from_slice(&raw);
+                        if let Err(e) = std::fs::write(dir.join(format!("{name}_depth.raw")), bytes) { stats.push_str(&format!("{name}: depth write failed: {e}\n")); }
+                    }
                     if raw.len() as u64 == 4 * k.width as u64 * k.height as u64 {
                         if let Some(s) = float_stats(vk::Format::R32_SFLOAT, &raw) {
                             stats.push_str(&format!("{name} depth: {s}\n"));

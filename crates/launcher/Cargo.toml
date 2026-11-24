@@ -14,6 +14,8 @@ path = "src/main.rs"
 dsconfig = { path = "../dsconfig" }
 ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 miniz_oxide = "0.8"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Com",

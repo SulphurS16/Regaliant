@@ -108,6 +108,7 @@ fn prot_from_flags(flags: u32) -> u32 {
 }
 
 /// Loads (maps and copies) a module without relocating it.
+#[cfg(windows)]
 pub fn load(path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     load_bytes(bytes, path, is_main)
@@ -452,11 +453,7 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
         p.patch_raw_fs_zero(m.code.1 - m.base, &mut stats);
     }
     if m.is_main {
-        crate::exception::install_text_hooks(&mut p, &ranges);
-        // (The engine's memory map: read only, so on with or without the
-        // title fixes.)
-        crate::engine::init(p.base, p.image);
-        crate::titlefix::apply(&mut p, &ranges);
+        crate::platform::loader_hooks::patch_main(&mut p, &ranges);
     }
     let tramp_used = p.tramp_used;
     // Protections. Segments can share a page (PS5: the end of .bss and the
@@ -514,11 +511,7 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
     }
     drop(st);
     unsafe {
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            m.base as *const _,
-            m.size as usize,
-        );
+        crate::platform::flush_instruction_cache(m.base, m.size as usize);
     }
     Ok(stats)
 }

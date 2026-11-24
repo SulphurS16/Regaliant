@@ -170,8 +170,8 @@ fn gpu_clock() -> Option<(u64, u64, f64)> {
     let (t, q) = c.calibrate()?;
     let (mut q_now, mut f) = (0i64, 0i64);
     unsafe {
-        windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut q_now);
-        windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f);
+        crate::platform::os::Win32::System::Performance::QueryPerformanceCounter(&mut q_now);
+        crate::platform::os::Win32::System::Performance::QueryPerformanceFrequency(&mut f);
     }
     let us_now = now_us();
     let us = us_now.saturating_sub(((q_now - q).max(0) as u128 * 1_000_000 / f.max(1) as u128) as u64);
@@ -450,6 +450,8 @@ pub fn flip(n: u64, us: u64) {
     }
     s.recent.push_back(d.min(u32::MAX as u64) as u32);
     let hitch = !(s.recent.len() < 9 || d * 2 < median * 3 || d < median + 16_667);
+    #[cfg(target_os = "linux")]
+    let hitch = hitch || d >= 250_000;
     // Its GPU time once its batches are in (`take_pending`).
     s.pending.push_back(Pending { n, start: prev, end: us, median, hitch });
     take_pending(&mut s);
@@ -479,7 +481,13 @@ pub fn flip(n: u64, us: u64) {
         }
     }
     over.sort_by(|a, b| b.0.cmp(&a.0));
-    let excess = d - median;
+    #[cfg(target_os = "linux")]
+    if d >= 250_000 && crate::platform::stalls::enabled() {
+        crate::platform::stalls::record(n, prev, us, median, over.iter().map(|(_, e)| serde_json::json!({
+            "start_us":e.start,"end_us":e.end,"kind":NAMES[e.kind as usize],"thread":e.thread,"reason":e.what
+        })), over.len());
+    }
+    let excess = d.saturating_sub(median);
     let top = (0..KINDS).max_by_key(|&k| sum[k]).filter(|&k| sum[k] * 4 >= excess).unwrap_or(KINDS);
     let kinds: Vec<String> = (0..KINDS).filter(|&k| sum[k] > 0).map(|k| format!("{} {:.0} ms", NAMES[k], sum[k] as f64 / 1e3)).collect();
     // The four longest, and the longest on a command processor when none

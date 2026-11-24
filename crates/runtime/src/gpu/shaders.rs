@@ -1683,7 +1683,7 @@ fn fmt_worker(name: String) {
     use std::sync::atomic::Ordering;
     crate::log::set_thread_name(&name);
     unsafe {
-        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+        crate::platform::os::Win32::System::Threading::SetThreadPriority(crate::platform::os::Win32::System::Threading::GetCurrentThread(), crate::platform::os::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
     }
     loop {
         let j = {

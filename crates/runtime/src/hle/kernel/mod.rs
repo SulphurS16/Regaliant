@@ -62,7 +62,7 @@ pub fn note_timeout(kind: &'static str, obj: u64, name: &str, us: u64) {
     };
     if first || TIMEOUTS_LOGGED.load(std::sync::atomic::Ordering::Relaxed) < 100 {
         TIMEOUTS_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::info!("wait timed out: {kind} {obj:#x} '{name}' after {us} us (flip {})", crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+        crate::info!("wait timed out: {kind} {obj:#x} '{name}' after {us} us (flip {})", crate::platform::loader_hooks::frame_count());
     }
 }
 

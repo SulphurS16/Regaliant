@@ -429,6 +429,7 @@ pub fn overlay() -> Option<(u64, crate::textbox::Content)> {
     Some((generation, content))
 }
 
+#[cfg(windows)]
 fn clipboard_text() -> Option<String> {
     use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -648,5 +649,16 @@ mod tests {
         let end = DIALOG.lock().as_ref().unwrap().end;
         assert_eq!((end, text()), (END_OK, "Q".to_string()));
         *DIALOG.lock() = None;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clipboard_text() -> Option<String> {
+    unsafe {
+        let p = sdl3::sys::clipboard::SDL_GetClipboardText();
+        if p.is_null() { return None; }
+        let text = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+        sdl3::sys::stdinc::SDL_free(p.cast());
+        Some(text)
     }
 }

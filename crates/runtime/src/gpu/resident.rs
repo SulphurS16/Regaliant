@@ -383,11 +383,112 @@ pub fn mark_host(base: u64, len: u64) {
     STATS[S_HOSTED].fetch_add(n, Ordering::Relaxed);
 }
 
+// Linux section tracking has logical guest permissions in `os`, and temporary read-only
+// permissions here. Keeping those separate avoids allocating/splitting the VMA map per fault.
+// Mirror/held-page modes still use the service thread (they can require GPU readback).
+#[cfg(target_os = "linux")]
+static LINUX_DIRECT: AtomicBool = AtomicBool::new(false);
+// Leaving a page unarmed saves faults but reports it dirty at every epoch. On Linux
+// the old 32..1024-frame backoff copied unchanged pages into VRAM thousands of times.
+// Keep it available for relay comparisons; exact tracking is the default. Read by
+// the signal handler, so initialize outside it and use only an atomic load there.
+#[cfg(target_os = "linux")]
+static LINUX_VOLATILE_BACKOFF: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static LINUX_REMAP: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "linux")]
+const LINUX_WRITER: u32 = 1 << 31;
+#[cfg(target_os = "linux")]
+static LINUX_FAULT_TIMING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+static LINUX_FAULT_SAMPLES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[cfg(target_os = "linux")]
+fn linux_clock_ns(clock: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::syscall(libc::SYS_clock_gettime, clock, &mut ts) } != 0 { return 0; }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_fault_timing() -> String {
+    let [n, wall, cpu] = LINUX_FAULT_SAMPLES.each_ref().map(|x| x.load(Ordering::Relaxed));
+    format!("Linux direct fault timing: {n} samples (1/256 attempts), mean {:.2} us wall / {:.2} us thread CPU; excludes kernel signal delivery and service-thread faults", wall as f64 / n.max(1) as f64 / 1000.0, cpu as f64 / n.max(1) as f64 / 1000.0)
+}
+#[cfg(target_os = "linux")]
+pub fn init_linux_faults() {
+    crate::platform::write_watch::initialize();
+    let on = crate::sections::on() && !wanted() && !crate::platform::write_watch::enabled() && std::env::var("DS_LINUX_DIRECT_FAULT").ok().as_deref() != Some("0");
+    let backoff = std::env::var("DS_LINUX_VOLATILE_BACKOFF").ok().as_deref() == Some("1");
+    LINUX_VOLATILE_BACKOFF.store(backoff, Ordering::Release);
+    LINUX_FAULT_TIMING.store(std::env::var("DS_LINUX_FAULT_TIMING").ok().as_deref() == Some("1"), Ordering::Release);
+    LINUX_DIRECT.store(on, Ordering::Release);
+    crate::info!("Linux resident direct write-fault recovery: {on} (section tracking only)");
+    crate::info!("Linux resident volatile backoff: {backoff} (false: exact dirty tracking; true: legacy 32..1024-frame cooldown)");
+}
+
+/// VirtualQuery's actual permissions: arming is temporary, distinct from guest permissions.
+/// Bound each query's scan; callers already walk successive regions.
+#[cfg(target_os = "linux")]
+pub fn linux_protection_span(a: u64, end: u64) -> (u64, bool) {
+    if !LINUX_DIRECT.load(Ordering::Acquire) { return (end, false); }
+    let armed = state(a) & ST_ARMED != 0;
+    let mut p = (a & !(PAGE - 1)) + PAGE;
+    let stop = end.min(p.saturating_add(63 * PAGE));
+    while p < stop && (state(p) & ST_ARMED != 0) == armed { p += PAGE; }
+    (p.min(end), armed)
+}
+
+/// Async-signal-safe: permanent table chunks, atomics and one mprotect syscall only.
+/// Never wait on ST_BUSY: the interrupted thread might hold it. Remaps exclude this path
+/// with a lock-free reader count; the slow service handles collisions and readback faults.
+#[cfg(target_os = "linux")]
+pub fn linux_write_fault(addr: u64) -> bool {
+    if !LINUX_DIRECT.load(Ordering::Acquire) { return false; }
+    let Some(c) = chunk(addr, false) else { return false };
+    let gate = LINUX_REMAP.load(Ordering::Acquire);
+    if gate & LINUX_WRITER != 0 || LINUX_REMAP.compare_exchange(gate, gate + 1, Ordering::AcqRel, Ordering::Acquire).is_err() { return false; }
+    let timed = LINUX_FAULT_TIMING.load(Ordering::Relaxed) && STATS[S_FAULTS].load(Ordering::Relaxed) % 256 == 0;
+    let start = if timed { (linux_clock_ns(libc::CLOCK_MONOTONIC), linux_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID)) } else { (0, 0) };
+    let i = idx(addr);
+    let s = &c.pages[i];
+    let cur = s.load(Ordering::Acquire);
+    let mut ok = false;
+    if cur & (ST_ARMED | ST_BUSY) == ST_ARMED && s.compare_exchange(cur, cur | ST_BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        let page = addr & !(PAGE - 1);
+        if unsafe { libc::syscall(libc::SYS_mprotect, page, PAGE, libc::PROT_READ | libc::PROT_WRITE) } == 0 {
+            let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
+            let volatile = note_write_fault(c, i, frame);
+            flag(c, i);
+            s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
+            STATS[S_FAULTS].fetch_add(1, Ordering::Relaxed);
+            // The direct counter is in signals; protect()'s call/time averages cover only
+            // its timed calls, not these signal-context syscalls.
+            ok = true;
+        } else { s.store(cur, Ordering::Release); }
+    }
+    LINUX_REMAP.fetch_sub(1, Ordering::Release);
+    if timed && ok {
+        let cpu = linux_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID).saturating_sub(start.1);
+        let wall = linux_clock_ns(libc::CLOCK_MONOTONIC).saturating_sub(start.0);
+        LINUX_FAULT_SAMPLES[1].fetch_add(wall, Ordering::Relaxed);
+        LINUX_FAULT_SAMPLES[2].fetch_add(cpu, Ordering::Relaxed);
+        LINUX_FAULT_SAMPLES[0].fetch_add(1, Ordering::Relaxed);
+    }
+    ok
+}
+
 fn protect(a: u64, n: u64, prot: u32) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READONLY};
+    use crate::platform::os::Win32::System::Memory::{VirtualProtect, PAGE_READONLY};
     let t = std::time::Instant::now();
     let mut old = 0u32;
+    #[cfg(windows)]
     let ok = unsafe { VirtualProtect(a as _, n as usize, prot, &mut old) } != 0;
+    #[cfg(target_os = "linux")]
+    let ok = if LINUX_DIRECT.load(Ordering::Acquire) && matches!(prot, PAGE_READONLY | crate::platform::os::Win32::System::Memory::PAGE_READWRITE) {
+        let native = if prot == PAGE_READONLY { libc::PROT_READ } else { libc::PROT_READ | libc::PROT_WRITE };
+        unsafe { libc::mprotect(a as _, n as usize, native) == 0 }
+    } else { unsafe { VirtualProtect(a as _, n as usize, prot, &mut old) != 0 } };
     let k = if prot == PAGE_READONLY { 0 } else { S_UNPROTECTS - S_PROTECTS };
     STATS[S_PROTECTS + k].fetch_add(1, Ordering::Relaxed);
     STATS[S_PROTECT_NS + k].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -398,7 +499,7 @@ fn protect(a: u64, n: u64, prot: u32) -> bool {
 /// span two section views). With `need_rw` only when every region is plain
 /// read-write now; false (nothing changed) otherwise.
 fn protect_regions(a: u64, e: u64, prot: u32, need_rw: bool) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
     let mut regions = Vec::new();
     let mut p = a;
     while p < e {
@@ -439,7 +540,7 @@ enum RegionKind {
 
 /// The memory region holding `p`, clipped to `e`: (end, kind).
 fn region_kind(p: u64, e: u64) -> (u64, RegionKind) {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { VirtualQuery(p as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
         return (e, RegionKind::Other);
@@ -503,7 +604,7 @@ fn mask_runs(masks: &[u32]) -> String {
 
 /// Whether the page holding `a` is committed and readable now.
 fn readable_now(a: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    use crate::platform::os::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { VirtualQuery(a as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
         return false;
@@ -512,7 +613,7 @@ fn readable_now(a: u64) -> bool {
 }
 
 fn plain_rw(a: u64, n: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
     let mut p = a;
     while p < a + n {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -644,8 +745,14 @@ fn host_answered(c: &Chunk, i: usize, frame: u32) {
 /// stays unarmed VOL_BASE << level frames, its level one up). A fault more
 /// than QUIET_FRAMES after the page's last stay ended resets its level.
 fn note_write_fault(c: &Chunk, i: usize, frame: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    if !LINUX_VOLATILE_BACKOFF.load(Ordering::Relaxed) { return false; }
     let last = c.faulted[i].swap(frame, Ordering::AcqRel);
+    #[cfg(windows)]
     let volatile = last != 0 && frame.wrapping_sub(last) <= VOLATILE_FRAMES;
+    #[cfg(target_os = "linux")]
+    let volatile = last != 0 && (frame.wrapping_sub(last) <= 64 ||
+        (c.vol_level[i].load(Ordering::Acquire) != 0 && frame.wrapping_sub(c.vol_until[i].load(Ordering::Acquire)) <= VOLATILE_FRAMES));
     if volatile {
         let level = c.vol_level[i].load(Ordering::Acquire).saturating_add(1).min(VOL_MAX_LEVEL);
         c.vol_level[i].store(level, Ordering::Release);
@@ -730,7 +837,7 @@ pub fn arm(base: u64, len: u64) -> u64 {
 /// `arm`, setting `extra` besides ST_ARMED (ST_VALID for the mirror; nothing
 /// for write tracking).
 fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    use crate::platform::os::Win32::System::Memory::PAGE_READONLY;
     // No mapping change meanwhile (`ARM_LOCK`).
     let _arming = ARM_LOCK.read();
     // Write tracking through the host (`via_host`): no other arm or disarm
@@ -815,7 +922,7 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
 /// device-invalid. Runs of armed pages are taken busy and made writable with
 /// one call each (an import window covers up to 16,384 pages).
 fn disarm_range(lo: u64, hi: u64) {
-    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    use crate::platform::os::Win32::System::Memory::PAGE_READWRITE;
     let host = via_host();
     let release = |a: u64, e: u64| {
         // Pages armed through the host: writable, then their host bits
@@ -941,8 +1048,25 @@ static ARM_LOCK: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
 /// Held by the memory manager across a mapping or protection change of
 /// guest memory and the `settled` after it (taken after `mem::GUEST_READERS`
 /// where both are; arming threads may hold that one shared).
+#[cfg(windows)]
 pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
     ARM_LOCK.write()
+}
+
+#[cfg(target_os = "linux")]
+pub struct RemapGuard { _lock: parking_lot::RwLockWriteGuard<'static, ()> }
+#[cfg(target_os = "linux")]
+impl Drop for RemapGuard {
+    fn drop(&mut self) { LINUX_REMAP.store(0, Ordering::Release); }
+}
+#[cfg(target_os = "linux")]
+pub fn remap_guard() -> RemapGuard {
+    let lock = ARM_LOCK.write();
+    // Only one writer holds ARM_LOCK. Stop admitting signal readers, then wait for the
+    // at most one syscall each already admitted reader performs.
+    LINUX_REMAP.fetch_or(LINUX_WRITER, Ordering::AcqRel);
+    while LINUX_REMAP.load(Ordering::Acquire) != LINUX_WRITER { std::hint::spin_loop(); }
+    RemapGuard { _lock: lock }
 }
 
 /// A mapping or protection change of [base, base+len) is done (called under
@@ -951,6 +1075,8 @@ pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
 /// writable would hide CPU writes from every later take; one reset before
 /// the change left armed pages read-only and unmarked until it landed).
 pub fn settled(base: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    crate::platform::write_watch::remapped(base, len);
     remapped(base, len);
     crate::hosted::forget(base, len);
     // (Front end 4's held pages there: their pending words died with the
@@ -964,8 +1090,17 @@ pub fn settled(base: u64, len: u64) {
 /// that another thread disarmed meanwhile. Called by the exception handler
 /// before anything else; takes no lock a faulting thread of ours could hold
 /// (the table's read lock only).
+/// Whether recovery can wait for GPU ownership/readback. The Linux fault dispatcher sends
+/// these to independent workers so a wait cannot block the faults of a GPU worker.
+#[cfg(target_os = "linux")]
+pub fn fault_may_wait(addr: u64) -> bool {
+    mirror_mode() && chunk(addr, false).is_some_and(|c| is_gprot(c, idx(addr)) || is_dirty(c, idx(addr)))
+}
+
 pub fn on_fault(addr: u64, write: bool) -> bool {
-    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    #[cfg(target_os = "linux")]
+    let _remap = LINUX_DIRECT.load(Ordering::Acquire).then(|| ARM_LOCK.read());
+    use crate::platform::os::Win32::System::Memory::PAGE_READWRITE;
     if !tracking() {
         return false;
     }
@@ -1047,6 +1182,8 @@ pub static TAKE_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// write faults and clears the mark; volatile and host-class pages, and
 /// pages a file read is writing, stay unarmed and are always reported.
 pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+    #[cfg(target_os = "linux")]
+    if crate::platform::write_watch::enabled() { return crate::platform::write_watch::take(base, size, out); }
     if size == 0 {
         return Some(());
     }
@@ -1299,6 +1436,8 @@ pub fn claim_pages(pages: &[u64]) -> usize {
 /// [base, base+len): its pages in the mirror's span are disarmed and stay
 /// out of the mirror until `host_write_end`.
 pub fn host_write_begin(base: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    if crate::platform::write_watch::enabled() { crate::platform::write_watch::host_write(base, len, true); return; }
     if !tracking() || len == 0 {
         return;
     }
@@ -1382,6 +1521,8 @@ pub fn describe(base: u64, len: u64) -> String {
 /// The write announced by `host_write_begin(base, len)` ended: its pages
 /// may be armed again (the mirror's copies of them are stale).
 pub fn host_write_end(base: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    if crate::platform::write_watch::enabled() { crate::platform::write_watch::host_write(base, len, false); return; }
     if !tracking() || len == 0 {
         return;
     }
@@ -2011,9 +2152,11 @@ fn back_in(m: &Mirror, base: u64, len: u64, count: &AtomicU64) -> Result<(), Str
         let r = parking_lot::MutexGuard::unlocked(&mut g, || {
             let sm = SPARSE_MARKS.get();
             let per_map: Vec<Vec<vk::SparseMemoryBind>> = (0..sm.map_or(0, |s| s.bufs.len())).map(|i| mbinds.iter().filter(|b| b.0 == i).map(|b| b.1).collect()).collect();
-            let mut bufs = vec![vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&binds)];
+            let driver_binds = crate::platform::graphics::sparse_buffer_binds(&binds);
+            let driver_maps: Vec<_> = per_map.iter().map(|v| crate::platform::graphics::sparse_buffer_binds(v)).collect();
+            let mut bufs = vec![vk::SparseBufferMemoryBindInfo::default().buffer(m.buf).binds(&driver_binds)];
             if let Some(sm) = sm {
-                for (i, v) in per_map.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+                for (i, v) in driver_maps.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
                     bufs.push(vk::SparseBufferMemoryBindInfo::default().buffer(sm.bufs[i]).binds(v));
                 }
             }
@@ -2542,7 +2685,7 @@ pub fn init() {
 /// Write faults on armed pages of a private region, and a pattern through
 /// the mirror's last page and back.
 fn self_test() -> Result<String, String> {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
     let n = 16 * PAGE;
     let a = unsafe { VirtualAlloc(std::ptr::null(), n as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
     if a == 0 {
@@ -2617,8 +2760,8 @@ pub fn mixed_test_maybe() {
 }
 
 fn mixed_test() -> Result<String, String> {
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::System::Memory::{GetWriteWatch, VirtualAlloc2, VirtualFree, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READWRITE};
+    use crate::platform::os::Win32::Foundation::GetLastError;
+    use crate::platform::os::Win32::System::Memory::{GetWriteWatch, VirtualAlloc2, VirtualFree, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READWRITE};
     const MEM_WRITE_WATCH: u32 = 0x0020_0000;
     let m: usize = 4 << 20;
     let c = ctx();
@@ -2697,12 +2840,12 @@ fn mixed_test() -> Result<String, String> {
 }
 
 fn section_test() -> Result<String, String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Memory::{
+    use crate::platform::os::Win32::Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE};
+    use crate::platform::os::Win32::System::Memory::{
         CreateFileMappingW, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
         MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use crate::platform::os::Win32::System::Threading::GetCurrentProcess;
     let size: usize = 64 << 20;
     let c = ctx();
     unsafe {
@@ -2855,7 +2998,7 @@ pub fn protect_test_maybe() {
 }
 
 fn protect_test() -> Result<String, String> {
-    use windows_sys::Win32::System::Memory::{GetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{GetWriteWatch, VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
     const MEM_WRITE_WATCH: u32 = 0x0020_0000;
     const PART: usize = 1 << 20;
     const PARTS: usize = 64;
@@ -2993,6 +3136,13 @@ pub fn view_census() -> String {
         v[S_VOL_REARMED],
         v[S_VOL_DECAYED]
     )
+}
+
+/// Lightweight relay counters; no page walks or GPU synchronization.
+#[cfg(target_os = "linux")]
+pub fn dirty_counters() -> [u64; 2] {
+    if crate::platform::write_watch::enabled() { return [crate::platform::write_watch::counters()[2], 0]; }
+    [TAKE_STATS[1].load(Ordering::Relaxed), TAKE_STATS[5].load(Ordering::Relaxed)]
 }
 
 pub fn status() -> String {
@@ -3208,7 +3358,7 @@ fn eager_ctx() -> Result<EagerCtx, String> {
 /// Returns the records the output had no room for.
 pub fn apply_masks_copy(out: *const u32, cap: u32) -> u32 {
     use rdna::kernels::{GATHER_HEADER_DWORDS, GATHER_MASK_RECORD_DWORDS};
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READONLY, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualProtect, PAGE_READONLY, PAGE_READWRITE};
     let t = std::time::Instant::now();
     let seq = super::cp::after_batch();
     let count = unsafe { std::ptr::read_volatile(out) };
@@ -3458,7 +3608,7 @@ const O7_UNPROTECTED: usize = 8;
 /// only; host-class pages never) and the batch is registered. None outside
 /// lazy mirror mode.
 pub fn own_begin(ranges: &[(u64, u64)]) -> Option<std::sync::Arc<Owned>> {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_NOACCESS};
+    use crate::platform::os::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_NOACCESS};
     if !mirror_mode() || !lazy_writebacks() || ranges.is_empty() {
         return None;
     }
@@ -3550,7 +3700,7 @@ pub fn own_done(o: &std::sync::Arc<Owned>) {
 /// stored to guest memory and its protection restored. True when the
 /// access may be retried.
 fn settle(page: u64, fault: bool) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let Some(c) = chunk(page, false) else { return false };
     let i = idx(page);
     if !is_gprot(c, i) {
@@ -3629,7 +3779,7 @@ fn undirty(c: &Chunk, i: usize) {
 /// (`release_dirty`). Returns the records the output had no room for.
 pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
     use rdna::kernels::{GATHER_HEADER_DWORDS, GATHER_MASK_RECORD_DWORDS};
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
     let count = unsafe { std::ptr::read_volatile(out) };
     let n = count.min(cap) as usize;
     let rec = |k: usize| unsafe { out.add(GATHER_HEADER_DWORDS as usize + k * GATHER_MASK_RECORD_DWORDS as usize) };
@@ -3690,7 +3840,7 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
         }
         let (a, e) = (fresh[i], fresh[j - 1] + PAGE);
         busy_range(a, e);
-        if protect_regions(a, e, windows_sys::Win32::System::Memory::PAGE_NOACCESS, false) {
+        if protect_regions(a, e, crate::platform::os::Win32::System::Memory::PAGE_NOACCESS, false) {
             let mut q = a;
             while q < e {
                 if let Some(c) = chunk(q, false) {
@@ -3904,7 +4054,7 @@ const READBACK_MAX: u64 = 1 << 20;
 /// their protection back. `fault`: for an access that faulted (statistics).
 /// True when the access may be retried.
 fn release_dirty(page: u64, fault: bool) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
     let t = std::time::Instant::now();
     let Some(c) = chunk(page, false) else { return false };
     let mut g = READBACK.lock();
@@ -4505,7 +4655,53 @@ pub fn one_off_now(record: impl FnOnce(vk::CommandBuffer)) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+    /// Exercise real signal recovery in isolated processes: policy initialization and
+    /// section tracking must not race the other tests' global residency state.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exact_tracking_across_epochs() {
+        let Ok(policy) = std::env::var("REGALIANT_TRACKING_TEST") else {
+            for policy in ["0", "1"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "gpu::resident::tests::linux_exact_tracking_across_epochs", "--nocapture"])
+                    .env("REGALIANT_TRACKING_TEST", policy).env("DS_LINUX_VOLATILE_BACKOFF", policy)
+                    .env("DS_SECTIONS", "1").env("DS_RESIDENT", "0").env("DS_LINUX_DIRECT_FAULT", "1")
+                    .output().unwrap();
+                assert!(out.status.success(), "policy {policy}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            }
+            return;
+        };
+        crate::mem::reserve_guest_range().unwrap();
+        crate::platform::signals::ensure_installed().unwrap();
+        let _stack = crate::platform::signals::SignalStack::new().unwrap();
+        init_linux_faults();
+        let a = commit_at(MIRROR_END - (16 << 20), PAGE).unwrap();
+        let take = || { let mut out = Vec::new(); take_written(a, PAGE, &mut out).unwrap(); out };
+        assert_eq!(take(), vec![a]);
+        for value in 1..=2 {
+            unsafe { std::ptr::write_volatile(a as *mut u64, value); }
+            assert_eq!(take(), vec![a]);
+        }
+        let direct = crate::platform::signals::DIRECT.load(Ordering::Relaxed);
+        assert!(direct >= 2, "stores must exercise direct signal recovery");
+        let mut redundant = 0;
+        for _ in 0..64 {
+            super::super::precache::end_scope(0);
+            redundant += take().len();
+        }
+        assert_eq!(redundant, if policy == "1" { 64 } else { 0 });
+        // Kernel/host writes still invalidate a clean page, without relying on a fault.
+        host_write_begin(a, 8);
+        unsafe { std::ptr::write_volatile(a as *mut u64, 3); }
+        host_write_end(a, 8);
+        super::super::precache::end_scope(0);
+        assert_eq!(take(), vec![a]);
+        assert_eq!(unsafe { std::ptr::read_volatile(a as *const u64) }, 3);
+        disarm_range(a, a + PAGE);
+        unsafe { VirtualFree(a as _, PAGE as usize, MEM_DECOMMIT) };
+    }
 
     /// Commits [want, want+n) inside the mirror's span: in the guest range,
     /// which the first heap allocation reserved (tests too), or reserved
@@ -4527,7 +4723,11 @@ mod tests {
     fn arm_fault_disarm() {
         ON.store(true, Ordering::Release);
         let n = 8 * PAGE;
+        #[cfg(windows)]
         let a = unsafe { VirtualAlloc(std::ptr::null(), n as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
+        // Linux mmap(NULL) normally lives above the guest tracking table's span.
+        #[cfg(target_os = "linux")]
+        let a = commit_at(MIRROR_END - (8 << 20), n).expect("test memory inside the tracked guest span");
         assert_ne!(a, 0);
         assert_eq!(arm(a + 10, 2 * PAGE), 3);
         assert_eq!(state(a), ST_ARMED | ST_VALID);
@@ -4549,6 +4749,17 @@ mod tests {
         // A remap resets armed pages' state (the guest's protection applies).
         remapped(a + 2 * PAGE, PAGE);
         assert_eq!(state(a + 2 * PAGE), 0);
+        #[cfg(target_os = "linux")]
+        {
+            let _stack = crate::platform::signals::SignalStack::new().unwrap();
+            crate::platform::signals::ensure_installed().unwrap();
+            assert_eq!(arm(a + 4 * PAGE, PAGE), 1);
+            // A real SIGSEGV passes through the Linux service, updates the shared resident
+            // state, and resumes the interrupted store without touching the guest red zone.
+            unsafe { std::ptr::write_volatile((a + 4 * PAGE) as *mut u32, 123); }
+            assert_eq!(state(a + 4 * PAGE) & ST_ARMED, 0);
+            assert_eq!(unsafe { std::ptr::read_volatile((a + 4 * PAGE) as *const u32) }, 123);
+        }
         disarm_range(a, a + n);
         unsafe { VirtualFree(a as _, 0, MEM_RELEASE) };
     }
@@ -4583,6 +4794,8 @@ mod tests {
         assert_eq!(take(), pages(&[]));
         // Page 2 written twice within VOLATILE_FRAMES: volatile, unarmed and
         // reported once per epoch until its stay ends, then armed again.
+        #[cfg(windows)]
+        {
         assert!(on_fault(a + 2 * PAGE, true));
         assert_eq!(take(), pages(&[2]));
         assert!(on_fault(a + 2 * PAGE, true));
@@ -4594,6 +4807,18 @@ mod tests {
         assert_eq!(take(), pages(&[2]));
         assert!(!plain_rw(a + 2 * PAGE, PAGE), "armed again");
         assert_eq!(state(a + 2 * PAGE) & ST_VOLATILE, 0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            for _ in 0..4 {
+                assert!(on_fault(a + 2 * PAGE, true));
+                assert_eq!(take(), pages(&[2]));
+                crate::gpu::precache::end_scope(0);
+                assert_eq!(take(), pages(&[]), "unchanged page stays clean across epochs");
+                assert_eq!(state(a + 2 * PAGE) & ST_VOLATILE, 0);
+                assert!(!plain_rw(a + 2 * PAGE, PAGE), "armed after every take");
+            }
+        }
         // The rest committed (mem.rs resets their states): reported next.
         assert_ne!(unsafe { VirtualAlloc((a + 8 * PAGE) as _, (8 * PAGE) as usize, MEM_COMMIT, PAGE_READWRITE) }, std::ptr::null_mut());
         remapped(a + 8 * PAGE, 8 * PAGE);

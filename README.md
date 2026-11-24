@@ -16,6 +16,8 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, Bl
 
 This is an early version.
 
+The `linux-port` branch has an experimental [Linux native bootstrap](docs/linux.md). It builds, renders the tutorial world through Vulkan and resumes saved progress. Performance and physical playtesting remain under investigation. See the Linux guide for the play command and remaining hardware-testing limits.
+
 ## Features
 
 - No CPU emulation: the game's own x86-64 code runs directly on your processor.

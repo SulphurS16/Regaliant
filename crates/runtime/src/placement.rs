@@ -77,7 +77,7 @@ fn sample(name: &dyn Fn() -> String) {
     if slot >= MAX_THREADS {
         return;
     }
-    let cpu = (unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() } as usize).min(MAX_CPUS - 1);
+    let cpu = (unsafe { crate::platform::os::Win32::System::Threading::GetCurrentProcessorNumber() } as usize).min(MAX_CPUS - 1);
     let now = unsafe { core::arch::x86_64::_rdtsc() } & TSC_MASK;
     COUNTS[slot][cpu].fetch_add(1, Ordering::Relaxed);
     LAST[slot].store(((cpu as u64 + 1) << 56) | now, Ordering::Relaxed);

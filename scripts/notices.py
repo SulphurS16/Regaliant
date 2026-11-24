@@ -246,7 +246,7 @@ def rust_std_section():
 
 INTRO = """\
 Third-party notices: regaliant.exe and regaliant-launcher.exe
-=============================================================
+-------------------------------------------------------------
 
 Regaliant, an unofficial PC port of Demon's Souls, is free software under the GNU General Public
 License, version 3 or (at your option) any later version (LICENSE). Besides its own code,
@@ -275,7 +275,7 @@ def main():
     ]
     out = [INTRO]
     for n, (title, body) in enumerate(sections, 1):
-        out.append(f"\n{'=' * WIDTH}\n{n}. {title}\n{'=' * WIDTH}\n\n{body}")
+        out.append(f"\n{'-' * WIDTH}\n{n}. {title}\n{'-' * WIDTH}\n\n{body}")
     OUT.write_text(''.join(out), encoding='utf-8', newline='\n')
     print(f'{OUT.name}: {OUT.stat().st_size} bytes')
 

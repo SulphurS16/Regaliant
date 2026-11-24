@@ -168,11 +168,11 @@ pub fn instance_offset_slot(addr: u64) -> Option<u32> {
     // lookup was ~10% of the graphics CP's busy time at a vista).
     thread_local! {
         static LAST: std::cell::Cell<(u64, u64, Option<u32>)> = const { std::cell::Cell::new((u64::MAX, u64::MAX, None)) };
-        static MEMO: std::cell::RefCell<(u64, crate::gpu::fx::Map<u64, Option<u32>>)> = std::cell::RefCell::new((u64::MAX, Default::default()));
+        static MEMO: std::cell::RefCell<(u64, crate::platform::graphics::Map<u64, Option<u32>>)> = std::cell::RefCell::new((u64::MAX, Default::default()));
     }
     let g = SHADERS_GEN.load(std::sync::atomic::Ordering::Acquire);
     let (lg, la, lv) = LAST.get();
-    if lg == g && la == addr && crate::gpu::tune::plan_fast() {
+    if lg == g && la == addr && crate::platform::graphics::plan_fast() {
         return lv;
     }
     let v = MEMO.with(|m| {
@@ -281,7 +281,7 @@ unsafe fn log_shader_info(h: u64) {
     if !*ON.get_or_init(|| std::env::var_os("DS_SHADER_INFO").is_some()) {
         return;
     }
-    let readable = |a: u64, n: u64| a != 0 && crate::gpu::cp::guest_readable(a, n);
+    let readable = |a: u64, n: u64| a != 0 && crate::platform::loader_hooks::guest_readable(a, n);
     let words = |a: u64, n: u64| (0..n).map(|i| format!("{:08x}", unsafe { rd32(a + 4 * i) })).collect::<Vec<_>>().join(" ");
     unsafe {
         let stage = *((h + TYPE) as *const u8);
@@ -475,17 +475,17 @@ sysv! {
                     let r = REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
                     SHADERS.lock().insert(addr, (stage, size as usize, instance_offset_slot_of(h, stage), r));
                     SHADERS_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    if matches!(stage, 1 | 2) && crate::gpu::tune::precompile() > 0 {
-                        crate::gpu::precompile::created_graphics(addr);
+                    if matches!(stage, 1 | 2) && crate::platform::graphics::precompile() > 0 {
+                        crate::platform::graphics::created_graphics(addr);
                     }
-                    if stage == 0 && crate::gpu::tune::precompile() > 0 {
+                    if stage == 0 && crate::platform::graphics::precompile() > 0 {
                         // The registers a compute dispatch takes from it
                         // (`gpu::precompile`).
                         let reg = |r: u32| (0..n).map(|k| regs + 8 * k).find(|&a| rd32(a) == r).map(|a| rd32(a + 4));
                         let sp = rd64(h + SPECIALS);
                         let modifier = if sp != 0 { rd32(sp + specials::DISPATCH_MODIFIER) } else { 0 };
                         let threads = |r: u32| reg(r).unwrap_or(1) & 0xFFFF;
-                        crate::gpu::precompile::created(addr, reg(0x213).unwrap_or(0), [threads(0x207), threads(0x208), threads(0x209)], modifier);
+                        crate::platform::graphics::created(addr, reg(0x213).unwrap_or(0), [threads(0x207), threads(0x208), threads(0x209)], modifier);
                     }
                     break;
                 }

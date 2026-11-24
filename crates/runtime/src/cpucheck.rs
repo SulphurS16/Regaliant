@@ -163,6 +163,7 @@ mod tests {
     #[test]
     fn insertq_code_runs() {
         use iced_x86::code_asm::*;
+        #[cfg(windows)]
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
         fn reg(i: u32) -> AsmRegisterXmm {
             [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15][i as usize]
@@ -192,7 +193,15 @@ mod tests {
             a.movdqu(reg(src), xmmword_ptr(rsp + 16)).unwrap();
             a.add(rsp, 40).unwrap();
             a.ret().unwrap();
+            #[cfg(windows)]
             let mem = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+            #[cfg(target_os = "linux")]
+            let allocation = crate::platform::vm::Reservation::new_at(0, 4096).unwrap();
+            #[cfg(target_os = "linux")]
+            let mem = {
+                allocation.protect(0, 4096, crate::platform::vm::READ | crate::platform::vm::WRITE | crate::platform::vm::EXEC).unwrap();
+                allocation.base() as *mut u8
+            };
             assert!(!mem.is_null());
             let bytes = a.assemble(mem as u64).unwrap();
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem, bytes.len()) };
@@ -200,6 +209,7 @@ mod tests {
             let (d_lo, d_hi, s_lo, s_hi) = (0x8877_6655_4433_2211u64, 0xffee_ddcc_bbaa_9988u64, 0x0102_0304_0506_0708u64, 0x1112_1314_1516_1718u64);
             let mut v = [d_lo, d_hi, s_lo, s_hi, 0, 0, 0, 0];
             f(v.as_mut_ptr());
+            #[cfg(windows)]
             unsafe { VirtualFree(mem as _, 0, MEM_RELEASE) };
             let src_lo = if src == dst { d_lo } else { s_lo };
             let mask = if len == 0 { u64::MAX } else { (1u64 << len) - 1 };

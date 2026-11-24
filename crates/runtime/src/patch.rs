@@ -176,6 +176,11 @@ impl<'a> Patcher<'a> {
         // Absolute [disp32] decodes with an 8-byte displacement size in 64-bit
         // mode; relative to a base register it is a sign-extended disp32.
         rewritten.set_memory_displ_size(if disp == 0 { 0 } else { 4 });
+        // Linux cannot tolerate an unpatched FS access (FS belongs to libc). iced-x86's
+        // displacement size describes the address size here: 8 for a sign-extended disp32
+        // with a 64-bit base. Keep the existing Windows patch policy unchanged in this port.
+        #[cfg(target_os = "linux")]
+        rewritten.set_memory_displ_size(if disp == 0 { 0 } else { 8 });
         list.push(rewritten);
         list.push(e(Instruction::with1(Code::Pop_r64, scratch))?);
         list.push(e(Instruction::with2(Code::Lea_r64_m, Register::RSP, MemoryOperand::with_base_displ(Register::RSP, 0x80)))?);
@@ -487,4 +492,50 @@ pub fn dump_around(base: u64, range: (u64, u64), site: u64) {
         }
     }
     crate::info!("function {:#x}..{:#x} around {:#x}:\n{}", range.0, range.1, site, out);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use crate::platform::{tls, vm};
+
+    #[test]
+    fn patched_tls_load_and_error_store_run_without_changing_host_fs() {
+        // mov rax,fs:[0]; mov dword ptr fs:[28h],0A0020307h; ret
+        let original = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+            0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 7, 3, 2, 0xa0, 0xc3];
+        let area = vm::Reservation::new_at(0, 8192).unwrap();
+        area.protect(0, 8192, vm::READ | vm::WRITE).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts_mut(area.base() as *mut u8, 8192) };
+        bytes[..original.len()].copy_from_slice(&original);
+        let (image, tramp) = bytes.split_at_mut(4096);
+        let mut p = Patcher { image, base: area.base() as u64, tls_slot_disp: teb_tls_slot_offset(0), tramp_base: area.base() as u64 + 4096, tramp, tramp_used: 0 };
+        let mut stats = PatchStats::default();
+        p.patch_functions(&[(0, original.len() as u64)], &mut stats);
+        assert!(stats.fs_unknown.is_empty(), "{:?}", stats.fs_unknown);
+        assert_eq!(stats.fs_zero, 1);
+        assert_eq!(stats.fs_tramp, 1);
+        area.protect(0, 8192, vm::READ | vm::EXEC).unwrap();
+        let mut tcb = [0u64; 16];
+        let tp = tcb.as_mut_ptr() as u64;
+        tcb[0] = tp;
+        let previous = tls::get(0);
+        tls::set(0, tp);
+        let f: unsafe extern "sysv64" fn() -> u64 = unsafe { std::mem::transmute(area.base()) };
+        let result = unsafe { f() };
+        tls::set(0, previous);
+        assert_eq!(result, tp);
+        assert_eq!(tcb[5] as u32, 0xa0020307);
+    }
+
+    #[test]
+    fn guest_syscalls_become_traps() {
+        let mut image = [0x0f, 0x05, 0xc3];
+        let mut tramp = [0; 32];
+        let mut p = Patcher { image: &mut image, base: 0x10000, tls_slot_disp: teb_tls_slot_offset(0), tramp_base: 0x20000, tramp: &mut tramp, tramp_used: 0 };
+        let mut stats = PatchStats::default();
+        p.patch_functions(&[(0, 3)], &mut stats);
+        assert_eq!(stats.syscalls, [0]);
+        assert_eq!(image, [0x0f, 0x0b, 0xc3]);
+    }
 }

@@ -170,7 +170,7 @@ static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(1);
 static NEXT_BATCH: AtomicU32 = AtomicU32::new(1);
 
 fn with_instances<R>(f: impl FnOnce(&mut HashMap<u32, Instance>) -> R) -> R {
-    f(crate::gpu::lockstat::AJM.lock(&INSTANCES).get_or_insert_with(HashMap::new))
+    f(crate::platform::loader_hooks::ajm_lock(&INSTANCES).get_or_insert_with(HashMap::new))
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +631,7 @@ unsafe fn run_job(p: u64) -> i32 {
         let out_cap: usize = (0..nout).map(|i| *((outs + 16 * i + 8) as *const u64) as usize).sum();
         let mut pcm = Vec::with_capacity(out_cap);
         let (outcome, fmt) = {
-            let mut g = crate::gpu::lockstat::AJM.lock(&INSTANCES);
+            let mut g = crate::platform::loader_hooks::ajm_lock(&INSTANCES);
             let m = g.get_or_insert_with(HashMap::new);
             let Some(inst) = m.get_mut(&instance) else {
                 write_result(sb, sbsize, RESULT_INVALID_PARAMETER);
@@ -929,7 +929,7 @@ sysv! {
         // Decoder setup writes libatrac9's shared tables: under the lock the
         // decoders run under.
         let info = {
-            let _g = crate::gpu::lockstat::AJM.lock(&INSTANCES);
+            let _g = crate::platform::loader_hooks::ajm_lock(&INSTANCES);
             match new_at9(cfg) {
                 Some(Decoder::At9 { info, .. }) | Some(Decoder::At9Multi { info, .. }) => info,
                 _ => return ERR_INVALID_PARAMETER,

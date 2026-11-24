@@ -18,13 +18,13 @@
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Memory::{
+use crate::platform::os::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use crate::platform::os::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
     MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS,
     PAGE_READWRITE, SEC_RESERVE,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use crate::platform::os::Win32::System::Threading::GetCurrentProcess;
 
 /// VirtualFree's MEM_COALESCE_PLACEHOLDERS (not named by windows-sys).
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
@@ -206,6 +206,11 @@ static SPLIT_HI: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// Splits made, and the last one's range and time (`log::elapsed_ms`):
 /// diagnostics of kernel-mode accesses that failed (`mem::kernel_io`).
 static SPLITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+#[cfg(target_os = "linux")]
+static SPLIT_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// A fault service's permission check is valid only if no split changed around it.
+#[cfg(target_os = "linux")]
+pub fn split_generation() -> u64 { SPLIT_GENERATION.load(Ordering::SeqCst) }
 static LAST_SPLIT: Mutex<(u64, u64, f64)> = Mutex::new((0, 0, 0.0));
 /// Causes of splits (`split_begin`): a mapping made over part of a view, a
 /// part unmapped, a part's protection changed.
@@ -220,6 +225,8 @@ pub fn split_begin(lo: u64, hi: u64, why: usize) {
     *LAST_SPLIT.lock() = (lo, hi, crate::log::elapsed_ms());
     SPLIT_LO.store(lo, Ordering::SeqCst);
     SPLIT_HI.store(hi, Ordering::SeqCst);
+    #[cfg(target_os = "linux")]
+    SPLIT_GENERATION.fetch_add(1, Ordering::SeqCst);
     // (The host retries faults inside it: handled here they would
     // overwrite the guest's red zone.)
     crate::hosted::splitting(lo, hi);
@@ -258,6 +265,8 @@ pub fn split_line() -> String {
 pub fn split_end() {
     SPLIT_HI.store(0, Ordering::SeqCst);
     SPLIT_LO.store(0, Ordering::SeqCst);
+    #[cfg(target_os = "linux")]
+    SPLIT_GENERATION.fetch_add(1, Ordering::SeqCst);
     crate::hosted::splitting(0, 0);
 }
 
@@ -316,7 +325,7 @@ pub fn anon_free(off: u64, size: u64) {
 /// The placeholder or view containing `a`: (allocation start, end, is a
 /// placeholder: reserved and not a mapped view).
 fn region(a: u64) -> Option<(u64, u64, bool)> {
-    use windows_sys::Win32::System::Memory::MEM_MAPPED;
+    use crate::platform::os::Win32::System::Memory::MEM_MAPPED;
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { VirtualQuery(a as _, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
         return None;
@@ -544,7 +553,7 @@ mod tests {
     /// range of their own (no `reserve`).
     #[test]
     fn write_watch_beside_views() {
-        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        use crate::platform::os::Win32::System::Memory::GetWriteWatch;
         const MEM_WRITE_WATCH: u32 = 0x0020_0000;
         const WRITE_WATCH_FLAG_RESET: u32 = 1;
         let base = 0x6100_0000_0000u64;
@@ -588,10 +597,10 @@ mod tests {
             // The view is protectable while its alias is not (the scheme's
             // premise), and its pages report nothing to write watching.
             let mut old = 0u32;
-            assert!(VirtualProtect((base + 2 * m) as _, 0x1000, windows_sys::Win32::System::Memory::PAGE_READONLY, &mut old) != 0);
+            assert!(VirtualProtect((base + 2 * m) as _, 0x1000, crate::platform::os::Win32::System::Memory::PAGE_READONLY, &mut old) != 0);
             assert!(VirtualProtect((base + 2 * m) as _, 0x1000, PAGE_READWRITE, &mut old) != 0);
             UnmapViewOfFile2(GetCurrentProcess(), v, 0);
-            windows_sys::Win32::Foundation::CloseHandle(sec);
+            crate::platform::os::Win32::Foundation::CloseHandle(sec);
             VirtualFree(base as _, 0, MEM_RELEASE);
             VirtualFree((base + m) as _, 0, MEM_RELEASE);
         }
@@ -603,7 +612,7 @@ mod tests {
     /// coalesced (a mapping unmapped).
     #[test]
     fn write_watch_at_16k() {
-        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        use crate::platform::os::Win32::System::Memory::GetWriteWatch;
         const MEM_WRITE_WATCH: u32 = 0x0020_0000;
         let base = 0x6200_0000_0000u64;
         let k = 16u64 << 10;
@@ -627,7 +636,7 @@ mod tests {
             assert!(VirtualFree((base + k) as _, k as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0, "release to a placeholder: error {}", GetLastError());
             assert!(VirtualFree(base as _, (2 * k) as usize, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0, "coalesce: error {}", GetLastError());
             UnmapViewOfFile2(GetCurrentProcess(), v, 0);
-            windows_sys::Win32::Foundation::CloseHandle(sec);
+            crate::platform::os::Win32::Foundation::CloseHandle(sec);
             VirtualFree(base as _, 0, MEM_RELEASE);
             VirtualFree((base + 3 * k) as _, 0, MEM_RELEASE);
         }
@@ -641,7 +650,7 @@ mod tests {
     /// given to a view later).
     #[test]
     fn windowed_private_allocations() {
-        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_DECOMMIT, PAGE_READONLY};
+        use crate::platform::os::Win32::System::Memory::{GetWriteWatch, MEM_DECOMMIT, PAGE_READONLY};
         const MEM_WRITE_WATCH: u32 = 0x0020_0000;
         let base = 0x6300_0000_0000u64;
         let w = 1u64 << 20;
@@ -699,7 +708,7 @@ mod tests {
             let v = MapViewOfFile3(sec, GetCurrentProcess(), (base + w) as _, 0, (2 * w) as usize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
             assert!(!v.Value.is_null(), "a view where the allocation was: error {}", GetLastError());
             UnmapViewOfFile2(GetCurrentProcess(), v, 0);
-            windows_sys::Win32::Foundation::CloseHandle(sec);
+            crate::platform::os::Win32::Foundation::CloseHandle(sec);
             VirtualFree(base as _, 0, MEM_RELEASE);
             VirtualFree((base + w) as _, 0, MEM_RELEASE);
         }

@@ -100,7 +100,7 @@ pub extern "sysv64" fn rad_speaker_hook(regs: *const u64, _arg: u32) {
             "RAD speaker gains: voice {voice:#x} ({ch} channels), {count} speakers, matrix [{}]{} (from {})",
             gains.join(" "),
             if fixed { ": the right channel added to the front right" } else { "" },
-            crate::exception::current_guest_frames(3).join(" <- ")
+            crate::platform::loader_hooks::current_guest_frames(3).join(" <- ")
         );
     }
 }
@@ -221,7 +221,7 @@ fn note_pad_buffer(data: *mut PadData, how: &str) {
     if (n >= 256 && n % 64 != 0) || SEEN.lock().len() >= 8 {
         return;
     }
-    let frames = crate::exception::current_guest_frames(4);
+    let frames = crate::platform::loader_hooks::current_guest_frames(4);
     let key = (data as u64, frames.first().cloned().unwrap_or_default());
     let mut g = SEEN.lock();
     if g.len() < 8 && !g.contains(&key) {

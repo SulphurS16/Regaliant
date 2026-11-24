@@ -41,6 +41,7 @@ use std::sync::Arc;
 /// workers +6% against 2 and 8 none more (2026-10-21, with the title's idle
 /// job workers asleep: a third was for CPUs shared with their polling).
 pub fn workers() -> usize {
+    if super::nan_probe::early_on() { return 0; }
     match super::tune::par() {
         1000 => {
             static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -502,7 +503,7 @@ impl Pool {
     /// Wakes the idle workers to the runs given them (`Worker::give`).
     pub fn wake(&self) {
         self.wake.fetch_add(1, Ordering::AcqRel);
-        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
+        unsafe { crate::platform::os::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
     }
 
     /// Worker `i` of the command processor `name` (started on first use);
@@ -586,11 +587,11 @@ fn run_worker(w: &Worker, name: &str, compute: bool) {
                 IDLE[k][1].fetch_add(1, Ordering::Relaxed);
             }
             unsafe {
-                windows_sys::Win32::System::Threading::WaitOnAddress(
+                crate::platform::os::Win32::System::Threading::WaitOnAddress(
                     Arc::as_ptr(&w.wake) as *const core::ffi::c_void,
                     &seen as *const u64 as *const core::ffi::c_void,
                     8,
-                    windows_sys::Win32::System::Threading::INFINITE,
+                    crate::platform::os::Win32::System::Threading::INFINITE,
                 )
             };
             IDLE[k][0].fetch_add(1, Ordering::Relaxed);

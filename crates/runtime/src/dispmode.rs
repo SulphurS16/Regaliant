@@ -180,8 +180,7 @@ fn start_aspect() {
             if !crate::gpu::vk::present::active() || !fullscreen {
                 return;
             }
-            use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-            let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            let (w, h) = crate::platform::loader_hooks::desktop_size();
             if w <= 0 || h <= 0 {
                 return;
             }

@@ -2486,7 +2486,7 @@ fn hole_check(written: &[u64]) {
 /// pages, so what it reports was written since their last take).
 /// (runs, pages queried, pages reported written, failed queries, ns.)
 pub fn fe3_scan_dry() -> (u64, u64, u64, u64, u64) {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    use crate::platform::os::Win32::System::Memory::GetWriteWatch;
     let t = std::time::Instant::now();
     let (mut runs, mut queried, mut written, mut failed) = (0u64, 0u64, 0u64, 0u64);
     let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 512];
@@ -2561,7 +2561,7 @@ pub fn fe3_scan_dry() -> (u64, u64, u64, u64, u64) {
 /// rings' spans of pages written within 2 flips summed, those pages, rings
 /// holding any, the spans by 64 MiB window summed].
 pub fn fe3_scan_dry2() -> [u64; 22] {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    use crate::platform::os::Win32::System::Memory::GetWriteWatch;
     let t = std::time::Instant::now();
     let frame = super::FRAMES.load(Ordering::Relaxed);
     let mut out = [0u64; 22];
@@ -3547,7 +3547,7 @@ fn behind_thread() {
     BEHIND_ARMING.with(|f| f.set(true));
     // (Below the recording threads: its work is never on their path.)
     unsafe {
-        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+        crate::platform::os::Win32::System::Threading::SetThreadPriority(crate::platform::os::Win32::System::Threading::GetCurrentThread(), crate::platform::os::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
     }
     let mut runs: Vec<(u64, u64)> = Vec::new();
     let mut merged: Vec<(u64, u64)> = Vec::new();
@@ -4196,7 +4196,7 @@ fn held(x: u64, y: u64, frame: u64) -> bool {
 }
 
 fn plain_rw(a: u64, n: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_READWRITE};
     let mut p = a;
     while p < a + n {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -5662,7 +5662,7 @@ pub fn init() {
 /// page made read-write again and checked (FRONTEND4.md C4: a held page is
 /// no-access while GPU work may still reach it).
 fn protection_test() -> String {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
     let c = ctx();
     let mut out = Vec::new();
     // (Also: a page made no-access before its import.)
@@ -5735,7 +5735,7 @@ fn protection_test() -> String {
 /// the others keep what the CPU wrote, and the marks and the touched bit
 /// must be cleared.
 fn self_test() -> Result<String, String> {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
     let c = ctx();
     let marks = super::resident::marks().ok_or("no written-bit map")?;
     let table = super::pagetable::buffer().ok_or("no page table")?;
@@ -5826,7 +5826,7 @@ fn self_test() -> Result<String, String> {
 /// from the mirror into the import and the import filled (each between the
 /// same barriers). Its pages and marks are cleared again after.
 fn scatter_bench() -> Result<String, String> {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
     let want: u64 = std::env::var("DS_FE2_SCATTER_BENCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let bench_pages: u64 = if want <= 1 { 64 } else { want.clamp(64, 16384).next_multiple_of(32) };
     const BENCH_REPS: usize = 15;
@@ -6016,6 +6016,14 @@ fn scatter_bench() -> Result<String, String> {
 }
 
 /// One status line ("" when off).
+/// Scheduled upload bytes and completed write-back bytes (different pipeline stages).
+/// Read atomics only: unlike status(), safe to sample without GPU counter readbacks.
+#[cfg(target_os = "linux")]
+pub fn traffic_counters() -> [u64; 3] {
+    [STATS[S_UPLOAD_PAGES].load(Ordering::Relaxed) * PAGE,
+     WB64[1].load(Ordering::Relaxed) * 4, STATS[S_UPLOADS].load(Ordering::Relaxed)]
+}
+
 pub fn status() -> String {
     if !on() {
         return String::new();
@@ -7414,7 +7422,7 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
         }
     };
     let lock = crate::hosted::arm_lock();
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
     let mut old = 0u32;
     // The pages with a window: their guest copy is current; read-write now.
     for (i, &p) in pages.iter().enumerate() {
@@ -7426,7 +7434,7 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
     }
     // The others through host memory, every other thread suspended.
     if let Some((sbuf, smem, sptr)) = staged {
-        let mut handles: Vec<windows_sys::Win32::Foundation::HANDLE> = Vec::with_capacity(4096);
+        let mut handles: Vec<crate::platform::os::Win32::Foundation::HANDLE> = Vec::with_capacity(4096);
         let mut tids: Vec<u32> = Vec::with_capacity(4096);
         let t1 = std::time::Instant::now();
         suspend_others(&mut handles, &mut tids);
@@ -7445,7 +7453,7 @@ fn c4_release_pages(pages: &[u64]) -> Result<(), String> {
         C4X[X_SUSPEND_US].fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
         C4X[X_CPU_PAGES].fetch_add(cpu.len() as u64, Ordering::Relaxed);
         for h in handles {
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+            unsafe { crate::platform::os::Win32::Foundation::CloseHandle(h) };
         }
         unsafe {
             c.device.destroy_buffer(sbuf, None);
@@ -7793,7 +7801,7 @@ fn late_worker() {
 
 /// `store_fallback`'s stores, its locks held (`lock`, the host's arm lock, released here).
 fn store_pages(f: &Fallback, lock: parking_lot::ReentrantMutexGuard<'static, ()>) {
-    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+    use crate::platform::os::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
     let (mut n_pg, mut n_dw, mut left, mut failed) = (0u64, 0u64, 0u64, 0u64);
     let hosted = crate::hosted::on();
     for (k, &(p, since)) in f.pages.iter().enumerate() {
@@ -7850,13 +7858,13 @@ fn store_pages(f: &Fallback, lock: parking_lot::ReentrantMutexGuard<'static, ()>
 /// Suspends every other thread of the process (handles and thread IDs into
 /// the caller's vectors, whose capacity must suffice: nothing allocates
 /// once a thread is suspended), snapshots taken until none is new.
-fn suspend_others(handles: &mut Vec<windows_sys::Win32::Foundation::HANDLE>, tids: &mut Vec<u32>) {
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
+fn suspend_others(handles: &mut Vec<crate::platform::os::Win32::Foundation::HANDLE>, tids: &mut Vec<u32>) {
+    use crate::platform::os::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use crate::platform::os::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
     let (pid, me) = unsafe { (GetCurrentProcessId(), GetCurrentThreadId()) };
     for _ in 0..4 {
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        if snap == crate::platform::os::Win32::Foundation::INVALID_HANDLE_VALUE {
             return;
         }
         let mut new = 0;
@@ -7872,31 +7880,31 @@ fn suspend_others(handles: &mut Vec<windows_sys::Win32::Foundation::HANDLE>, tid
                         tids.push(te.th32ThreadID);
                         new += 1;
                     } else {
-                        unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+                        unsafe { crate::platform::os::Win32::Foundation::CloseHandle(h) };
                     }
                 }
             }
             ok = unsafe { Thread32Next(snap, &mut te) } != 0;
         }
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+        unsafe { crate::platform::os::Win32::Foundation::CloseHandle(snap) };
         if new == 0 {
             break;
         }
     }
     // (A suspension takes effect asynchronously: a context read waits for it.)
     #[repr(C, align(16))]
-    struct Ctx16(windows_sys::Win32::System::Diagnostics::Debug::CONTEXT);
+    struct Ctx16(crate::platform::os::Win32::System::Diagnostics::Debug::CONTEXT);
     for &h in handles.iter() {
         let mut ctx: Ctx16 = unsafe { std::mem::zeroed() };
         // (CONTEXT_CONTROL for AMD64.)
         ctx.0.ContextFlags = 0x0010_0001;
-        unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(h, &mut ctx.0) };
+        unsafe { crate::platform::os::Win32::System::Diagnostics::Debug::GetThreadContext(h, &mut ctx.0) };
     }
 }
 
-fn resume_others(handles: &[windows_sys::Win32::Foundation::HANDLE]) {
+fn resume_others(handles: &[crate::platform::os::Win32::Foundation::HANDLE]) {
     for &h in handles {
-        unsafe { windows_sys::Win32::System::Threading::ResumeThread(h) };
+        unsafe { crate::platform::os::Win32::System::Threading::ResumeThread(h) };
     }
 }
 

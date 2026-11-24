@@ -940,7 +940,7 @@ pub fn full_from_start() {
 }
 
 fn set_priority(normal: bool) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+    use crate::platform::os::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
     unsafe { SetThreadPriority(GetCurrentThread(), if normal { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_LOWEST }) };
 }
 
@@ -997,7 +997,7 @@ fn add_workers(max: usize, what: &str) {
     let Some((list, t0)) = LIST.get() else { return };
     let have = LIST_WORKERS.load(Relaxed);
     let free_gib = {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        use crate::platform::os::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { 0.0 } else { m.ullAvailPhys as f64 / (1u64 << 30) as f64 }
@@ -1123,8 +1123,8 @@ fn work_list(src: &dsconfig::zar::Source, threads: usize) -> (Vec<Prog>, Vec<(us
 
 /// The process's committed private bytes.
 fn private_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use crate::platform::os::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    use crate::platform::os::Win32::System::Threading::GetCurrentProcess;
     let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
     c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
     let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS, c.cb) };

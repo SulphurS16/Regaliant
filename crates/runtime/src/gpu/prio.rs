@@ -124,7 +124,7 @@ pub fn apply() {
 
 #[cold]
 fn set(had: (u64, u64), want: (u64, u64)) {
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL};
+    use crate::platform::os::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL};
     if had.0 != want.0 {
         let p = match want.0 {
             0 => THREAD_PRIORITY_NORMAL,
@@ -206,7 +206,7 @@ fn guest_from(front: u64, process: u64) -> u64 {
 /// (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records of RelationProcessorCore:
 /// PROCESSOR_RELATIONSHIP from 8, GroupMask[0].Mask at 32, .Group at 40).
 fn core_groups() -> Vec<u64> {
-    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
+    use crate::platform::os::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
     let mut len = 0u32;
     unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
     if len == 0 {
@@ -239,7 +239,7 @@ fn core_groups() -> Vec<u64> {
 
 /// The process's affinity mask (processor group 0).
 fn process_mask() -> u64 {
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
+    use crate::platform::os::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
     let (mut process, mut system) = (0usize, 0usize);
     if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) } == 0 {
         return 0;
@@ -252,7 +252,7 @@ fn process_mask() -> u64 {
 /// Relationship at 0, Size at 4, CACHE_RELATIONSHIP from 8: Level at 8,
 /// GroupMask.Mask at 40, GroupMask.Group at 48).
 fn l3_groups() -> Vec<u64> {
-    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationCache};
+    use crate::platform::os::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationCache};
     let mut len = 0u32;
     unsafe { GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut len) };
     if len == 0 {

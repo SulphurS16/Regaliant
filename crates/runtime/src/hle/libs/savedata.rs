@@ -49,6 +49,31 @@ pub fn init(root: PathBuf) {
     ROOT.set(root).ok();
 }
 
+/// Persist files the title has already written. Do not commit unfinished transactions:
+/// recovery at the next mount preserves the previous committed save. This cannot make
+/// the guest create a new checkpoint; players should quit through the game's menu first.
+#[cfg(target_os = "linux")]
+pub fn flush_on_exit() {
+    fn sync_tree(path: &Path) -> std::io::Result<u64> {
+        let mut files = 0;
+        for e in std::fs::read_dir(path)? {
+            let e = e?;
+            let kind = e.file_type()?;
+            if kind.is_dir() { files += sync_tree(&e.path())?; }
+            else if kind.is_file() { std::fs::File::open(e.path())?.sync_all()?; files += 1; }
+            // Never follow a symlink out of the save tree.
+        }
+        std::fs::File::open(path)?.sync_all()?;
+        Ok(files)
+    }
+    if let Some(root) = ROOT.get().filter(|r| r.exists()) {
+        match sync_tree(root) {
+            Ok(n) => crate::info!("savedata shutdown: synced {n} existing files; unfinished transactions retained for recovery"),
+            Err(e) => crate::warn!("savedata shutdown flush: {e}"),
+        }
+    }
+}
+
 pub fn title_id() -> String {
     if let Some(t) = super::app::param_json().get("titleId").and_then(|v| v.as_str()) {
         return t.to_string();
@@ -232,7 +257,7 @@ fn read_blocks(dir: &std::path::Path) -> u64 {
 fn user_root(user: i32, title: *const u8) -> PathBuf {
     let t = if title.is_null() { title_id() } else { unsafe { cstr(title) }.to_string() };
     let t = if t.is_empty() { title_id() } else { t };
-    ROOT.get().expect("savedata root").join(format!("{user}")).join(t)
+    crate::platform::file_hooks::save_root(ROOT.get().expect("savedata root").join(format!("{user}")).join(t))
 }
 
 fn valid_dir_name(s: &str) -> bool {
@@ -411,12 +436,12 @@ sysv! {
         0
     }
     fn sceSaveDataGetSaveDataMemory(user: i32, buf: *mut u8, size: u64, offset: i64) -> i32 {
-        use std::os::windows::fs::FileExt;
+        use crate::platform::files::FileExt;
         let f = match std::fs::File::open(memory_file(user)) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };
         let out = std::slice::from_raw_parts_mut(buf, size as usize);
         out.fill(0);
         // The kernel writes the buffer: write-tracked pages cannot fault.
-        let _w = crate::gpu::track::host_write(buf as u64, size);
+        let _w = crate::platform::file_hooks::host_write(buf as u64, size);
         let what = || format!("save data memory read [{offset:#x}+{size:#x}] into {:#x}", buf as u64);
         let _ = crate::mem::kernel_io(&what, buf as u64, size, true, || f.seek_read(&mut out[..], offset as u64));
         0
@@ -538,7 +563,7 @@ sysv! {
     }
 
     fn sceSaveDataSetSaveDataMemory(user: i32, buf: *const u8, size: u64, offset: i64) -> i32 {
-        use std::os::windows::fs::FileExt;
+        use crate::platform::files::FileExt;
         let path = memory_file(user);
         if let Some(d) = path.parent() { backup_once(d); }
         let f = match std::fs::OpenOptions::new().write(true).open(&path) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };

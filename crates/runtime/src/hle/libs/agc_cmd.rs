@@ -197,7 +197,7 @@ fn marker(cb: u64, compute: bool, operation: u32, s: *const u8, color: u32) -> u
             "bink build: cb {cb:#x} (start {bottom:#x}, cursor +{} dw, top-down {} dw) by {}",
             (up.wrapping_sub(bottom) as i64) / 4,
             (top.wrapping_sub(down) as i64) / 4,
-            crate::exception::current_guest_frames(10).join(" <- ")
+            crate::platform::loader_hooks::current_guest_frames(10).join(" <- ")
         );
     }
     private(cb, compute, operation, &marker_payload(color, &text))
@@ -309,7 +309,7 @@ fn draw_trace(what: &str, count: u32) {
             Some(w) => format!("; guest stack: {}", w.iter().map(|v| format!("{v:x}")).collect::<Vec<_>>().join(" ")),
             None => String::new(),
         };
-        crate::info!("agc: {what} count {count}: {}{stack}", crate::exception::current_guest_frames(16).join(" <- "));
+        crate::info!("agc: {what} count {count}: {}{stack}", crate::platform::loader_hooks::current_guest_frames(16).join(" <- "));
     }
 }
 
@@ -326,7 +326,7 @@ fn indirect_trace(what: &str, offset: u32) {
     {
         return;
     }
-    let frames = crate::exception::current_guest_frames(12);
+    let frames = crate::platform::loader_hooks::current_guest_frames(12);
     let key = frames.iter().take(6).cloned().collect::<Vec<_>>().join(" <- ");
     {
         let mut g = SEEN.lock();

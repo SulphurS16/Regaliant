@@ -88,6 +88,11 @@ std::arch::global_asm!(
     "call r12",
     "call {returned}",
     "ud2",
+    returned = sym fiber_entry_returned,
+);
+
+#[cfg(windows)]
+std::arch::global_asm!(
     // void ds_call_on_stack(u64 top [rcx], void (*f)(void*) [rdx], void* arg [r8],
     //                       u64 limit [r9])  [win64]
     // Calls f(arg) with rsp just below `top` and the TEB stack bounds set to
@@ -118,7 +123,38 @@ std::arch::global_asm!(
     "pop rbp",
     "ret",
     ".seh_endproc",
-    returned = sym fiber_entry_returned,
+);
+
+#[cfg(target_os = "linux")]
+std::arch::global_asm!(
+    ".globl ds_call_on_stack",
+    ".type ds_call_on_stack,@function",
+    "ds_call_on_stack:",
+    ".cfi_startproc",
+    "push rbp",
+    ".cfi_def_cfa_offset 16",
+    ".cfi_offset rbp, -16",
+    "mov rbp, rsp",
+    ".cfi_def_cfa_register rbp",
+    "push qword ptr gs:[8]",
+    "push qword ptr gs:[0x10]",
+    // SysV: rdi=top, rsi=callback, rdx=arg, rcx=limit. No Win64 shadow space.
+    "mov qword ptr gs:[8], rdi",
+    "mov qword ptr gs:[0x10], rcx",
+    "mov rsp, rdi",
+    "and rsp, -16",
+    "mov rdi, rdx",
+    "call rsi",
+    "mov rcx, [rbp-8]",
+    "mov qword ptr gs:[8], rcx",
+    "mov rcx, [rbp-16]",
+    "mov qword ptr gs:[0x10], rcx",
+    "mov rsp, rbp",
+    "pop rbp",
+    ".cfi_def_cfa rsp, 8",
+    "ret",
+    ".cfi_endproc",
+    ".size ds_call_on_stack, .-ds_call_on_stack",
 );
 
 unsafe extern "sysv64" {
@@ -197,8 +233,7 @@ pub unsafe fn on_host_stack<R, F: FnOnce() -> R>(fiber: u64, f: F) -> R {
     unsafe {
         let mut base = *field(fiber, OBJ_ALT_BASE);
         if base == 0 {
-            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-            base = VirtualAlloc(std::ptr::null(), ALT_SIZE as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as u64;
+            base = crate::platform::stack::allocate(ALT_SIZE as usize);
             if base == 0 {
                 crate::fatal_exit(0xD521, "fiber host stack allocation failed");
             }
@@ -472,8 +507,7 @@ sysv! {
         with(|m| m.remove(&fiber));
         let alt = *field(fiber, OBJ_ALT_BASE);
         if alt != 0 {
-            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-            VirtualFree(alt as *mut _, 0, MEM_RELEASE);
+            crate::platform::stack::free(alt, ALT_SIZE as usize);
             *field(fiber, OBJ_ALT_BASE) = 0;
         }
         *(fiber as *mut u64) = 0;
@@ -575,4 +609,49 @@ pub fn register(r: &mut Registry) {
         sceFiberOptParamInitialize, _sceFiberInitializeImpl, sceFiberFinalize, sceFiberRun, sceFiberSwitch,
         sceFiberReturnToThread, sceFiberGetSelf, sceFiberGetInfo, sceFiberRename,
     ]);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    unsafe extern "sysv64" fn entry(initial: u64, arg: u64) {
+        assert_eq!(initial, 17);
+        assert_eq!(arg, 23);
+        let fiber = on_fiber_stack().expect("on guest fiber");
+        let answer = unsafe { on_host_stack(fiber, || {
+            assert!(on_fiber_stack().is_none());
+            let v = unsafe { guest_callback(|| {
+                assert!(on_fiber_stack().is_some());
+                42
+            }) };
+            v + 1
+        }) };
+        let mut resumed = 0;
+        assert_eq!(unsafe { sceFiberReturnToThread(answer, &mut resumed) }, 0);
+        assert_eq!(resumed, 71);
+        unsafe { sceFiberReturnToThread(99, std::ptr::null_mut()) };
+        unreachable!("test fiber must remain suspended");
+    }
+
+    #[test]
+    fn fiber_host_callback_and_resume_keep_stack_bounds() {
+        crate::platform::tls::set(0, 0);
+        let bounds = teb_bounds();
+        let context = crate::platform::vm::Reservation::new_at(0, 64 << 10).unwrap();
+        context.protect(0, 64 << 10, crate::platform::vm::READ | crate::platform::vm::WRITE).unwrap();
+        let mut object = [0u64; 32];
+        let fiber = object.as_mut_ptr() as u64;
+        unsafe {
+            assert_eq!(_sceFiberInitializeImpl(fiber, c"linux-test".as_ptr().cast(), entry as *const () as u64, 17, context.base() as u64, 64 << 10, 0, 0), 0);
+            let mut result = 0;
+            assert_eq!(sceFiberRun(fiber, 23, &mut result), 0);
+            assert_eq!(result, 43);
+            assert_eq!(teb_bounds(), bounds);
+            assert_eq!(sceFiberRun(fiber, 71, &mut result), 0);
+            assert_eq!(result, 99);
+            assert_eq!(teb_bounds(), bounds);
+            assert_eq!(sceFiberFinalize(fiber), 0);
+        }
+    }
 }

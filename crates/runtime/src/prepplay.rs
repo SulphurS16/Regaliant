@@ -309,6 +309,7 @@ pub fn player_user() -> Option<&'static Path> {
 /// player's cache (`prepare`), the player's shader store, no window, no sound, no system input,
 /// the text hook its stages read the screens by. Its log stays in the player's logs folder
 /// (`<time>-prepare-<stage>`).
+#[cfg(windows)]
 pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     let player = cfg.paths.clone();
     let store = cfg.cache.clone().unwrap_or_else(|| player.shaders());
@@ -367,6 +368,28 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     let _ = SETUP.set(Setup { stage, player_user: player.user.clone(), player_paths: player, own_paths, progress: cfg.progress.clone(), runtime, store, threads, chunk: cfg.prepare_chunk, deadline });
 }
 
+/// Linux's CLI parent has already selected and validated an isolated user/cache root.
+#[cfg(target_os = "linux")]
+pub fn setup_linux(stage: Stage, paths: &dsconfig::paths::Paths, store: &Path, progress: PathBuf, threads: usize, chunk: Option<(usize, usize)>) -> Result<(), String> {
+    unsafe {
+        crate::set_unless_given("DS_TEXT_HOOK", TEXT_HOOK);
+        std::env::set_var("DS_IME_TEXT", NAME);
+        for (k, v) in [("DS_FRAME_CAP", "0"), ("DS_UNCAPPED", "0"), ("DS_HEADLESS_PRESENT", "0")] { std::env::set_var(k, v); }
+        if stage == Stage::Tour { crate::set_unless_given("DS_MIRROR_COLD", "1200"); }
+    }
+    crate::audio::SILENT.store(true, Relaxed);
+    crate::input::SYSTEM_OFF.store(true, Relaxed);
+    if stage == Stage::Tour {
+        crate::gamestep::SPEED_X100.store((level_speed() * 100.0).round() as u32, Relaxed);
+        if fast_forward() { crate::gamestep::FIXED_FEED.store(true, Relaxed); crate::input::FLIP_TIMED.store(true, Relaxed); }
+    }
+    let setup = Setup { stage, player_user: paths.user.clone(), player_paths: paths.clone(), own_paths: paths.clone(),
+        progress: Some(progress), runtime: paths.runtime(), store: store.to_path_buf(), threads, chunk, deadline: None };
+    // Before mounts/settings/save initialization. start() only launches the shared driver later.
+    prepare_files(&setup);
+    SETUP.set(setup).map_err(|_| "preparation already configured".to_string())
+}
+
 /// The self-play's own files made ready (`start`: after the one-session lock, before the settings
 /// and saves are read): the player's PC settings (some choose shader variants: the upscaler, the
 /// Visual Mode), display choices and game folder copied, never their saves, key bindings or
@@ -376,21 +399,23 @@ fn prepare_files(s: &Setup) {
     let player = &s.player_paths;
     let user = &paths.user;
     let _ = std::fs::create_dir_all(user);
-    match std::fs::read_to_string(player.settings_file()) {
-        Ok(t) => {
-            let kept: String = t.lines().filter(|l| !PRIVATE_SETTINGS.iter().any(|k| l.trim_start().starts_with(k))).map(|l| format!("{l}\n")).collect();
-            let _ = std::fs::write(user.join("pcsettings.txt"), kept);
+    if player.user != paths.user {
+        match std::fs::read_to_string(player.settings_file()) {
+            Ok(t) => {
+                let kept: String = t.lines().filter(|l| !PRIVATE_SETTINGS.iter().any(|k| l.trim_start().starts_with(k))).map(|l| format!("{l}\n")).collect();
+                let _ = std::fs::write(user.join("pcsettings.txt"), kept);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(user.join("pcsettings.txt"));
+            }
         }
-        Err(_) => {
-            let _ = std::fs::remove_file(user.join("pcsettings.txt"));
-        }
-    }
-    for f in ["display.txt", "game.txt"] {
-        let src = player.user.join(f);
-        if src.is_file() {
-            let _ = std::fs::copy(&src, user.join(f));
-        } else {
-            let _ = std::fs::remove_file(user.join(f));
+        for f in ["display.txt", "game.txt"] {
+            let src = player.user.join(f);
+            if src.is_file() {
+                let _ = std::fs::copy(&src, user.join(f));
+            } else {
+                let _ = std::fs::remove_file(user.join(f));
+            }
         }
     }
     if s.stage == Stage::NewGame {
@@ -455,6 +480,7 @@ fn copy_synced(from: &Path, to: &Path) -> std::io::Result<u64> {
 /// automation is read at its boot): its driver thread plays it and ends the session.
 pub fn start() {
     let Some(s) = SETUP.get() else { return };
+    #[cfg(windows)]
     prepare_files(s);
     crate::log::tap_on();
     crate::info!(
@@ -651,7 +677,11 @@ fn resume_from(chunk: (usize, usize)) -> usize {
 /// A level of this part started (its index from the part's first): the resume record.
 fn note_resume(level: usize) {
     let (Some(f), Some((i, n))) = (resume_file(), SETUP.get().and_then(|s| s.chunk)) else { return };
-    let _ = std::fs::write(f, format!("chunk={i}/{n}\nlevel={level}\n"));
+    let text = format!("chunk={i}/{n}\nlevel={level}\n");
+    #[cfg(windows)]
+    let _ = std::fs::write(f, text);
+    #[cfg(target_os = "linux")]
+    let _ = crate::platform::prepare::atomic_write(&f, text.as_bytes());
 }
 
 /// A self-play stage's health line when it ends otherwise than through `end` (found hung). Not
@@ -775,6 +805,10 @@ struct Play {
     /// The compute list's rest is being made (`compute_tail`): the progress file's second line
     /// (the launcher's bar) is the list's items made and listed.
     tail: bool,
+    /// Linux relay uses defaults and captures every transition.
+    relay: bool,
+    /// No readback requests inside timed intervals.
+    measuring: bool,
 }
 
 /// The new game's steps (progress): the title, character creation, its menus, the character
@@ -787,7 +821,7 @@ impl Play {
     fn new(progress: Option<PathBuf>, total: u32) -> Play {
         // (The launcher's stop file, as the precompile reads it.)
         let stop = progress.as_ref().map(|p| p.with_extension("stop"));
-        let p = Play { w: Watch { lines: VecDeque::new(), first: 0, cursor: 0 }, progress, stop, done_steps: 0, total: total.max(1), t0: Instant::now(), tail: false };
+        let p = Play { w: Watch { lines: VecDeque::new(), first: 0, cursor: 0 }, progress, stop, done_steps: 0, total: total.max(1), t0: Instant::now(), tail: false, relay: false, measuring: false };
         p.write_progress();
         p
     }
@@ -806,6 +840,7 @@ impl Play {
 
     /// A step done (`what`: what comes next).
     fn step(&mut self, what: &str) {
+        if self.relay { self.shot(what); }
         self.done_steps = (self.done_steps + 1).min(self.total);
         self.write_progress();
         crate::info!("prepare-play: {} of {} ({what}) at {:.0} s", self.done_steps, self.total, self.t0.elapsed().as_secs_f64());
@@ -856,7 +891,17 @@ impl Play {
         }
     }
 
+    fn shot(&self, what: &str) {
+        let tag: String = what.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        // Measurement/timeline boundaries are markers only: no GPU readback in either interval.
+        if !self.measuring && !what.starts_with("gameplay-measure-") && !what.starts_with("gameplay-timeline-") && !what.starts_with("movement-measure-") {
+            *crate::hle::libs::videoout::SHOT_REQUEST.lock() = Some(format!("step-{:04}-{}", self.t0.elapsed().as_secs(), tag));
+        }
+        crate::info!("relay step: {what}; {}", crate::uistate::report());
+    }
+
     fn press(&self, names: &str, ms: u64) {
+        if self.relay { self.shot(&format!("press-{names}-{ms}ms")); }
         if let Err(e) = crate::input::press_for(names, Duration::from_millis(ms)) {
             crate::warn!("prepare-play: press {names}: {e}");
         }
@@ -864,6 +909,7 @@ impl Play {
 
     /// A press held for `flips` of the game's frames, whatever their time (`input::press_flips`).
     fn press_flips(&self, names: &str, flips: u64) {
+        if self.relay { self.shot(&format!("press-{names}-{flips}flips")); }
         if let Err(e) = crate::input::press_flips(names, flips) {
             crate::warn!("prepare-play: press {names}: {e}");
         }
@@ -1035,6 +1081,16 @@ impl Play {
         // that press found no save.)
         let created_from = self.w.mark();
         self.sleep(3.0)?;
+        let name = if self.relay { "Regaliant" } else { NAME };
+        let name_event = format!("ime dialog: entered '{name}'");
+        if (self.relay || cfg!(target_os = "linux")) && !self.w.found(&name_event, 0) {
+            let m = self.w.mark();
+            self.press("cross", 300);
+            if !self.wait_for(&name_event, m, 12.0)? {
+                return Err(End::Failed("character name was not accepted by IME".into()));
+            }
+            self.sleep(2.0)?;
+        }
         // The entries below the name: class, gift, saved creations, foundation, appearance,
         // Finalise (`CREATION_ENTRIES`), the cursor placed on each by its help text (`to_entry`).
         // Each but the saved creations is opened (Cross), changed (Right) and left (Circle): their
@@ -1050,7 +1106,7 @@ impl Play {
             }
             at = Some(i);
             self.sleep(1.0)?;
-            if e == "saveload" {
+            if self.relay || e == "saveload" {
                 continue;
             }
             for b in ["cross", "right", "circle"] {
@@ -1061,6 +1117,7 @@ impl Play {
         if !self.to_entry(5, at)? {
             crate::warn!("prepare-play: the cursor may not be on Finalise");
         }
+        if self.relay { crate::gpu::nan_probe::early_phase("before character finalise / level loading"); }
         self.step("the character made");
         let m = self.w.mark();
         self.press("cross", 300);
@@ -1080,15 +1137,120 @@ impl Play {
         if !self.wait_in_game(m, "Crescent Moon Grass", 420.0)? {
             return Err(End::Failed("not in the game after the cinematic".into()));
         }
+        if self.relay { crate::gpu::nan_probe::early_phase("first gameplay detected"); }
         self.step("in the game: the tutorial's first steps");
         self.sleep(8.0)?;
         for (what, secs) in [("ls_up", 6.0), ("rs_right", 3.0), ("ls_up", 6.0), ("rs_left", 5.0), ("ls_up", 6.0), ("rs_right", 6.0), ("ls_up", 4.0)] {
             self.press(what, (secs * 1000.0) as u64);
             self.sleep(secs + 0.7)?;
         }
+        if self.relay {
+            for b in ["r1", "r1", "r2"] { self.press(b, 300); self.sleep(2.0)?; }
+        }
+        if self.relay && std::env::var("DS_RELAY_TARGETS").ok().as_deref() == Some("1") {
+            // A frame at a known gameplay step, rather than a boot-dependent flip number.
+            // This intentionally stalls for readbacks. Exclude it from the performance window.
+            self.shot("gameplay-target-capture-begin");
+            let before = crate::gpu::capture::completed_flip();
+            crate::gpu::capture::arm_next();
+            let start = Instant::now();
+            while crate::gpu::capture::completed_flip() == before && start.elapsed() < Duration::from_secs(300) {
+                self.check_stop()?;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if crate::gpu::capture::completed_flip() == before {
+                return Err(End::Failed("gameplay target capture did not finish in 300 seconds".into()));
+            }
+            self.shot("gameplay-target-capture-end");
+        }
+        self.measure_gameplay()?;
         self.step("the in-game menu");
         self.menu()?;
         self.sleep(4.0)?;
+        Ok(())
+    }
+
+    fn measure_gameplay(&mut self) -> Result<(), End> {
+        if self.relay {
+            let seconds = std::env::var("DS_RELAY_GAMEPLAY_SECONDS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0).min(180);
+            if seconds > 0 {
+                self.sleep(5.0)?;
+                #[cfg(target_os = "linux")]
+                { self.relay_settle()?; self.relay_capture_barrier()?; }
+                self.shot("measurement-scene");
+                #[cfg(target_os = "linux")]
+                self.relay_capture_barrier()?;
+                let cpu_profile = cfg!(target_os = "linux") && std::env::var("DS_RELAY_CPU_PROFILE").ok().as_deref() == Some("1");
+                if cpu_profile { crate::gpu::reset_profile(); }
+                let _ = crate::gpu::pacing::report_and_reset();
+                self.measuring = true;
+                self.shot("gameplay-measure-begin");
+                #[cfg(target_os = "linux")]
+                crate::platform::present_timing::begin();
+                // Wall time: a slow renderer must not extend the measurement.
+                #[cfg(target_os = "linux")]
+                if std::env::var("DS_RELAY_IDLE_COMPARE").ok().as_deref() == Some("1") {
+                    let original = [crate::gpu::tune::job_idle(), crate::gpu::tune::job_sleep(), crate::gpu::tune::job_watch()];
+                    let mut samples = Vec::new();
+                    let result = (|| -> Result<(), End> {
+                        for (label, values) in [("legacy", [50, 200, 2000]), ("bounded-sleep", original)] {
+                            for (key, value) in ["job_idle", "job_sleep", "job_watch"].into_iter().zip(values) { crate::gpu::tune::set(key, value); }
+                            let before = crate::jobidle::relay_snapshot();
+                            let start = Instant::now();
+                            while start.elapsed() < Duration::from_secs_f64(seconds as f64 / 2.0) {
+                                self.check_stop()?;
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            let sample = crate::jobidle::relay_delta(&before, &crate::jobidle::relay_snapshot(), start.elapsed().as_secs_f64(), label);
+                            crate::info!("relay idle comparison: {sample}");
+                            samples.push(sample);
+                        }
+                        Ok(())
+                    })();
+                    for (key, value) in ["job_idle", "job_sleep", "job_watch"].into_iter().zip(original) { crate::gpu::tune::set(key, value); }
+                    if let Some(dir) = crate::run_dir() {
+                        let _ = std::fs::write(dir.join("job-idle-comparison.json"), serde_json::to_vec_pretty(&samples).unwrap());
+                    }
+                    result?;
+                } else {
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_secs(seconds) {
+                        self.check_stop()?;
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_secs(seconds) {
+                        self.check_stop()?;
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                crate::platform::present_timing::end("gameplay");
+                self.shot("gameplay-measure-end");
+                self.measuring = false;
+                if cpu_profile {
+                    if let Some(dir) = crate::run_dir() {
+                        let _ = std::fs::write(dir.join("cpu-gameplay-profile.txt"), crate::gpu::status_ex(false));
+                    }
+                }
+                crate::info!("relay gameplay frame times: {}", crate::gpu::pacing::report_and_reset());
+                self.shot("gameplay-timeline-begin");
+                match crate::gpu::timeline::start(16) {
+                    Ok(()) => {
+                        let start = Instant::now();
+                        while crate::gpu::timeline::on() && start.elapsed() < Duration::from_secs(30) {
+                            self.check_stop()?;
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                    }
+                    Err(e) => crate::warn!("relay timeline: {e}"),
+                }
+                self.shot("gameplay-timeline-end");
+            }
+        }
         Ok(())
     }
 
@@ -1117,7 +1279,7 @@ impl Play {
         self.sleep(3.0)
     }
 
-    fn tour(&mut self) -> Result<(), End> {
+    fn continue_save(&mut self) -> Result<(), End> {
         self.title()?;
         self.step("the main menu: the save continued");
         let m = self.w.mark();
@@ -1130,6 +1292,91 @@ impl Play {
         if !self.wait_in_game(m, "Crescent Moon Grass", 180.0)? {
             return Err(End::Failed("not in the game after the load".into()));
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn relay_continue(&mut self) -> Result<(), End> {
+        self.continue_save()?;
+        self.relay_settle()?;
+        self.step("saved game resumed in gameplay");
+        self.relay_capture_barrier()?;
+        self.measure_gameplay()?;
+        // Same route on cold/warm runs. Both passes stay capture-free, even when
+        // pressing a button; boundary PNGs are requested and drained outside them.
+        for pass in 1..=2 {
+            self.relay_settle()?;
+            self.shot(&format!("movement-pass-{pass}-before"));
+            self.relay_capture_barrier()?;
+            self.measuring = true;
+            self.shot(&format!("movement-measure-{pass}-begin"));
+            crate::platform::present_timing::begin();
+            for (button, flips) in [("ls_up", 60), ("ls_down", 60), ("rs_right", 90), ("rs_left", 90), ("r1", 12), ("r2", 12)] {
+                self.press_flips(button, flips);
+                // Wait for a fixed number of game flips, not wall-time distance.
+                self.relay_flips(flips as u64 + 30)?;
+            }
+            crate::platform::present_timing::end(&format!("movement-{pass}"));
+            self.shot(&format!("movement-measure-{pass}-end"));
+            self.measuring = false;
+            self.shot(&format!("movement-pass-{pass}-after"));
+            self.relay_capture_barrier()?;
+        }
+        if std::env::var("DS_RELAY_SHORT").ok().as_deref() != Some("1") { self.menu()?; }
+        self.sleep(1.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn relay_flips(&self, count: u64) -> Result<(), End> {
+        let start = crate::gpu::FRAMES.load(Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while crate::gpu::FRAMES.load(Relaxed).saturating_sub(start) < count {
+            self.check_stop()?;
+            if Instant::now() >= deadline { return Err(End::Failed("relay frame wait exceeded 90s".into())); }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn relay_capture_barrier(&self) -> Result<(), End> {
+        // Two flips let an outstanding request finish its readback and enqueue its writer.
+        self.relay_flips(2)?;
+        crate::hle::libs::videoout::wait_shots();
+        if !crate::hle::libs::videoout::shots_idle() {
+            return Err(End::Failed("relay capture request did not drain".into()));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn relay_settle(&mut self) -> Result<(), End> {
+        // The 1.07 loading screen has HUD=304/768 and can briefly have no menu.
+        // Real Outpost gameplay has HUD=880. The shared loose HUD test is for
+        // automation progress, not permission to start a performance measurement.
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let mut stable = None;
+        loop {
+            self.check_stop()?;
+            let up = crate::uistate::hud_count().is_some_and(|n| n >= 800)
+                && crate::uistate::menu_depth() == Some(0);
+            if !up { stable = None; }
+            else {
+                let (since, frame) = *stable.get_or_insert_with(|| (Instant::now(), crate::gpu::FRAMES.load(Relaxed)));
+                if since.elapsed() >= Duration::from_secs(5) && crate::gpu::FRAMES.load(Relaxed).saturating_sub(frame) >= 120 {
+                    crate::info!("relay gameplay ready: stable HUD/menu and 120+ flips; {}", crate::uistate::report());
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline { return Err(End::Failed(format!("no stable gameplay after 240s: {}", crate::uistate::report()))); }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn tour(&mut self) -> Result<(), End> {
+        self.continue_save()?;
+        #[cfg(target_os = "linux")]
+        self.relay_settle()?;
         self.step("in the game: the tour's start");
         // The automation's own waits, then its views (`dsport-tour:` before each). One that
         // started before the save was loaded had its level loads ignored.
@@ -1693,4 +1940,34 @@ mod tests {
         assert!(s2.contains("+cp11_loadLevel 2 1") && !s2.contains("+cp11_loadLevel 1 1") && !s2.contains("+cp11_loadLevel 3 1"));
         assert!(super::levels_lines("nothing here", "", &o(0, 4, Vec::new())).is_none());
     }
+}
+
+/// The shared text-driven new-game/continue workflow, in the caller's isolated relay folder.
+/// No preparation folder deletion, player-save copying, or shader-tour changes are performed.
+#[cfg(target_os = "linux")]
+pub static RELAY_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(target_os = "linux")]
+pub fn start_relay(resume: bool) -> Result<(), String> {
+    crate::log::tap_on();
+    std::thread::Builder::new().name("linux-selfplay".into()).spawn(move || {
+        crate::log::set_thread_name("linux-selfplay");
+        let mut p = Play::new(None, NEWGAME_STEPS);
+        p.relay = true;
+        let result = if resume { p.relay_continue() } else { p.newgame() };
+        let success = result.is_ok();
+        let message = match result {
+            Ok(()) => if resume && cfg!(target_os = "linux") && std::env::var("DS_RELAY_SHORT").ok().as_deref() == Some("1") { "saved game resumed, movement and attacks (short relay)" } else if resume { "saved game resumed, movement, attacks and menu" } else { "new game reached gameplay, movement, attacks and menu" }.to_string(),
+            Err(End::Failed(why)) => format!("FAILED: {why}"),
+            Err(_) => "STOPPED before completing self-play".to_string(),
+        };
+        p.shot("selfplay-result");
+        crate::info!("Linux self-play result: {message}");
+        if let Some(dir) = crate::run_dir() {
+            let _ = std::fs::write(dir.join("selfplay.txt"), message);
+            let _ = crate::uistate::dump_nodes(dir, "selfplay-final");
+        }
+        // Let the requested final capture reach a guest flip before the main thread drains.
+        std::thread::sleep(Duration::from_secs(5));
+        RELAY_RESULT.store(if success { 0 } else { EXIT_FAILED }, std::sync::atomic::Ordering::Release);
+    }).map(|_| ()).map_err(|e| e.to_string())
 }

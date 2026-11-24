@@ -5,7 +5,13 @@ pub mod framewatch;
 pub mod pbin;
 pub mod present;
 pub mod sharpen;
+#[cfg_attr(target_os = "linux", path = "../../platform/linux/window.rs")]
 pub mod window;
+
+// Preserve the existing presence switch, but an explicit zero disables validation.
+fn validation_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v != "0")
+}
 
 use ash::vk;
 use parking_lot::Mutex;
@@ -27,6 +33,7 @@ pub struct Ctx {
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
     pub surface_i: ash::khr::surface::Instance,
+    #[cfg(windows)]
     pub win32_i: ash::khr::win32_surface::Instance,
     pub swapchain_d: ash::khr::swapchain::Device,
     pub push_desc: ash::khr::push_descriptor::Device,
@@ -328,7 +335,7 @@ fn init_inner() -> Result<(), String> {
         // DS_VK_VALIDATION without a layer path of its own: the project's
         // SDK copy (`local_layer_dir`), for the loader to find (set before it
         // loads; this diagnosis only).
-        if std::env::var_os("DS_VK_VALIDATION").is_some() && std::env::var_os("VK_ADD_LAYER_PATH").is_none() {
+        if validation_requested(std::env::var_os("DS_VK_VALIDATION").as_deref()) && std::env::var_os("VK_ADD_LAYER_PATH").is_none() {
             if let Some(dir) = local_layer_dir() {
                 crate::info!("Vulkan validation layer from {}", dir.display());
                 std::env::set_var("VK_ADD_LAYER_PATH", &dir);
@@ -342,7 +349,7 @@ fn init_inner() -> Result<(), String> {
             .engine_name(app_name)
             .api_version(vk::API_VERSION_1_3);
         let layers_avail = entry.enumerate_instance_layer_properties().unwrap_or_default();
-        let want_validation = std::env::var_os("DS_VK_VALIDATION").is_some();
+        let want_validation = validation_requested(std::env::var_os("DS_VK_VALIDATION").as_deref());
         let validation_name = c"VK_LAYER_KHRONOS_validation";
         let has_validation = layers_avail.iter().any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
         let validation = want_validation && has_validation;
@@ -350,7 +357,8 @@ fn init_inner() -> Result<(), String> {
             crate::warn!("DS_VK_VALIDATION set but the Khronos validation layer is not installed");
         }
         let layers: Vec<*const c_char> = if validation { vec![validation_name.as_ptr()] } else { vec![] };
-        let mut exts = vec![ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];
+        let surface_extensions = window::instance_extensions()?;
+        let mut exts: Vec<_> = surface_extensions.iter().map(|s| s.as_ptr()).collect();
         let inst_exts = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
         let inst_has = |n: &CStr| inst_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
         // Display modes and HDR (`present`): surface queries with chained structures (exclusive
@@ -359,7 +367,7 @@ fn init_inner() -> Result<(), String> {
         if surface_caps2 {
             exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
         }
-        let colorspaces = inst_has(ash::ext::swapchain_colorspace::NAME);
+        let colorspaces = cfg!(windows) && inst_has(ash::ext::swapchain_colorspace::NAME);
         if colorspaces {
             exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
         }
@@ -401,7 +409,11 @@ fn init_inner() -> Result<(), String> {
             let qfs = instance.get_physical_device_queue_family_properties(pd);
             if let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)) {
                 let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
-                if chosen.is_none() || discrete {
+                let prefer = if cfg!(target_os = "linux") {
+                    let rank = |p: &vk::PhysicalDeviceProperties| (p.vendor_id == 0x10de, p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU);
+                    chosen.as_ref().is_none_or(|(_, _, previous)| rank(&props) > rank(previous))
+                } else { chosen.is_none() || discrete };
+                if prefer {
                     chosen = Some((pd, qf as u32, props));
                 }
             }
@@ -472,7 +484,7 @@ fn init_inner() -> Result<(), String> {
         // driver may not turn into exclusive mode (`present`); HDR metadata for HDR10 output.
         let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
         let dev_has = |n: &CStr| dev_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
-        let has_fse = surface_caps2 && dev_has(ash::ext::full_screen_exclusive::NAME) && std::env::var("DS_NO_FSE").is_err();
+        let has_fse = cfg!(windows) && surface_caps2 && dev_has(ash::ext::full_screen_exclusive::NAME) && std::env::var("DS_NO_FSE").is_err();
         if has_fse {
             dexts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
         }
@@ -521,7 +533,7 @@ fn init_inner() -> Result<(), String> {
             .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::calibrated_timestamps::NAME)
             && ash::ext::calibrated_timestamps::Instance::new(&entry, &instance)
                 .get_physical_device_calibrateable_time_domains(pdev)
-                .is_ok_and(|d| d.contains(&vk::TimeDomainEXT::DEVICE) && d.contains(&vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER));
+                .is_ok_and(|d| d.contains(&vk::TimeDomainEXT::DEVICE) && d.contains(&window::time_domain()));
         if calibrated {
             dexts.push(ash::ext::calibrated_timestamps::NAME.as_ptr());
         }
@@ -842,6 +854,11 @@ fn init_inner() -> Result<(), String> {
         let mut pb_feat = pbin::Features { s_type: pbin::ST_FEATURES, p_next: std::ptr::null_mut(), pipeline_binaries: 1 };
         let mut pb_cache = pbin::CacheControl { s_type: pbin::ST_CACHE_CONTROL, p_next: std::ptr::null(), disable_internal_cache: 1 };
         crate::gpu::upscale::apply_features(&mut features, &mut f11, &mut f12, &mut f13, &up_dev);
+        crate::info!("Vulkan enabled extensions: {}", dexts.iter().map(|&p| CStr::from_ptr(p).to_string_lossy()).collect::<Vec<_>>().join(", "));
+        crate::info!("Vulkan enabled features: synchronization2={} timelineSemaphore={} dynamicRendering={} bufferDeviceAddress={} subgroupSizeControl={}; queues: {}",
+            f13.synchronization2, f12.timeline_semaphore, f13.dynamic_rendering, f12.buffer_device_address, f13.subgroup_size_control,
+            qci.iter().map(|q| format!("family {} count {}", q.queue_family_index, q.queue_count)).collect::<Vec<_>>().join(", "));
+        crate::info!("Vulkan renderer paths: push descriptors; device-local images and FE2 sparse mirror; host imports feed mirror uploads. Descriptor buffer, host image copy and pageable device-local memory are not renderer paths on either platform.");
         let mut mutable = vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default().mutable_descriptor_type(true);
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
@@ -970,6 +987,7 @@ fn init_inner() -> Result<(), String> {
             batches,
             cpu_done,
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),
+            #[cfg(windows)]
             win32_i: ash::khr::win32_surface::Instance::new(&entry, &instance),
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
@@ -1208,10 +1226,13 @@ pub fn note_alloc(what: &str, size: u64, t0: std::time::Instant) {
 /// stalled while the driver compiles).
 pub fn note_submit(what: &'static str, t0: std::time::Instant, t1: std::time::Instant) {
     let all = t0.elapsed();
+    let lock = t1 - t0;
+    if super::timeline::on() {
+        super::timeline::split_back(&format!("Vulkan / {}", crate::log::thread_name()), lock, all.saturating_sub(lock), what);
+    }
     if all.as_micros() < 2000 {
         return;
     }
-    let lock = t1 - t0;
     // (`DS_IMPORT_LOG=1`: each such call logged, to line up with the imports logged beside it.)
     static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *LOG.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1")) {
@@ -2133,7 +2154,7 @@ impl Ctx {
     /// without VK_EXT_calibrated_timestamps).
     pub fn calibrate(&self) -> Option<(u64, i64)> {
         let cal = self.calibrated.as_ref()?;
-        let info = [vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::DEVICE), vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER)];
+        let info = [vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::DEVICE), vk::CalibratedTimestampInfoEXT::default().time_domain(window::time_domain())];
         let (t, _) = unsafe { cal.get_calibrated_timestamps(&info) }.ok()?;
         Some((t[0], t[1] as i64))
     }
@@ -2312,5 +2333,27 @@ impl Ctx {
         ss.extend(self.progress_signal());
         let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
         unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod validation_switch_tests {
+    #[test]
+    fn subgroup_policy_includes_blackwell_boundary() {
+        assert!(super::modes_checked_on(0x10de, 0x2684));
+        assert!(super::modes_checked_on(0x10de, 0x2b7f));
+        assert!(!super::modes_checked_on(0x10de, 0x2b80));
+        assert!(!super::modes_checked_on(0x10de, 0x2bb1));
+        assert!(!super::modes_checked_on(0x1002, 0x744c));
+        assert!(!super::modes_checked_on(0x8086, 0x56a0));
+    }
+
+    #[test]
+    fn explicit_zero_disables_validation() {
+        use std::ffi::OsStr;
+        assert!(!super::validation_requested(None));
+        assert!(!super::validation_requested(Some(OsStr::new("0"))));
+        assert!(super::validation_requested(Some(OsStr::new("1"))));
+        assert!(super::validation_requested(Some(OsStr::new(""))));
     }
 }

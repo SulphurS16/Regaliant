@@ -1349,9 +1349,9 @@ fn pipe_budget() -> usize {
         if let Some(n) = std::env::var("DS_PIPE_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()) {
             return n.max(64);
         }
-        let mut st: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        st.dwLength = std::mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32;
-        let phys = if unsafe { windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut st) } != 0 { st.ullTotalPhys } else { 16 << 30 };
+        let mut st: crate::platform::os::Win32::System::SystemInformation::MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = std::mem::size_of::<crate::platform::os::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32;
+        let phys = if unsafe { crate::platform::os::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut st) } != 0 { st.ullTotalPhys } else { 16 << 30 };
         let each: u64 = if ctx().pbin.is_some() { 2_780_000 } else { 500_000 };
         ((phys / 4 / each) as usize).clamp(1500, 20_000)
     })
@@ -2276,7 +2276,7 @@ fn audit_mirror(buf: vk::Buffer, ptr: *mut u8, round: u64, cpu: &dyn Fn(u64) -> 
             // hold it armed: an armed page that is writable passes CPU writes
             // unseen.
             let prot = {
-                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+                use crate::platform::os::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
                 let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
                 if unsafe { VirtualQuery(p as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 { format!("{:#x}", mbi.Protect) } else { "?".into() }
             };
@@ -3669,7 +3669,7 @@ fn compile_in_background(p: &Prepared) -> bool {
 fn async_worker(name: String) {
     crate::log::set_thread_name(&name);
     unsafe {
-        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+        crate::platform::os::Win32::System::Threading::SetThreadPriority(crate::platform::os::Win32::System::Threading::GetCurrentThread(), crate::platform::os::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
     }
     loop {
         let (tr, addr, key) = {
@@ -4248,6 +4248,7 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
                     bi = super::vk::pbin::BinaryInfo { s_type: super::vk::pbin::ST_BINARY_INFO, p_next: ci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
                     ci.p_next = &bi as *const super::vk::pbin::BinaryInfo as *const std::ffi::c_void;
                 }
+                let _permit = crate::gpu::compile::driver_permit();
                 c.device.create_compute_pipelines(via.cache, &[ci], None).map(|v| v[0]).map_err(|(_, e)| format!("compute pipeline: {e}"))
             };
             // (The module as the driver gets it: `module_code`'s declaration included.)
@@ -6329,7 +6330,7 @@ fn host_scratch() -> Option<vk::Buffer> {
 /// Our own write-watched memory imported as guest memory is, nothing else
 /// using it, for `tune skip_copies` 4096 (diagnosis).
 fn imported_scratch() -> Option<vk::Buffer> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    use crate::platform::os::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
     const MEM_WRITE_WATCH: u32 = 0x0020_0000;
     static B: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
@@ -6345,7 +6346,7 @@ fn imported_scratch() -> Option<vk::Buffer> {
 /// (diagnosis): each window's merge stores at its guest address modulo that
 /// size, over as many pages as into guest memory.
 fn imported_spread() -> Option<vk::Buffer> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    use crate::platform::os::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
     const MEM_WRITE_WATCH: u32 = 0x0020_0000;
     static B: std::sync::OnceLock<Option<vk::Buffer>> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
@@ -7314,10 +7315,15 @@ fn releaser_thread(q: usize) {
                 RELEASE_CV[q].wait(&mut g);
             }
         };
+        let release_track = if q == 0 { "gpu-release" } else { "gpu-release-c" };
         if !DEVICE_LOST.load(Ordering::Relaxed) {
+            let tl = super::timeline::mark();
             wait_submitted(r.seq);
+            super::timeline::end(release_track, tl, || format!("wait: submission #{}", r.seq));
             let tf = std::time::Instant::now();
+            let tl = super::timeline::mark();
             let (ok, why) = wait_release_done(q, &r);
+            super::timeline::end(release_track, tl, || format!("wait: GPU completion #{} owner {} shaders {:?}", r.seq, r.name, r.shaders));
             FENCE_NS.fetch_add(tf.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if !ok && lose_device() {
                 let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
@@ -7330,8 +7336,10 @@ fn releaser_thread(q: usize) {
                 }
             }
             FLUSHES.fetch_add(1, Ordering::Relaxed);
+            let tl = super::timeline::mark();
             collect_timestamps(r.bq, r.queries, &r.shaders, &r.name, r.seq, &r.segs, &r.ops);
             check_watchdog(&r.name, &r.shaders);
+            super::timeline::end(release_track, tl, || format!("release diagnostics #{}", r.seq));
             let ms = r.submitted.elapsed().as_millis();
             if ms >= 250 {
                 let list: Vec<String> = r.shaders.iter().map(|a| format!("{a:#x}")).collect();
@@ -7341,6 +7349,7 @@ fn releaser_thread(q: usize) {
         }
         // Its slot for the next batch there, unless the recording thread took
         // the reset back (`Exec::begin_batch`).
+        let tl = super::timeline::mark();
         if let Some(x) = r.reset.take() {
             if !DEVICE_LOST.load(Ordering::Relaxed) && x.state.compare_exchange(r.seq, u64::MAX, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 let c = ctx();
@@ -7357,6 +7366,7 @@ fn releaser_thread(q: usize) {
                 x.state.store(0, Ordering::Release);
             }
         }
+        super::timeline::end(release_track, tl, || format!("release pool reset #{}", r.seq));
         RELEASED[q].store(r.seq, Ordering::Release);
         drop(RELEASED_LOCK.lock());
         RELEASED_CV.notify_all();
@@ -8736,13 +8746,17 @@ fn submitter_thread() {
         let mut specs = Vec::with_capacity(jobs.len());
         let mut last = 0;
         let first = jobs[0].0;
+        let prepare_mark = super::timeline::mark();
         for (seq, job) in jobs {
             last = seq;
             if let Some(s) = job(seq) {
                 specs.push((seq, s));
             }
         }
+        super::timeline::end("vk submit", prepare_mark, || "prepare submit jobs".into());
+        let call_mark = super::timeline::mark();
         submit_specs(specs);
+        super::timeline::end("vk submit", call_mark, || "submit specs".into());
         super::timeline::end("vk submit", tl, || if last == first { format!("#{first}{}", ["", " own copies", " earlier copies"][SUBMIT_KIND.with(|k| k.get()) as usize]) } else { format!("#{first}-#{last}") });
         note_submitted(last);
     }
@@ -14035,12 +14049,13 @@ impl Exec {
                 // (Whether the GPU had completed the batch already: the wait
                 // is then the releaser's bookkeeping, `SLOT_LAG`.)
                 let gpu_done = (if slot.on_c { ctx().batch_value_c() } else { ctx().batch_value() }) >= slot.seq;
+                let state = if gpu_done { "release" } else if super::timeline::on() && *SUBMITTED.lock() < slot.seq { "submit" } else { "gpu" };
                 let tw = super::timeline::wait_start();
                 if !wait_released(slot, Some(std::time::Duration::from_secs(3))) && !super::shutting_down() && !DEVICE_LOST.load(Ordering::Relaxed) {
                     crate::warn!("gpu[{}]: waiting > 3 s for a free batch slot (batch {}, done {}; held {}, past {})", self.name, slot.seq, done_seq(), self.held, self.past);
                     wait_released(slot, None);
                 }
-                tw.end(&self.name, || format!("wait: batch slot (#{})", slot.seq));
+                tw.end(&self.name, || format!("wait: batch slot (#{}, initial {state}, {} slots, compute {})", slot.seq, self.slots.len(), slot.on_c));
                 super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("a free batch slot: the GPU behind (batch {})", slot.seq));
                 WAIT_NS[2].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 WAIT_NS[3].fetch_add(1, Ordering::Relaxed);
@@ -20507,6 +20522,12 @@ impl Exec {
     /// Copies a stage's SGPR data into the ring (space reserved) and binds it;
     /// where it went (ring buffer, offset).
     fn bind_sgpr(&mut self, p: &Prepared, bound: &mut Bound) -> Result<(vk::Buffer, u64), String> {
+        if p.addr == 0x100892b200 {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            if SEEN.swap(p.tr.key, Ordering::Relaxed) != p.tr.key {
+                crate::info!("scatter binding: code {:#x}, translation {:#x}, per_lane {}, lane_votes {}, wave64 {}, lockstep {}, wave_masks {}, sgpr_ubo {}, gpu_loads {:#x}; {} SGPR dwords", p.code_hash, p.tr.key, p.tr.spec.per_lane, p.tr.spec.lane_votes, p.tr.spec.wave64, p.tr.out.lockstep, p.tr.out.wave_masks, p.tr.spec.sgpr_ubo, p.tr.spec.gpu_loads, p.sgpr_data.len());
+            }
+        }
         // Little-endian dwords, as the shader reads them.
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(p.sgpr_data.as_ptr() as *const u8, 4 * p.sgpr_data.len()) };
         let vram = match super::tune::ring_vram() {

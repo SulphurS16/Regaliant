@@ -1040,6 +1040,7 @@ fn par_event(op: u32, compute: bool) -> bool {
 /// synchronization-free runs: four under front end 2 (+6-10% at the vista,
 /// FINDINGS.md 2026-10-28 night), none in the old front end (a loss there).
 fn compute_workers() -> usize {
+    if super::nan_probe::early_on() { return 0; }
     if !super::fe2::on() {
         return 0;
     }
@@ -1434,10 +1435,10 @@ fn wake_label(addr: u64, bytes: u8) {
     if ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(addr as *const core::ffi::c_void) };
+    unsafe { crate::platform::os::Win32::System::Threading::WakeByAddressAll(addr as *const core::ffi::c_void) };
     if bytes >= 8 {
         // A 32-bit wait on its upper half.
-        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((addr + 4) as *const core::ffi::c_void) };
+        unsafe { crate::platform::os::Win32::System::Threading::WakeByAddressAll((addr + 4) as *const core::ffi::c_void) };
     }
 }
 
@@ -6534,7 +6535,31 @@ impl Cp {
         }
     }
 
+    pub(crate) fn packet_address(&self) -> u64 { self.cur_packet }
+
     fn packet(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
+        let dispatch = matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT);
+        let draw = matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI);
+        let early = (draw || dispatch) && super::nan_probe::early(self, dispatch);
+        if (draw || dispatch) && (super::nan_probe::active() || early) {
+            // Capture disables parallel recording already. Complete this queue before and
+            // after the operation so diagnostics distinguish inherited NaNs from new ones.
+            self.sync();
+            let sz = self.index_size().unwrap_or(4) as u64;
+            let index = match opcode {
+                op::DRAW_INDEX_2 => (addr64(p(1), p(2)), p(3) as u64 * sz),
+                op::DRAW_INDEX_OFFSET_2 => (self.index_base + p(1) as u64 * sz, p(2) as u64 * sz),
+                _ => (self.index_base, self.index_count as u64 * sz),
+            };
+            let probe = super::nan_probe::before(self, dispatch, at, opcode, index, early);
+            let result = self.packet_inner(opcode, h, at, n, p);
+            self.sync();
+            super::nan_probe::after(self, probe);
+            result
+        } else { self.packet_inner(opcode, h, at, n, p) }
+    }
+
+    fn packet_inner(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
         crate::placement::note(&|| crate::log::thread_name());
         if self.repeat_ok && !self.keeps_repeat(opcode, n, p) {
             self.repeat_ok = false;
@@ -6769,7 +6794,7 @@ impl Cp {
                     let (a, initiator) = if n >= 3 { (addr64(p(0), p(1)), p(2)) } else { (self.dispatch_indirect_base + p(0) as u64, p(1)) };
                     // Arguments that GPU work still writes: the GPU reads them
                     // (captures and interpreter checks need the group counts).
-                    let gpu = valid(a, 12) && !super::capture::capturing() && !(super::exec::enabled() && super::emucheck::wanted(self)) && self.dispatch_gpu_indirect(a, initiator);
+                    let gpu = valid(a, 12) && !super::capture::capturing() && !super::nan_probe::early_on() && !(super::exec::enabled() && super::emucheck::wanted(self)) && self.dispatch_gpu_indirect(a, initiator);
                     gpu_read = gpu;
                     if !gpu {
                         // Arguments may have been written by earlier GPU work.
@@ -7605,7 +7630,7 @@ impl Cp {
                     break;
                 }
                 WAKE_SLEEPS.fetch_add(1, Ordering::Relaxed);
-                unsafe { windows_sys::Win32::System::Threading::WaitOnAddress(a as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, if wide { 8 } else { 4 }, 1) };
+                unsafe { crate::platform::os::Win32::System::Threading::WaitOnAddress(a as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, if wide { 8 } else { 4 }, 1) };
             } else if spins < yields {
                 std::thread::yield_now();
             } else {
@@ -7678,6 +7703,7 @@ impl Cp {
                     Err(e) => crate::warn!("gpu[{}]: flip of buffer {index} (handle {handle:#x}) failed ({e:#x})", self.name),
                 }
                 let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                if super::capture::needs_boundary_sync(n) { self.sync(); }
                 super::capture::on_flip(n);
                 if !self.compute {
                     super::note_run_ahead();

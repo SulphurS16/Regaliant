@@ -1754,6 +1754,7 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
                 bi = crate::gpu::vk::pbin::BinaryInfo { s_type: crate::gpu::vk::pbin::ST_BINARY_INFO, p_next: gpci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
                 gpci.p_next = &bi as *const crate::gpu::vk::pbin::BinaryInfo as *const std::ffi::c_void;
             }
+            let _permit = crate::gpu::compile::driver_permit();
             c.device.create_graphics_pipelines(via.cache, &[gpci], None).map(|v| v[0]).map_err(|(_, e)| format!("graphics pipeline: {e}"))
         });
         for (_, m) in modules {

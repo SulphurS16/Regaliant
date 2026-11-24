@@ -45,7 +45,7 @@ pub fn on() -> bool {
 /// The timeline's clock (the performance counter).
 pub fn now() -> i64 {
     let mut t = 0i64;
-    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut t) };
+    unsafe { crate::platform::os::Win32::System::Performance::QueryPerformanceCounter(&mut t) };
     t
 }
 
@@ -53,7 +53,7 @@ fn freq() -> i64 {
     static F: OnceLock<i64> = OnceLock::new();
     *F.get_or_init(|| {
         let mut f = 0i64;
-        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
+        unsafe { crate::platform::os::Win32::System::Performance::QueryPerformanceFrequency(&mut f) };
         f.max(1)
     })
 }
@@ -61,6 +61,16 @@ fn freq() -> i64 {
 /// The start of a span while recording.
 pub fn mark() -> Option<i64> {
     on().then(now)
+}
+
+/// CPU-only phase on the current thread, including early returns. No clock or allocation
+/// while the timeline is off; this never requests a GPU query or queue flush.
+pub struct Section { t0: Option<i64>, name: &'static str }
+pub fn section(name: &'static str) -> Section { Section { t0: mark(), name } }
+impl Drop for Section {
+    fn drop(&mut self) {
+        if self.t0.is_some() { end(&crate::log::thread_name(), self.t0, || self.name.into()); }
+    }
 }
 
 thread_local! {
@@ -135,6 +145,22 @@ pub fn span_back(track: &str, ago: std::time::Duration, name: impl FnOnce() -> S
     }
 }
 
+/// Two adjacent wall-time phases ending now (a Vulkan queue-lock wait followed by the
+/// driver call and preparation under that lock). One clock origin keeps their boundary exact.
+pub fn split_back(track: &str, first: std::time::Duration, second: std::time::Duration, name: &str) {
+    if !on() { return; }
+    let t2 = now();
+    let ticks = |d: std::time::Duration| (d.as_secs_f64() * freq() as f64) as i64;
+    let t1 = t2 - ticks(second);
+    let t0 = t1 - ticks(first);
+    if let Some(s) = STATE.lock().as_mut() {
+        if s.spans.len() + 2 <= MAX_SPANS {
+            s.spans.push(Span { track: track.into(), name: format!("queue lock: {name}"), t0, t1 });
+            s.spans.push(Span { track: track.into(), name: format!("call/preparation: {name}"), t0: t1, t1: t2 });
+        }
+    }
+}
+
 /// Ends a span begun with `mark` on the calling thread's track when it
 /// lasted at least `min_us` (parts too small to list otherwise).
 pub fn end_min(t0: Option<i64>, min_us: i64, name: impl FnOnce() -> String) {
@@ -147,8 +173,8 @@ pub fn end_min(t0: Option<i64>, min_us: i64, name: impl FnOnce() -> String) {
 /// Starts recording for the next `flips` flips.
 pub fn start(flips: u32) -> Result<(), String> {
     let c = super::vk::try_ctx().ok_or("no Vulkan device")?;
-    let cal = c.calibrate();
-    if cal.is_none() {
+    let cal = super::exec::batch_stamps().then(|| c.calibrate()).flatten();
+    if super::exec::batch_stamps() && cal.is_none() {
         crate::warn!("timeline: no calibrated timestamps (VK_EXT_calibrated_timestamps): GPU spans are left out");
     }
     *STATE.lock() = Some(State { spans: Vec::with_capacity(1 << 16), cal, started: now() });
@@ -190,7 +216,7 @@ pub fn flipped(n: u64) {
         return;
     }
     let t = now();
-    let cal = super::vk::try_ctx().and_then(|c| c.calibrate());
+    let cal = super::exec::batch_stamps().then(|| super::vk::try_ctx().and_then(|c| c.calibrate())).flatten();
     if let Some(s) = STATE.lock().as_mut() {
         s.spans.push(Span { track: "flips".to_string(), name: format!("flip {n}"), t0: t, t1: t });
         if cal.is_some() {

@@ -970,3 +970,13 @@ mod tests {
         }
     }
 }
+
+pub fn instance_extensions() -> Result<Vec<std::ffi::CString>, String> {
+    Ok(vec![ash::khr::surface::NAME.into(), ash::khr::win32_surface::NAME.into()])
+}
+pub unsafe fn surface(c: &super::Ctx, hwnd: isize, hinstance: isize) -> Result<ash::vk::SurfaceKHR, String> {
+    let sci = ash::vk::Win32SurfaceCreateInfoKHR::default().hinstance(hinstance).hwnd(hwnd);
+    unsafe { c.win32_i.create_win32_surface(&sci, None) }.map_err(|e| format!("create surface: {e}"))
+}
+
+pub fn time_domain() -> ash::vk::TimeDomainEXT { ash::vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER }

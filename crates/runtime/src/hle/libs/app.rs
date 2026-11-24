@@ -336,5 +336,5 @@ fn safe_area_ratio() -> f32 {
     if let Some(v) = std::env::var("DS_SAFE_AREA").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
         return v.clamp(0.5, 1.0);
     }
-    crate::pcsettings::safe_area().unwrap_or(1.0)
+    crate::platform::loader_hooks::safe_area().unwrap_or(1.0)
 }

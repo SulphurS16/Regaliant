@@ -6,7 +6,9 @@
 //! shows a keyboard of keys to move over (`Keys`). Drawn with GDI into a bitmap the presenter
 //! puts on the frame (`gpu::vk::present`).
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{RECT, SIZE};
+#[cfg(windows)]
 use windows_sys::Win32::Graphics::Gdi::*;
 
 /// What the box shows.
@@ -65,6 +67,7 @@ pub fn size(frame_h: u32, keys: usize) -> (u32, u32) {
 }
 
 /// The box as top-down BGRA pixels (alpha 255) for a frame `frame_h` pixels high.
+#[cfg(windows)]
 pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
     let s = (frame_h as f32 / 1080.0).max(0.5);
     let px = |v: f32| (v * s).round() as i32;
@@ -220,6 +223,58 @@ pub fn to_pq(bgra: &mut [u8], nits: f32) {
     for p in bgra.chunks_exact_mut(4) {
         for c in &mut p[..3] {
             *c = lut[*c as usize];
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn render(c: &Content, frame_h: u32) -> (Vec<u8>, u32, u32) {
+    let rows = c.keys.as_ref().map_or(0, |k| k.rows.len());
+    let (w,h) = size(frame_h, rows);
+    let scale = (frame_h as f32 / 1080.0).max(0.5);
+    let mut canvas = crate::platform::text::Canvas { pixels: vec![0; (w*h*4) as usize], w:w as usize, h:h as usize, scale };
+    canvas.fill((0.0,0.0,820.0,design_height(rows)), [18,17,20]);
+    canvas.fill((0.0,0.0,820.0,2.0), [150,134,104]);
+    canvas.text(&c.title, (30.0,20.0,760.0,32.0), [236,226,200]);
+    canvas.fill((40.0,76.0,740.0,52.0), [4,4,5]);
+    let text = if c.text.is_empty() { &c.placeholder } else { &c.text };
+    canvas.text(text, (56.0,86.0,590.0,30.0), [250,248,244]);
+    canvas.text(&format!("{} / {}", c.text.encode_utf16().count(), c.max_len), (660.0,89.0,100.0,22.0), [168,160,146]);
+    if c.caret {
+        let width = (crate::platform::text::width(&c.text,30.0*scale)/scale).min(590.0);
+        canvas.fill((351.0+width/2.0+3.0,88.0,2.0,28.0), [236,226,200]);
+    }
+    if let Some(k) = &c.keys {
+        for (r,row) in k.rows.iter().enumerate() {
+            let mut col = 0;
+            for (i,(label,width,on)) in row.iter().enumerate() {
+                let rect = (43.0+col as f32*74.0, KEYS_TOP+r as f32*ROW_PITCH, *width as f32*74.0-6.0, KEY_H);
+                col += *width as u32;
+                let selected = k.selected == (r,i);
+                canvas.fill(rect, if selected { [150,134,104] } else if *on { [48,43,35] } else { [24,23,26] });
+                canvas.text(label, (rect.0+3.0,rect.1+10.0,rect.2-6.0,28.0), if selected { [12,11,10] } else { [226,216,194] });
+            }
+        }
+    }
+    let top = if rows == 0 { 146.0 } else { KEYS_TOP+rows as f32*ROW_PITCH+12.0 };
+    for (i,line) in c.hint.lines().take(2).enumerate() { canvas.text(line,(24.0,top+i as f32*HINT_LINE,772.0,24.0),[168,160,146]); }
+    (canvas.pixels,w,h)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    #[test]
+    fn ime_overlay_has_text_and_keys() {
+        let c = super::Content {
+            title: "Enter your player's name".into(), text: "Regaliant".into(), placeholder: "Name".into(), max_len: 16, caret: true,
+            hint: "Enter: Confirm    Esc: Cancel\nKeyboard or controller".into(),
+            keys: Some(super::Keys { rows: vec![vec![("A".into(), 2, false), ("B".into(), 2, false), ("Space".into(), 4, false), ("OK".into(), 2, true)]], selected: (0,0) }),
+        };
+        let (pixels,w,h) = super::render(&c, 1080);
+        assert_eq!(w,820);
+        assert!(pixels.chunks_exact(4).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count() > 100);
+        if let Some(path) = std::env::var_os("REGALIANT_IME_PNG") {
+            std::fs::write(path, crate::gpu::png::encode(w,h,&pixels.chunks_exact(4).flat_map(|p| [p[2],p[1],p[0],p[3]]).collect::<Vec<_>>())).unwrap();
         }
     }
 }
