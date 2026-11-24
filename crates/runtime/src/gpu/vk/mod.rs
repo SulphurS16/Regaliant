@@ -188,7 +188,11 @@ pub fn subgroup_modes_checked() -> bool {
 }
 
 fn modes_checked_on(vendor: u32, device: u32) -> bool {
-    vendor == 0x10de && device < 0x2b80
+    // On Linux the subgroup modes were also checked on a Blackwell card (an RTX PRO 6000,
+    // 10de:2bb1, driver 615.78): with them and rdna's NaN handling the tutorial and the tunnel
+    // render right, while the portable translation drew the 3D scene as scattered coloured
+    // specks. So NVIDIA keeps the modes on Linux whatever the design (DS_PLAIN_MODES overrides).
+    vendor == 0x10de && (device < 0x2b80 || cfg!(target_os = "linux"))
 }
 
 /// Translated shaders declare maximal reconvergence (`exec::module_code`); set when the device is
@@ -661,6 +665,9 @@ fn init_inner() -> Result<(), String> {
             dexts.push(ash::khr::shader_maximal_reconvergence::NAME.as_ptr());
         }
         MAX_RECONV.store(max_reconv, std::sync::atomic::Ordering::Relaxed);
+        crate::info!("effective translation policy: source={} portable={} maximal_reconvergence={} per_lane={} (DS_PLAIN_MODES={:?}, DS_MAX_RECONV={:?}); pipeline binaries verify SPIR-V plus reconvergence fingerprint",
+            rdna::SOURCE_HASH, super::shaders::plain_modes(), max_reconv, super::tune::per_lane(),
+            std::env::var("DS_PLAIN_MODES").ok(), std::env::var("DS_MAX_RECONV").ok());
         crate::info!(
             "Vulkan: maximal reconvergence {} (offered {mr_offered}, wanted {mr_wanted}: {}; DS_MAX_RECONV=1 or 0 overrides)",
             if max_reconv { "on: every translated shader declares it" } else { "off" },
