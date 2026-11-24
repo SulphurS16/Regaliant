@@ -36,7 +36,10 @@ Keyboard, mouse and SDL gamepads (including Xbox, DualSense and DualShock 4) use
 PC settings tab and `controls.txt`. PlayStation controllers select PlayStation button labels;
 the touchpad click maps to the shared View/touchpad binding. Rumble and the light bar use SDL;
 adaptive triggers and motion sensors are not mapped. Actual controller output needs physical
-testing. Click the window to capture the mouse; F1 releases or recaptures it. Alt+Enter or F11
+testing. F1 captures or releases the mouse. Controller input hides the pointer over the window;
+mouse movement or a mouse button shows it again when capture is off. In fullscreen, the pointer
+also hides after three seconds without mouse activity. These visibility changes do not grab the
+mouse. Alt+Enter or F11
 switches between windowed and borderless fullscreen. Closing the window flushes completed
 saves and shader records before exiting. Quit through the game menu when possible; closing
 during a game save cannot guarantee an unfinished save completes.
@@ -95,8 +98,9 @@ python3 scripts/linux-prepare-shaders.py --app /path/to/PPSA01341-app0
 
 This runs the full multi-level tour hidden and silent, using an isolated save. It never uses or
 replaces your player saves. It uses eight allowed logical CPUs (preferring performance cores),
-nice 10, two shader compiler workers, and a 30 fps cap. The thermal guard pauses above 95 °C,
-resumes below 85 °C, and stops if cooling takes longer than 60 seconds. Missing temperature
+nice 10, two shader compiler workers, and a 30 fps cap. The thermal guard pauses after ten
+continuous seconds at or above 103 °C, resumes below 97 °C, and aborts after 60 continuous
+seconds at or above 105 °C. Missing temperature
 sensors stop the command. `DS_RELAY_CPUS` and `DS_COMPILE_WORKERS` adjust CPU limits; the relay
 thermal variables below also apply. Monitor records are fsynced under
 `local-data/linux-port/shader-preparation/`.
@@ -177,10 +181,12 @@ Every workload, including builds and preparation children, has these limits:
 - `DS_COMPILE_WORKERS=2` by default. Shader pools are capped and a shared driver-compilation
   permit prevents foreground/background pools from each using the whole budget. Cargo uses
   the same job limit. Drivers may still create their own internal threads within the CPU set.
-- CPU package temperature is sampled every two seconds. Above `DS_RELAY_TEMP_PAUSE=95` °C,
-  the owned process groups stop; below `DS_RELAY_TEMP_RESUME=85` °C, they resume. A pause longer
-  than `DS_RELAY_TEMP_ABORT_S=60` seconds aborts the run with a graceful-stop request and bounded
-  TERM/KILL fallback. The whole pause is bounded even if temperature sits between thresholds.
+- CPU package temperature is sampled every two seconds. At or above `DS_RELAY_TEMP_PAUSE=103` °C
+  for `DS_RELAY_TEMP_HOLD_S=10` continuous seconds, the owned process groups stop; below
+  `DS_RELAY_TEMP_RESUME=97` °C, they resume. At or above `DS_RELAY_TEMP_ABORT=105` °C for
+  `DS_RELAY_TEMP_ABORT_S=60` continuous seconds, the run aborts with a graceful-stop request
+  and bounded TERM/KILL fallback. All thresholds are overridable. The monitor also enforces the
+  command's wall timeout while its process group is stopped.
 - Before each workload, cooldown waits for the resume threshold, up to
   `DS_RELAY_COOLDOWN_S=120` seconds. Missing or unreadable sensors stop the relay. It prefers
   the `Package id 0` sensor, falling back to the hottest coretemp/k10temp sensor.
@@ -277,3 +283,86 @@ combat trail still needs this GPU check. It does not clear targets unconditional
 
 `python3 scripts/linux-session-report.py /path/to/dsport.log` summarizes an existing log without
 modifying it. Hitch spans overlap across threads and cannot establish a per-thread CPU profile.
+
+## Pipeline reuse checks
+
+The pipeline store has two formats: ordinary Vulkan pipeline-cache blobs (`pipelines/*.bin`)
+when binaries are disabled, and captured `VK_KHR_pipeline_binary` data (`binaries/*.pb` plus
+shared binary data) when supported. Shared data is scoped by the same device compatibility
+namespace as its parent pipeline file; a matching binary key alone cannot reuse older data. Captured binaries are intended to replay without NVIDIA's
+internal cache. Ordinary cache blobs are not a guarantee that shader compilation is avoided.
+
+The binary header now records schema `DSPBIN04`, a device compatibility key (pipeline-cache
+UUID, driver/vendor/device IDs, enabled extensions and features), and the code/create-info
+fingerprint. The latter covers translated code, reconvergence, descriptor layouts, push
+constants, pipeline flags and requested subgroup sizes. Graphics state keys include formats,
+blend state and topology; window dimensions are dynamic viewport/scissor state. Previous
+schema files rebuild once. An existing `binaries-mode.txt` decision to use ordinary caches is
+retained for normal play; the isolated relay omits that old decision when testing fresh binaries.
+Changing a translation or device feature policy also rebuilds
+incompatible entries. These are counted separately from driver refusals. This compatibility
+identifier is application-managed: upstream disabled the actual `vkGetPipelineKeyKHR` global-key
+query after it triggered a driver crash. That workaround remains, so a driver session change
+not reflected in these fields is still a possible cause of cross-process refusal.
+
+Capture and replay now keep the same flags2 structure in the create-info chain. Only the
+capture bit and the binary-input structure differ, as allowed by the
+[Vulkan binary replay contract](https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineBinaryInfoKHR.html).
+Whether that change eliminates this NVIDIA driver's refusals still needs the hardware relay.
+
+Normal play and shader preparation also share the fallback driver cache under
+`$XDG_CACHE_HOME/Regaliant/driver-cache/` (default `~/.cache/Regaliant/driver-cache/`). Previously,
+preparation isolated this cache, so normal play could not benefit from it when a binary was
+refused. Explicit `__GL_SHADER_DISK_CACHE_PATH`, `MESA_SHADER_CACHE_DIR` and `CUDA_CACHE_PATH`
+values are preserved and checked against read-only roots. NVIDIA's requested cache budget
+defaults to 8 GiB; `__GL_SHADER_DISK_CACHE_SIZE` overrides it. Linux defaults
+`__GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1` to retain preparation work; an explicit value is preserved.
+Mesa defaults to `MESA_SHADER_CACHE_MAX_SIZE=8G`, also overridable. The full tour's cache footprint
+has not been measured; with cleanup disabled, monitor disk usage rather than treating the budget
+as a hard disk-space bound. Startup logs the selected paths and settings before Vulkan starts. NVIDIA documents the cache path/size controls in its
+[driver README](https://download.nvidia.com/XFree86/Linux-x86_64/570.124.04/README/openglenvvariables.html).
+The actual Vulkan driver's use of that cache is checked by the relay, not assumed from the
+requested budget. Rerun the normal preparation command after this upgrade; it retains its
+isolated save and repeats shader stages with the new contract and shared driver cache.
+
+For the reviewer, export `DS_GAME_DIR`, `DS_RELAY_SAVE_SEED` (containing `saves/`) and
+`DS_RELAY_SHADER_SEED`, then run:
+
+```sh
+python3 scripts/linux-pipeline-reuse.py
+```
+
+This copies the seed translations/specs but omits old binaries, runs twice from the same save,
+and keeps the new binaries and driver cache between runs. Read-only seeds stay untouched; only
+new private copies receive owner write permission. A write/rename preflight rejects an unusable
+store before starting the game. Both sessions are hidden, silent,
+limited to 30 fps, two compiler workers and the relay CPU/thermal guard. Each lasts at most
+300 seconds with a 330-second timeout; `--seconds` adjusts that bound. Fresh captures are
+replayed immediately as a diagnostic. This is a reuse test, not an FPS benchmark.
+
+Read `local-data/linux-port/pipeline-reuse/run-*/comparison.json` and `summary.txt`. Passing
+requires at least 100 matching pipelines covering 95% of the second run, at least 99% reuse,
+no store-write failures, no fresh-replay failures and no
+more than one second of aggregate source-creation calls for those matching pipelines. Newly
+encountered or changed pipelines are reported separately. Per-pipeline outcomes, creation
+latencies, stale reasons and cache environment are in each runtime's `pipeline-reuse.json`.
+An incomplete route, truncated ledger or thermal interruption cannot pass. Optional
+`--cold-driver` gives the second run an empty driver cache while retaining the port's binaries,
+to test independence from the internal cache; it never deletes an existing cache.
+
+
+## Diagnosing a camera-dependent black surface
+
+The reported corridor artifact is not yet attributed to a particular draw. Linux and Windows
+share the same unmapped-texture handling: zero-fill on first upload, retain prior contents on
+later partial uploads. A partial-residency warning alone does not identify the black surface.
+Those warnings now include image addresses and dimensions for comparison with a frame capture.
+
+For a diagnostic play session, add `DS_SCENE_PROBE=1` to the normal play command. Press F9 once
+at the bad camera angle and again at a nearby angle that renders correctly. Each press requests
+a window PNG, `capture-<flip>.txt`, intermediate `targets-<flip>/` images/statistics, and sampled
+textures in `scene-<flip>/textures/` under that session's log directory. Texture PNG support is
+format-dependent; the text records the bound descriptors and depth, clipping and culling state.
+Readback can stall the game, so use this only to capture the problem, not to measure performance.
+F9 keeps its ordinary input behavior without `DS_SCENE_PROBE=1`. Do not publish captures containing
+game assets with a source-code patch.

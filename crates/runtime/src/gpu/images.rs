@@ -3053,6 +3053,11 @@ fn record_upload(cmd: vk::CommandBuffer, image: vk::Image, first: bool, buf: vk:
     }
 }
 
+fn partial_residency_note(key: ImageKey, skipped: usize, first: bool) -> String {
+    format!("partially resident texture: {skipped} (mip, layer) not mapped, {}; image {:#x} {}x{} layers {} levels {} {:?}",
+        if first { "zero-filled" } else { "left as they were" }, key.base, key.width, key.height, key.layers, key.levels, key.format)
+}
+
 /// A texture's re-upload left by `refresh` for after the image cache's lock
 /// (since 2026-11-01): its write marks taken and re-armed under the lock,
 /// its parts chosen and detiled outside it by the thread that took them, its
@@ -3320,7 +3325,7 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
     }
     push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
     if skipped > 0 {
-        notes.push(format!("partially resident texture: {skipped} (mip, layer) not mapped, {}", if job.first { "zero-filled" } else { "left as they were" }));
+        notes.push(partial_residency_note(job.key, skipped, job.first));
     }
     Ok(Prepared { copy: Some((st, regions, total)), size, notes })
 }
@@ -4440,7 +4445,7 @@ impl Images {
                         PART_UPLOADS[3].fetch_add(bytes, Relaxed);
                     }
                     if skipped > 0 {
-                        self.report(format!("partially resident texture: {skipped} (mip, layer) not mapped, {}", if first { "zero-filled" } else { "left as they were" }));
+                        self.report(partial_residency_note(key, skipped, first));
                     }
                     self.uploads += 1;
                     return Ok((t.base, size));
@@ -4501,10 +4506,7 @@ impl Images {
             push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
         }
         if skipped > 0 {
-            self.report(format!(
-                "partially resident texture: {skipped} (mip, layer) not mapped, {}",
-                if first { "zero-filled" } else { "left as they were" }
-            ));
+            self.report(partial_residency_note(key, skipped, first));
         }
         let t_stage = std::time::Instant::now();
         let (buf, mem) = (st.buf, st.mem);

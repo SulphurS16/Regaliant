@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Flip number at which to start capturing (u64::MAX = not armed).
 static ARMED: AtomicU64 = AtomicU64::new(u64::MAX);
+static SCENE_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
 
 pub fn completed_flip() -> u64 { COMPLETED.load(Ordering::Acquire) }
@@ -43,6 +44,21 @@ pub fn init_from_env() {
 /// Arms a capture of the frame after the next flip.
 pub fn arm_next() {
     ARMED.store(super::FRAMES.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+pub fn scene_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_SCENE_PROBE").ok().as_deref() == Some("1"))
+}
+
+/// Explicit player diagnostic at the current camera angle; never armed by normal play.
+#[cfg(target_os = "linux")]
+pub fn arm_scene_probe() {
+    if CAPTURE_ON.load(Ordering::Acquire) || SCENE_PROBE.swap(true, Ordering::AcqRel) { return; }
+    crate::info!("scene probe: capture requested at the current camera angle (F9); readback can stall this frame");
+    *crate::hle::libs::videoout::SHOT_REQUEST.lock() = Some(format!("scene-probe-{}", super::FRAMES.load(Ordering::Relaxed)));
+    arm_next();
 }
 
 pub fn capturing() -> bool {
@@ -83,7 +99,7 @@ pub fn on_flip(flip: u64) {
     let armed = ARMED.load(Ordering::SeqCst);
     if armed != u64::MAX && flip >= armed {
         ARMED.store(u64::MAX, Ordering::SeqCst);
-        MORE.store(std::env::var("DS_CAPTURE_COUNT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).saturating_sub(1), Ordering::SeqCst);
+        MORE.store(if SCENE_PROBE.load(Ordering::Acquire) { 0 } else { std::env::var("DS_CAPTURE_COUNT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).saturating_sub(1) }, Ordering::SeqCst);
         *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default(), targets: Default::default() });
         CAPTURE_ON.store(true, Ordering::SeqCst);
         crate::info!("capture: recording the frame after flip {flip}");
@@ -95,10 +111,12 @@ fn finish(c: Capture, dumps: bool) {
     let path = dir.join(format!("capture-{}.txt", c.flip));
     let _ = std::fs::write(&path, &c.text);
     let dumped = c.shaders.iter().filter(|&&a| save_program(a).is_some()).count();
-    let tex = if dumps { dump_textures(&dir, &c.textures) } else { 0 };
+    let scene_probe = SCENE_PROBE.swap(false, Ordering::AcqRel);
+    let texture_dir = if scene_probe { dir.join(format!("scene-{}", c.flip)) } else { dir.to_path_buf() };
+    let tex = if dumps { dump_textures(&texture_dir, &c.textures) } else { 0 };
     // Render targets as rendered (GPU execution): the graphics queue's work
     // of the frame completed before its flip.
-    let frame_targets = std::env::var("DS_CAPTURE_TARGETS_FRAME").ok().as_deref() == Some("1");
+    let frame_targets = scene_probe || std::env::var("DS_CAPTURE_TARGETS_FRAME").ok().as_deref() == Some("1");
     let target_dir = if frame_targets { dir.join(format!("targets-{}", c.flip)) } else { dir.join("targets") };
     let rts = if dumps && super::exec::enabled() {
         super::images::with(|im| if frame_targets { im.dump_frame_targets(&target_dir, &c.targets) } else { im.dump_targets(&target_dir) })

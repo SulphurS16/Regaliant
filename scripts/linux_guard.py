@@ -86,11 +86,14 @@ class Policy:
         env = os.environ if env is None else env
         self.cpus = select_cpus(env.get('DS_RELAY_CPUS'))
         self.workers = int(env.get('DS_COMPILE_WORKERS', '2'))
-        self.pause = float(env.get('DS_RELAY_TEMP_PAUSE', '95'))
-        self.resume = float(env.get('DS_RELAY_TEMP_RESUME', '85'))
+        self.pause = float(env.get('DS_RELAY_TEMP_PAUSE', '103'))
+        self.resume = float(env.get('DS_RELAY_TEMP_RESUME', '97'))
+        self.hold = float(env.get('DS_RELAY_TEMP_HOLD_S', '10'))
+        self.abort_temp = float(env.get('DS_RELAY_TEMP_ABORT', '105'))
         self.abort = float(env.get('DS_RELAY_TEMP_ABORT_S', '60'))
         self.cooldown = float(env.get('DS_RELAY_COOLDOWN_S', '120'))
         if not (1 <= self.workers <= 16 and 0 < self.resume < self.pause <= 110
+                and 0 <= self.hold <= 600 and self.pause <= self.abort_temp <= 120
                 and 0 < self.abort <= 600 and 0 < self.cooldown <= 600):
             raise GuardError('Invalid worker count or thermal thresholds/time limits')
         self.paths = sensor_paths()
@@ -120,26 +123,32 @@ class Policy:
 
 class ThermalState:
     """Pure hysteresis state machine, tested with a fake clock and sensor values."""
-    def __init__(self, pause, resume, abort):
+    def __init__(self, pause, resume, abort, hold=10, abort_temp=105):
         self.pause, self.resume, self.abort = pause, resume, abort
         self.since = None
+        self.warm_since = None
+        self.hot_since = None
+        self.hold, self.abort_temp = hold, abort_temp
         self.pauses = 0
         self.paused_s = 0.0
 
     def step(self, now, temp):
+        self.hot_since = (now if self.hot_since is None else self.hot_since) if temp >= self.abort_temp else None
+        if self.hot_since is not None and now-self.hot_since >= self.abort:
+            return 'abort'
         if self.since is None:
-            if temp > self.pause:
+            self.warm_since = (now if self.warm_since is None else self.warm_since) if temp >= self.pause else None
+            if self.warm_since is not None and now-self.warm_since >= self.hold:
                 self.since = now
                 self.pauses += 1
                 return 'pause'
         elif temp < self.resume:
             self.paused_s += now-self.since
             self.since = None
+            self.warm_since = None
             return 'resume'
-        elif now-self.since >= self.abort:
-            # Bound the entire pause, even if temperature sits between thresholds.
-            return 'abort'
         return 'sample'
+
 
 
 def descendant_groups(pid):
@@ -171,6 +180,20 @@ def group_activity(groups):
     return result
 
 
+def timeout_seconds(command):
+    """Independent wall bound while SIGSTOP also stops the GNU timeout wrapper."""
+    if not command or Path(command[0]).name != 'timeout': return None
+    i = 1
+    while i < len(command):
+        arg = command[i]
+        if arg in ('-k', '--kill-after', '-s', '--signal'): i += 2; continue
+        if arg.startswith('-'): i += 1; continue
+        units = {'s':1, 'm':60, 'h':3600, 'd':86400}
+        try: return float(arg[:-1])*units[arg[-1]] if arg[-1] in units else float(arg)
+        except (ValueError, IndexError): return None
+    return None
+
+
 class Process:
     """Popen interface with an independent 2s monitor; monitors never share game affinity."""
     def __init__(self, command, *, output, env=None, **kwargs):
@@ -178,11 +201,12 @@ class Process:
         self.output.mkdir(parents=True, exist_ok=True)
         self.policy = Policy(env)
         self.policy.wait_cool(self.output/'monitor.jsonl')
-        self.state = ThermalState(self.policy.pause, self.policy.resume, self.policy.abort)
+        self.state = ThermalState(self.policy.pause, self.policy.resume, self.policy.abort, self.policy.hold, self.policy.abort_temp)
         self.aborted = None
         self.finished = threading.Event()
         self.groups = set()
         self.started = time.monotonic()
+        self.wall_limit = timeout_seconds(command)
         self.stop_file = self.output/'stop-request'
         child_env = self.policy.environment(env or os.environ)
         child_env['DS_RELAY_STOP_FILE'] = str(self.stop_file)
@@ -221,6 +245,10 @@ class Process:
         with (self.output/'monitor.jsonl').open('a') as f:
             try:
                 while self.p.poll() is None:
+                    if self.state.since is not None and self.wall_limit is not None and time.monotonic()-self.started >= self.wall_limit:
+                        self.aborted = 'wall timeout during thermal pause'
+                        record(f, event='wall-timeout', pid=self.pid, limit_s=self.wall_limit)
+                        break
                     self.groups.update(descendant_groups(self.pid))
                     temp = temperature(self.policy.paths)
                     action = self.state.step(time.monotonic(), temp)
@@ -229,7 +257,7 @@ class Process:
                     record(f, event=action, temperature_c=temp, pid=self.pid, cpus=self.policy.cpus,
                            paused=self.state.since is not None, owned_groups=group_activity(self.groups))
                     if action == 'abort':
-                        self.aborted = 'thermal pause exceeded bounded cooling time'
+                        self.aborted = f'CPU stayed at or above {self.policy.abort_temp} C for {self.policy.abort} seconds'
                         break
                     if self.finished.wait(2): break
             except Exception as e:

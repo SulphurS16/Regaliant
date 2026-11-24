@@ -90,6 +90,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         if ty.is_dir() { copy_tree(&e.path(), &dest)?; }
         else if ty.is_file() {
             std::fs::copy(e.path(), &dest).map_err(|e| e.to_string())?;
+            // fs::copy preserves a read-only seed's mode; only the private save is writable.
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).map_err(|e| e.to_string())?.permissions().mode();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode | 0o600)).map_err(|e| e.to_string())?;
             std::fs::File::open(&dest).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
         } else { return Err(format!("preparation seed contains a symlink/special file: {}", e.path().display())); }
     }
@@ -112,6 +116,7 @@ pub fn validate_child(root: &Path, paths: &dsconfig::paths::Paths) -> Result<(),
 const POLICY_ENV: &[&str] = &[
     "DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "DS_SG_APPENDS",
     "DS_MARKS_PART", "DS_IMG_DIM_INST", "DS_FMT_SEED", "DS_FMT_RT_ONLY",
+    "DS_PIPELINE_BINARIES", "DS_PB_NO_INTERNAL", "DS_PIPELINE_STATS", "DS_PUSH_DESC",
     "DS_SUBGROUP32", "DS_BARY_GS", "DS_GPU_COMPAT", "DS_OUTPUT_SIZE", "DS_RENDER_SIZE",
 ];
 fn policy_switch(key: &str) -> bool {
@@ -120,7 +125,7 @@ fn policy_switch(key: &str) -> bool {
 fn policy_identity(mut switches: Vec<(String, String)>, settings: &str, display: &[u8]) -> Result<String, String> {
     switches.retain(|(k, _)| policy_switch(k));
     switches.sort();
-    let bytes = serde_json::to_vec(&(rdna::SOURCE_HASH, "portable-modes-mrc1", switches, settings, display)).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&(rdna::SOURCE_HASH, "pipeline-contract-1-driver-cache-shared", switches, settings, display)).map_err(|e| e.to_string())?;
     let mut hash = dsconfig::sha::Sha256::new().map_err(|e| e.to_string())?;
     hash.update(&bytes).map_err(|e| e.to_string())?;
     Ok(dsconfig::sha::hex(&hash.finish().map_err(|e| e.to_string())?))
@@ -134,6 +139,7 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
     let cache = super::files::output_path(&paths.cache, &forbidden).map_err(|e| e.to_string())?;
     let shaders = std::env::var_os("DS_LINUX_SHADER_CACHE").map(PathBuf::from).unwrap_or_else(|| paths.shaders());
     let shaders = super::files::output_path(&shaders, &forbidden).map_err(|e| e.to_string())?;
+    super::files::configure_driver_cache(&cache)?;
     let root = super::files::output_path(&cache.join("prepare/linux-full"), &forbidden).map_err(|e| e.to_string())?;
     for output in [&paths.user, &cache, &shaders] { super::files::validate_output_tree(output).map_err(|e| e.to_string())?; }
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -216,8 +222,6 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
                 .env("TMPDIR", root.join("tmp")).env("TMP", root.join("tmp")).env("TEMP", root.join("tmp"))
                 .env("XDG_CACHE_HOME", root.join("xdg-cache")).env("XDG_DATA_HOME", root.join("xdg-data"))
                 .env("XDG_CONFIG_HOME", root.join("xdg-config")).env("XDG_STATE_HOME", root.join("xdg-state"))
-                .env("MESA_SHADER_CACHE_DIR", root.join("driver")).env("__GL_SHADER_DISK_CACHE_PATH", root.join("driver"))
-                .env("CUDA_CACHE_PATH", root.join("driver"))
                 .stdin(Stdio::null()).stderr(log.try_clone().map_err(|e| e.to_string())?).stdout(log);
             if let Some(phase) = stage.strip_prefix("check-") { cmd.args(["--pb-check", phase]); }
             else if stage == "compile" { cmd.args(["--precompile-all", &threads.to_string()]); }
@@ -276,7 +280,7 @@ mod tests {
     #[test]
     fn preparation_identity_tracks_player_translation_and_settings() {
         let base = policy_identity(vec![], "", b"").unwrap();
-        for k in ["DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "RDNA_LANE_GUARDS"] {
+        for k in ["DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "RDNA_LANE_GUARDS", "DS_PIPELINE_BINARIES", "DS_PUSH_DESC", "DS_PIPELINE_STATS"] {
             assert!(policy_switch(k));
             assert_ne!(base, policy_identity(vec![(k.into(), "0".into())], "", b"").unwrap());
         }
@@ -313,6 +317,20 @@ mod tests {
         assert_eq!(std::fs::read_to_string(checkpoint).unwrap(), "chunk=1/3\nlevel=3\n");
         std::os::unix::fs::symlink(root.join("owned.txt"), root.join("user/link")).unwrap();
         assert!(copy_tree(&root.join("user"), &root.join("copy")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn readonly_seed_produces_writable_private_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("regaliant-readonly-seed-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("seed")).unwrap();
+        let source = root.join("seed/save");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+        copy_tree(&root.join("seed"), &root.join("private")).unwrap();
+        std::fs::write(root.join("private/save"), b"progress").unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert_eq!(std::fs::metadata(source).unwrap().permissions().mode() & 0o777, 0o444);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

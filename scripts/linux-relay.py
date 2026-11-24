@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import linux_snapshot
 import signal
 import subprocess
 import sys
@@ -194,6 +195,8 @@ def session_environment(inherited, profile):
         env.update(DS_NAN_EARLY='1', DS_CAPTURE_CODE='1', DS_RECORD_PROFILE='1')
     elif profile == 'host-profile':
         env.update(DS_RELAY_GAMEPLAY_SECONDS='30', DS_VK_VALIDATION='0', DS_STEP_LAPS='1', DS_OP_CENSUS='1', DS_WW_CENSUS='1', DS_RELAY_CPU_PROFILE='1')
+    elif profile == 'cache-reuse':
+        env.update(DS_VK_VALIDATION='0', DS_RELAY_GAMEPLAY_SECONDS='30')
     elif profile not in ('present', 'present-validation', 'resume'):
         raise ValueError(f'unknown relay profile: {profile}')
     if profile == 'legacy': env.update(DS_LINUX_VOLATILE_BACKOFF='1', DS_LINUX_WRITE_WATCH='mprotect')
@@ -264,8 +267,10 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     if gentle:
         env.update(DS_RELAY_GAMEPLAY_SECONDS='30', DS_RELAY_SHORT='1')
         if mode == 'offscreen': env['DS_RELAY_IDLE_COMPARE'] = '1'
+    if profile == 'cache-reuse': env.update(DS_RELAY_IDLE_COMPARE='0', DS_RELAY_FPS_LIMIT='30')
     if env.get('DS_RELAY_UI_PROBE') == '1':
         env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_RELAY_IDLE_COMPARE='0', DS_RELAY_FPS_LIMIT='30')
+    linux_snapshot.check_writable(cache/"pipelines"/"binaries")
     driver_cache = driver_cache or run.parent/('driver-'+profile.replace('warm', 'clean'))
     driver_cache.mkdir(exist_ok=True)
     for name in ('mesa', 'nvidia', 'cuda'): (driver_cache/name).mkdir(exist_ok=True)
@@ -274,7 +279,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     env['DSPORT_HOME'] = str(run/'user')
     (run/'user').mkdir()
     if saved_user is not None:
-        shutil.copytree(saved_user/'saves', run/'user'/'saves')
+        linux_snapshot.copy_tree(saved_user/'saves', run/'user'/'saves')
         for name in ('pcsettings.txt', 'display.txt', 'controls.txt'):
             p = saved_user/name
             if p.is_file():
@@ -282,6 +287,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
                 if name == 'pcsettings.txt':
                     text = '\n'.join(l for l in text.splitlines() if not l.strip().startswith(('Setting_PC_SaveFolder', 'Setting_PC_ImportSaves')))+'\n'
                 (run/'user'/name).write_text(text)
+    linux_snapshot.check_writable(run/'user'/'saves')
     (run/'saves-before.json').write_text(json.dumps(save_inventory(run/'user'), indent=2)+'\n')
     command = ['timeout', '-k', '5s', hard+'s', str(repo/'target/release/dsport'), '--app', str(game),
                '--relay-continue' if saved_user is not None else '--relay-newgame', '--run-seconds', seconds] + (['--offscreen'] if mode == 'offscreen' else [])
@@ -545,6 +551,7 @@ def pipeline_reuse(run):
     hits, source = r['binary_hits'], r['source_create_calls']
     result = {k: r[k] for k in ('binary_hits', 'binary_refused', 'missing', 'invalid', 'other_driver', 'other_code',
                                'captured', 'source_create_calls', 'source_create_ms', 'binary_total_ms', 'identity')}
+    result['store_write_failures'] = r.get('store_write_failures', 0)
     result.update(available=True, binary_mode=r['binary_mode'], binary_hit_fraction=hits/max(hits+source, 1))
     intervals = {}
     for p in (run/'user').rglob('*-pipeline-reuse.json'):
@@ -621,7 +628,7 @@ def main():
     results = {}
     prepared = run/'prepared-shaders'
     if shader_seed is None: prepared.mkdir()
-    else: shutil.copytree(shader_seed, prepared)
+    else: linux_snapshot.copy_tree(shader_seed, prepared)
     if seed is None:
         bootstrap = run_session(repo, game, run/'seed-newgame', 'offscreen', '900', '960', prepared, 'round9-route')
         if session_failed(bootstrap, 'round9-route') or not (run/'seed-newgame/user/saves').is_dir():
@@ -642,7 +649,7 @@ def main():
         if label in ('present-fifo-uffd', 'present-fifo-gpu-timing'): family = 'present-fifo'
         if not full: family = 'gentle'
         cache = run/('cache-'+family)/'shaders'
-        if not cache.exists(): shutil.copytree(shader_seed, cache)
+        if not cache.exists(): linux_snapshot.copy_tree(shader_seed, cache)
         # Cold/warm repeat the same route from immutable saves, sharing BOTH cache types.
         driver = run/('driver-'+family)
         results[label] = run_session(repo, game, run/label, 'present' if label.startswith('present') else 'offscreen',

@@ -867,6 +867,14 @@ fn init_inner() -> Result<(), String> {
             qci.iter().map(|q| format!("family {} count {}", q.queue_family_index, q.queue_count)).collect::<Vec<_>>().join(", "));
         crate::info!("Vulkan renderer paths: push descriptors; device-local images and FE2 sparse mirror; host imports feed mirror uploads. Descriptor buffer, host image copy and pageable device-local memory are not renderer paths on either platform.");
         let mut mutable = vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default().mutable_descriptor_type(true);
+        // Value-only compatibility identity, before push_next links these feature structs.
+        // Driver UUID/version alone does not distinguish enabled robustness/subgroup features.
+        let mut binary_extensions: Vec<_> = dexts.iter().map(|&p| CStr::from_ptr(p).to_string_lossy().into_owned()).collect();
+        binary_extensions.sort();
+        let binary_features = format!("{features:?}|{f11:?}|{f12:?}|{f13:?}|{}|{:?}|{barycentric}|{max_reconv}|{}|{pbins}|{has_pw}|{has_fault}|{has_stats}",
+            has_robust2, if has_robust2 { Some(r2) } else { None }, up_dev.mutable_descriptor);
+        let binary_compatibility = format!("contract1|{binary_extensions:?}|{binary_features}");
+        crate::info!("Vulkan pipeline compatibility: {binary_compatibility}");
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
@@ -982,7 +990,7 @@ fn init_inner() -> Result<(), String> {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("effects timeline semaphore: {e}"))?
         };
-        let pbin = if pbins { pbin::Fns::load(&instance, pdev, device.handle()) } else { None };
+        let pbin = if pbins { pbin::Fns::load(&instance, pdev, device.handle(), binary_compatibility.as_bytes()) } else { None };
         if pbins {
             match &pbin {
                 Some(_) => crate::info!("Vulkan pipeline binaries: on"),

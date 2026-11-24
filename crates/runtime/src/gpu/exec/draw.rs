@@ -1743,12 +1743,10 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
                 v
             },
         );
-        let r = crate::gpu::pcache::create_with('g', hkey, fp, |via| {
+        let r = crate::gpu::pcache::create_with('g', hkey, crate::gpu::pcache::creation_fingerprint(fp, &bindings, &ranges, flags, gpci.flags, c.subgroup32 & (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::GEOMETRY | vk::ShaderStageFlags::FRAGMENT)), |via| {
             let mut gpci = gpci;
-            let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(gpci.flags.as_raw() as u64 | crate::gpu::vk::pbin::CAPTURE_DATA));
-            if via.capture {
-                gpci = gpci.push_next(&mut f2);
-            }
+            let mut f2 = crate::gpu::vk::pbin::creation_flags(gpci.flags, via.capture);
+            if via.capture || via.binaries.is_some() { gpci = gpci.push_next(&mut f2); }
             let bi;
             if let Some(b) = via.binaries {
                 bi = crate::gpu::vk::pbin::BinaryInfo { s_type: crate::gpu::vk::pbin::ST_BINARY_INFO, p_next: gpci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };

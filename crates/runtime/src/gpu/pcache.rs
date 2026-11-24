@@ -46,7 +46,7 @@ const BIN_BUDGET: u64 = 4 << 30;
 /// their code, and binaries of other code must never be used), the binaries
 /// (key, data; data of SHARED_MIN bytes or more kept once, in `<key>.shared`,
 /// and marked u64::MAX here), an FNV-1a hash of all before it.
-const PB_MAGIC: &[u8; 8] = b"DSPBIN03";
+const PB_MAGIC: &[u8; 8] = b"DSPBIN04";
 const SHARED_MIN: usize = 1 << 20;
 /// [pipelines made from binaries, their ns, binaries refused or failed,
 /// pipelines whose binaries were captured, their bytes, capture ns, captures
@@ -61,8 +61,19 @@ static PB_OTHER_KEY: AtomicU64 = AtomicU64::new(0);
 static SOURCE_CALLS: AtomicU64 = AtomicU64::new(0);
 static SOURCE_NS: AtomicU64 = AtomicU64::new(0);
 static PB_MISSING: AtomicU64 = AtomicU64::new(0);
+static PB_SCHEMA: AtomicU64 = AtomicU64::new(0);
 static PB_INVALID: AtomicU64 = AtomicU64::new(0);
 static PB_EVENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+static PB_LEDGER: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+static PB_LEDGER_DROPPED: AtomicU64 = AtomicU64::new(0);
+static PB_FRESH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+fn reuse_record(kind: char, key: u64, fp: u64, outcome: &str, ms: f64) {
+    let mut rows = PB_LEDGER.lock();
+    if rows.len() < 32768 {
+        rows.push(serde_json::json!({"key":format!("{kind}{key:016x}"), "fingerprint":format!("{fp:016x}"), "outcome":outcome, "ms":ms}));
+    } else { PB_LEDGER_DROPPED.fetch_add(1, Ordering::Relaxed); }
+}
+
 fn reuse_event(kind: char, key: u64, fp: u64, reason: &str) {
     let mut events = PB_EVENTS.lock();
     if events.len() < 256 { events.push(serde_json::json!({"key":format!("{kind}{key:016x}"), "fingerprint":format!("{fp:016x}"), "reason":reason})); }
@@ -72,13 +83,16 @@ fn reuse_event(kind: char, key: u64, fp: u64, reason: &str) {
 pub fn reuse_report() -> serde_json::Value {
     serde_json::json!({"binary_mode":super::vk::try_ctx().is_some_and(|c| c.pbin.is_some()), "binary_hits":PB[0].load(Ordering::Relaxed), "binary_refused":PB[2].load(Ordering::Relaxed),
         "missing":PB_MISSING.load(Ordering::Relaxed), "invalid":PB_INVALID.load(Ordering::Relaxed),
-        "other_driver":PB_OTHER_KEY.load(Ordering::Relaxed), "other_code":PB_STALE.load(Ordering::Relaxed),
+        "old_schema":PB_SCHEMA.load(Ordering::Relaxed), "other_driver":PB_OTHER_KEY.load(Ordering::Relaxed), "other_code":PB_STALE.load(Ordering::Relaxed),
         "captured":PB[3].load(Ordering::Relaxed), "capture_failed":PB[6].load(Ordering::Relaxed),
         "source_create_calls":SOURCE_CALLS.load(Ordering::Relaxed), "source_create_ms":SOURCE_NS.load(Ordering::Relaxed) as f64/1e6,
         "binary_total_ms":PB[1].load(Ordering::Relaxed) as f64/1e6,
         "cache_create_calls":LAPS[7].load(Ordering::Relaxed), "cache_create_ms":LAPS[2].load(Ordering::Relaxed) as f64/1e6,
         "cache_file_hits":STATS[0].load(Ordering::Relaxed), "cache_files_written":STATS[1].load(Ordering::Relaxed),
         "store":DIR.get(), "identity":IDENTITY.get(), "events":&*PB_EVENTS.lock(),
+        "schema":"DSPBIN04/creation-contract-1", "ledger":&*PB_LEDGER.lock(), "ledger_dropped":PB_LEDGER_DROPPED.load(Ordering::Relaxed),
+        "store_write_failures":WRITE_FAILS.load(Ordering::Relaxed), "fresh_replay_ok":PB_FRESH[0].load(Ordering::Relaxed), "fresh_replay_failed":PB_FRESH[1].load(Ordering::Relaxed),
+        "driver_cache_env": (["__GL_SHADER_DISK_CACHE", "__GL_SHADER_DISK_CACHE_PATH", "__GL_SHADER_DISK_CACHE_SIZE", "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "DS_PB_NO_INTERNAL"].map(|k| (k, std::env::var(k).ok()))),
         "note":"Source creates may hit driver caches. Binary hits bypass shader compilation but still instantiate Vulkan objects. Events capped at256."})
 }
 
@@ -968,6 +982,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
         let t = std::time::Instant::now();
         let result = create(via);
         if source {
+            reuse_record(kind, key, fp, if result.is_ok() { "source" } else { "source_failed" }, t.elapsed().as_secs_f64() * 1000.0);
             SOURCE_CALLS.fetch_add(1, Ordering::Relaxed);
             SOURCE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
@@ -1008,7 +1023,15 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
         let stored = match std::fs::read(p) {
             Ok(b) => {
                 let decoded = decode_pb(&b, &pb.global, fp);
-                if decoded.is_none() { PB_INVALID.fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, "invalid file, driver key or code fingerprint"); }
+                if decoded.is_none() {
+                    let reason = pb_rejection(&b, &pb.global, fp);
+                    match reason {
+                        "old_schema" => &PB_SCHEMA, "other_driver" => &PB_OTHER_KEY,
+                        "other_code_or_contract" => &PB_STALE, _ => &PB_INVALID,
+                    }.fetch_add(1, Ordering::Relaxed);
+                    reuse_record(kind, key, fp, reason, 0.0);
+                    reuse_event(kind, key, fp, reason);
+                }
                 decoded
             }
             Err(e) => { PB_MISSING.fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, &format!("read: {e}")); None }
@@ -1044,10 +1067,12 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                 Ok(pipe) => {
                     PB[0].fetch_add(1, Ordering::Relaxed);
                     PB[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    reuse_record(kind, key, fp, "hit", t.elapsed().as_secs_f64() * 1000.0);
                     touch_later(p);
                     return Ok(pipe);
                 }
                 Err(e) => {
+                    reuse_record(kind, key, fp, "refused", t.elapsed().as_secs_f64() * 1000.0);
                     reuse_event(kind, key, fp, &e);
                     if PB[2].fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::warn!("pipeline cache: the binaries of {kind}{key:016x} were not used ({e}); made anew");
@@ -1077,8 +1102,38 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
         let t = std::time::Instant::now();
         match pb.capture(*pipe, &|k| shared_path(k).is_some_and(|p| p.exists())) {
             Ok(bins) => {
-                let enc = encode_pb(&pb.global, fp, &bins);
+                let enc = match encode_pb(&pb.global, fp, &bins) {
+                    Ok(enc) => enc,
+                    Err(e) => {
+                        reuse_record(kind, key, fp, "storage_failed", 0.0);
+                        reuse_event(kind, key, fp, &e);
+                        PB[5].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        return r;
+                    }
+                };
+                // Explicit relay diagnostic: reconstruct from exactly the serialized parts and
+                // replay while the original create-info, layouts and modules are still alive.
+                // No internal-cache lookup is involved. Do not count these as ordinary hits.
+                if std::env::var("DS_PB_VERIFY_CAPTURE").ok().as_deref() == Some("1") {
+                    let started = std::time::Instant::now();
+                    let parts = decode_pb(&enc, &pb.global, fp).expect("just encoded pipeline binary");
+                    let ready = parts.iter().all(|p| match p {
+                        super::vk::pbin::Part::Shared(k) => pb.has_shared(k) || load_shared(k).is_some_and(|d| pb.share(k, &d).is_ok()),
+                        _ => true,
+                    });
+                    let result = if ready { pb.from_parts(&parts).map_err(|e| e.to_string()).and_then(|(all, own)| {
+                        let result = create(Via { cache: vk::PipelineCache::null(), capture: false, binaries: Some(&all) });
+                        pb.destroy(&own);
+                        result
+                    }) } else { Err("shared data unavailable".into()) };
+                    let outcome = match result {
+                        Ok(replay) => { unsafe { ctx().device.destroy_pipeline(replay, None) }; PB_FRESH[0].fetch_add(1, Ordering::Relaxed); "fresh_hit" }
+                        Err(e) => { PB_FRESH[1].fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, &format!("fresh replay: {e}")); "fresh_refused" }
+                    };
+                    reuse_record(kind, key, fp, outcome, started.elapsed().as_secs_f64() * 1000.0);
+                }
                 if write_file(p, &enc) {
+                    reuse_record(kind, key, fp, "captured", 0.0);
                     PB[3].fetch_add(1, Ordering::Relaxed);
                     PB[4].fetch_add(enc.len() as u64, Ordering::Relaxed);
                 }
@@ -1106,6 +1161,17 @@ pub fn translated_fingerprint(parts: &[&[u32]]) -> u64 {
     }
 }
 
+/// The variable create-info fields not covered by shader code or the graphics state key.
+/// No handles, pointers or padding enter this fingerprint. Fixed state/chain changes bump
+/// this schema. Viewport/scissor extents are dynamic and are deliberately absent.
+pub fn creation_fingerprint(code: u64, bindings: &[vk::DescriptorSetLayoutBinding], ranges: &[vk::PushConstantRange], layout_flags: vk::DescriptorSetLayoutCreateFlags, flags: vk::PipelineCreateFlags, subgroups: vk::ShaderStageFlags) -> u64 {
+    let mut words = vec![1, code as u32, (code >> 32) as u32, layout_flags.as_raw(), flags.as_raw(), subgroups.as_raw(), bindings.len() as u32];
+    for b in bindings { words.extend([b.binding, b.descriptor_type.as_raw() as u32, b.descriptor_count, b.stage_flags.as_raw()]); }
+    words.push(ranges.len() as u32);
+    for r in ranges { words.extend([r.stage_flags.as_raw(), r.offset, r.size]); }
+    fingerprint(&[&words])
+}
+
 /// A pipeline's code fingerprint (`create_with`): its stages' SPIR-V words
 /// and any other words that shape it.
 pub fn fingerprint(parts: &[&[u32]]) -> u64 {
@@ -1127,24 +1193,35 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// A shared binary's file (`<key>.shared`): its data and an FNV-1a hash.
+/// Shared data is valid only within its device compatibility namespace, just like
+/// the parent pipeline file. A matching binary key alone cannot validate old data.
+fn shared_name(global: &[u8], key: &[u8]) -> String {
+    format!("{}-{}.shared", hex(global), hex(key))
+}
 fn shared_path(key: &[u8]) -> Option<PathBuf> {
-    BIN_DIR.get().map(|d| d.join(format!("{}.shared", hex(key))))
+    let dir = BIN_DIR.get()?;
+    let pb = ctx().pbin.as_ref()?;
+    Some(dir.join(shared_name(&pb.global, key)))
 }
 
 /// Stores a shared binary's data once (`SHARED_MIN`).
-fn store_shared(key: &[u8], data: &[u8]) {
-    let Some(p) = shared_path(key) else { return };
-    if p.exists() {
-        return;
-    }
+fn store_shared(key: &[u8], data: &[u8]) -> bool {
+    let Some(p) = shared_path(key) else { return false };
+    store_shared_at(&p, data)
+}
+fn store_shared_at(p: &Path, data: &[u8]) -> bool {
+    if load_shared_at(p).is_some() { return true; }
+    if data.is_empty() { return false; }
     let mut w = data.to_vec();
     w.extend_from_slice(&fnv64(data).to_le_bytes());
-    write_file(&p, &w);
+    write_file(p, &w)
 }
 
 fn load_shared(key: &[u8]) -> Option<Vec<u8>> {
-    let mut b = std::fs::read(shared_path(key)?).ok()?;
+    load_shared_at(&shared_path(key)?)
+}
+fn load_shared_at(path: &Path) -> Option<Vec<u8>> {
+    let mut b = std::fs::read(path).ok()?;
     if b.len() < 8 {
         return None;
     }
@@ -1152,7 +1229,7 @@ fn load_shared(key: &[u8]) -> Option<Vec<u8>> {
     if fnv64(&b) != u64::from_le_bytes(tail.try_into().ok()?) {
         // (Damaged: removed, so the next capture stores it again; not by the launcher's probe.)
         if !READ_ONLY.load(Ordering::Relaxed) {
-            let _ = std::fs::remove_file(shared_path(key)?);
+            let _ = std::fs::remove_file(path);
         }
         return None;
     }
@@ -1160,7 +1237,10 @@ fn load_shared(key: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// A pipeline binary file (`PB_MAGIC`); shared data stored once apart.
-fn encode_pb(global: &[u8], fp: u64, bins: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+fn encode_pb(global: &[u8], fp: u64, bins: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    encode_pb_with(global, fp, bins, store_shared)
+}
+fn encode_pb_with(global: &[u8], fp: u64, bins: &[(Vec<u8>, Vec<u8>)], store: impl Fn(&[u8], &[u8]) -> bool) -> Result<Vec<u8>, String> {
     let mut w = Vec::with_capacity(64 + bins.iter().map(|b| b.0.len() + b.1.len().min(SHARED_MIN) + 12).sum::<usize>());
     w.extend_from_slice(PB_MAGIC);
     w.extend_from_slice(&(global.len() as u32).to_le_bytes());
@@ -1172,9 +1252,7 @@ fn encode_pb(global: &[u8], fp: u64, bins: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
         w.extend_from_slice(k);
         if d.is_empty() || d.len() >= SHARED_MIN {
             // (Empty: a shared binary stored before, `pbin::Fns::capture`.)
-            if !d.is_empty() {
-                store_shared(k, d);
-            }
+            if !store(k, d) { return Err(format!("shared binary {} could not be stored/read; pipeline record not written", hex(k))); }
             w.extend_from_slice(&u64::MAX.to_le_bytes());
         } else {
             w.extend_from_slice(&(d.len() as u64).to_le_bytes());
@@ -1183,11 +1261,24 @@ fn encode_pb(global: &[u8], fp: u64, bins: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     }
     let h = fnv64(&w);
     w.extend_from_slice(&h.to_le_bytes());
-    w
+    Ok(w)
 }
 
 /// `encode_pb`'s inverse; None for another global key, other code (`fp`)
 /// or a damaged file.
+fn pb_rejection(b: &[u8], global: &[u8], fp: u64) -> &'static str {
+    if b.get(..8).is_some_and(|v| v == b"DSPBIN03") { return "old_schema"; }
+    if b.len() < 28 || b.get(..8) != Some(PB_MAGIC) { return "invalid"; }
+    let (body, tail) = b.split_at(b.len() - 8);
+    if fnv64(body) != u64::from_le_bytes(tail.try_into().unwrap()) { return "invalid"; }
+    let n = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    let Some(g) = body.get(12..12usize.saturating_add(n)) else { return "invalid" };
+    if g != global { return "other_driver"; }
+    let Some(f) = body.get(12+n..20+n) else { return "invalid" };
+    if u64::from_le_bytes(f.try_into().unwrap()) != fp { return "other_code_or_contract"; }
+    "invalid"
+}
+
 fn decode_pb(b: &[u8], global: &[u8], fp: u64) -> Option<Vec<super::vk::pbin::Part>> {
     if b.len() < 8 + 4 + 4 + 8 || &b[..8] != PB_MAGIC {
         return None;
@@ -1204,11 +1295,9 @@ fn decode_pb(b: &[u8], global: &[u8], fp: u64) -> Option<Vec<super::vk::pbin::Pa
     };
     let gl = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
     if take(gl)? != global {
-        PB_OTHER_KEY.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if u64::from_le_bytes(take(8)?.try_into().ok()?) != fp {
-        PB_STALE.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let n = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
@@ -1218,6 +1307,7 @@ fn decode_pb(b: &[u8], global: &[u8], fp: u64) -> Option<Vec<super::vk::pbin::Pa
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let kl = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        if kl == 0 || kl > super::vk::pbin::MAX_KEY { return None; }
         let k = take(kl)?.to_vec();
         let dl = u64::from_le_bytes(take(8)?.try_into().ok()?);
         if dl == u64::MAX {
@@ -1227,6 +1317,7 @@ fn decode_pb(b: &[u8], global: &[u8], fp: u64) -> Option<Vec<super::vk::pbin::Pa
             out.push(super::vk::pbin::Part::Own(k, d));
         }
     }
+    if at != body.len() { return None; }
     Some(out)
 }
 
@@ -1295,6 +1386,71 @@ impl ThreadIdNumber for std::thread::ThreadId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fake_driver_capture_store_load_replay() {
+        // Fake driver's ordered capture: private code plus a large shared dictionary.
+        // Exercise the production serializer, atomic writer and shared-data reader on disk.
+        let root = std::env::temp_dir().join(format!("regaliant-pb-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let global = [1; 36];
+        let bins = vec![(vec![2; 8], vec![5; 32]), (vec![3; 8], vec![7; SHARED_MIN])];
+        let store = |key: &[u8], bytes: &[u8]| store_shared_at(&root.join(shared_name(&global, key)), bytes);
+        let encoded = encode_pb_with(&global, 123, &bins, store).unwrap();
+        let path = root.join("c123.pb");
+        assert!(write_file(&path, &encoded));
+        let parts = decode_pb(&std::fs::read(&path).unwrap(), &global, 123).unwrap();
+        let replay: Vec<_> = parts.into_iter().map(|p| match p {
+            super::super::vk::pbin::Part::Own(k, d) => (k, d),
+            super::super::vk::pbin::Part::Shared(k) => { let d = load_shared_at(&root.join(shared_name(&global, &k))).unwrap(); (k, d) }
+        }).collect();
+        assert_eq!(replay, bins, "fake driver accepts only its original ordered keys/data");
+        // A capture that skipped already-known shared bytes still reloads the stored data.
+        let mut known = bins.clone(); known[1].1.clear();
+        assert!(encode_pb_with(&global, 123, &known, store).is_ok());
+        // Neither a failed shared write nor missing known data may publish a dangling record.
+        assert!(encode_pb_with(&global, 123, &bins, |_, _| false).is_err());
+        std::fs::remove_file(root.join(shared_name(&global, &bins[1].0))).unwrap();
+        assert!(encode_pb_with(&global, 123, &known, store).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_data_is_scoped_to_device_contract() {
+        assert_ne!(shared_name(&[1, 2], &[3, 4]), shared_name(&[1, 5], &[3, 4]));
+        assert_ne!(shared_name(&[1, 2], &[3, 4]), shared_name(&[1, 2], &[3, 5]));
+        assert_eq!(shared_name(&[1, 2], &[3, 4]), "0102-0304.shared");
+    }
+
+    #[test]
+    fn binary_file_preserves_order_and_rejects_stale_contracts() {
+        let bins = vec![(vec![7; 4], vec![1; 40]), (vec![3; 8], vec![2; 20])];
+        let bytes = encode_pb(&[9; 28], 42, &bins).unwrap();
+        let parts = decode_pb(&bytes, &[9; 28], 42).unwrap();
+        for (part, (key, data)) in parts.iter().zip(&bins) {
+            match part { super::super::vk::pbin::Part::Own(k, d) => { assert_eq!(k, key); assert_eq!(d, data); }, _ => panic!("not shared") }
+        }
+        assert!(decode_pb(&bytes, &[9; 28], 43).is_none());
+        assert_eq!(pb_rejection(&bytes, &[9; 28], 43), "other_code_or_contract");
+        assert_eq!(pb_rejection(&bytes, &[8; 28], 42), "other_driver");
+        let mut old = bytes.clone(); old[..8].copy_from_slice(b"DSPBIN03");
+        assert_eq!(pb_rejection(&old, &[9; 28], 42), "old_schema");
+        let mut corrupt = bytes; corrupt[30] ^= 1;
+        assert_eq!(pb_rejection(&corrupt, &[9; 28], 42), "invalid");
+    }
+
+    #[test]
+    fn pipeline_contract_includes_layout_flags_and_subgroup_size() {
+        let b = [vk::DescriptorSetLayoutBinding::default().binding(2).descriptor_count(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        let f = |flags, sg, binding: &[vk::DescriptorSetLayoutBinding]| creation_fingerprint(7, binding, &[], vk::DescriptorSetLayoutCreateFlags::empty(), flags, sg);
+        let flags = vk::PipelineCreateFlags::DISPATCH_BASE;
+        let h = f(flags, vk::ShaderStageFlags::COMPUTE, &b);
+        assert_ne!(h, f(flags, vk::ShaderStageFlags::empty(), &b));
+        assert_ne!(h, f(vk::PipelineCreateFlags::empty(), vk::ShaderStageFlags::COMPUTE, &b));
+        let mut other = b; other[0].descriptor_count = 2;
+        assert_ne!(h, f(flags, vk::ShaderStageFlags::COMPUTE, &other));
+        assert_eq!(h, f(flags, vk::ShaderStageFlags::COMPUTE, &b));
+    }
 
     /// Files decoded one after another into one buffer (the block kept in
     /// place when the offset repeats) come back as decoded fresh.
@@ -1478,10 +1634,8 @@ pub fn pb_check(phase: &str) -> i32 {
         let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(flags);
         let make = |via: Via| -> Result<vk::Pipeline, String> {
             let mut ci = ci;
-            let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(ci.flags.as_raw() as u64 | super::vk::pbin::CAPTURE_DATA));
-            if via.capture {
-                ci = ci.push_next(&mut f2);
-            }
+            let mut f2 = super::vk::pbin::creation_flags(ci.flags, via.capture);
+            if via.capture || via.binaries.is_some() { ci = ci.push_next(&mut f2); }
             let bi;
             if let Some(b) = via.binaries {
                 bi = super::vk::pbin::BinaryInfo { s_type: super::vk::pbin::ST_BINARY_INFO, p_next: ci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };

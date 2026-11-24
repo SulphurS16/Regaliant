@@ -38,7 +38,7 @@ if [[ $dry_run == 1 ]]; then
     printf 'Build (guarded, two Cargo jobs by default): CARGO_HOME=%q python3 scripts/linux_guard.py <run>/build-guard timeout -k 5s 600s cargo build --release -p dsport\n' "$CARGO_HOME"
     printf 'Run: timeout -k 5s %ss %q --app %q %s --relay-continue --run-seconds %s\n' "$hard_seconds" "$repo_dir/target/release/dsport" "$game_dir" "${mode_args[*]}" "$run_seconds"
     printf 'CPU: DS_RELAY_CPUS or 8 allowed logical CPUs selected by sysfs performance-core topology; nice 10. Compile workers: %s.\n' "${DS_COMPILE_WORKERS:-2}"
-    printf 'Thermal guard: poll 2s, pause above %s C, resume below %s C, abort paused after %s s; bounded cooldown before EVERY workload. Monitor lines fsynced. Paused measurements INVALID.\n' "${DS_RELAY_TEMP_PAUSE:-95}" "${DS_RELAY_TEMP_RESUME:-85}" "${DS_RELAY_TEMP_ABORT_S:-60}"
+    printf 'Thermal guard: poll2s, pause at %s C sustained %ss, resume below %s C, abort at %s C sustained %ss; bounded cooldown. Paused timings INVALID.\n' "${DS_RELAY_TEMP_PAUSE:-103}" "${DS_RELAY_TEMP_HOLD_S:-10}" "${DS_RELAY_TEMP_RESUME:-97}" "${DS_RELAY_TEMP_ABORT:-105}" "${DS_RELAY_TEMP_ABORT_S:-60}"
     if [[ $full == 0 ]]; then
         printf 'SHORT suite: one clean offscreen measurement + one visible FIFO run, each 180s / timeout200s. Requires DS_RELAY_SAVE_SEED containing saves/; DS_RELAY_SHADER_SEED optional. No preparation, scatter, tracking stress or repeated profiles.\n'
     else

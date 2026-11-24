@@ -5,7 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
+import linux_snapshot
 import signal
 import sys
 import time
@@ -71,12 +71,12 @@ def main():
     (output/'plan.json').write_text(json.dumps(plan, indent=2)+'\n')
     # Writes only into our isolated snapshot, never the player's live settings or save.
     snapshot = output/'seed'; snapshot.mkdir()
-    shutil.copytree(seed/'saves', snapshot/'saves')
+    linux_snapshot.copy_tree(seed/'saves', snapshot/'saves')
     text = (seed/'pcsettings.txt').read_text() if (seed/'pcsettings.txt').exists() else ''
     lines = [l for l in text.splitlines() if not l.strip().startswith(('Setting_PC_WindowMode', 'Setting_PC_SaveFolder', 'Setting_PC_ImportSaves'))]
     lines.append('Setting_PC_WindowMode=1')
     (snapshot/'pcsettings.txt').write_text('\n'.join(lines)+'\n')
-    cache = output/'shaders'; shutil.copytree(shaders, cache)
+    cache = output/'shaders'; linux_snapshot.copy_tree(shaders, cache)
     os.environ.update(env, CARGO_HOME=str(repo/'.cargo-home'))
     results = []
     for i in range(args.repeat):

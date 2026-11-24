@@ -55,7 +55,7 @@ def main():
         print(json.dumps(dict(command=cmd, monitor=str(output), fps_limit=env['DS_RELAY_FPS_LIMIT'],
                              paths='inherit player XDG/DSPORT_HOME and DS_LINUX_SHADER_CACHE',
                              cpus=linux_guard.select_cpus(env.get('DS_RELAY_CPUS')), nice=10,
-                             thermal='95 C pause / 85 C resume / 60 s abort, configurable DS_RELAY_TEMP_*'), indent=2))
+                             thermal='103 C for10s pause / below97 C resume / 105 C for60s abort, configurable DS_RELAY_TEMP_*'), indent=2))
         return 0
     if not (repo/'target/release/dsport').is_file(): parser.error('build dsport --release first (see docs/linux.md)')
     print(f'Thermal monitor: {output}', flush=True)

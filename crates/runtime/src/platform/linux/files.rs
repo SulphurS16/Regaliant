@@ -200,3 +200,24 @@ pub fn import_file_type(path: &std::path::Path) -> Option<std::fs::FileType> {
 pub fn save_output(path: &std::path::Path) -> std::io::Result<()> {
     output_path(path, &[]).map(|_| ())
 }
+
+/// Before driver startup: play and isolated preparation share the same fallback driver
+/// cache. A preparation-only cache discarded that work whenever pipeline binaries refused.
+/// Explicit caller paths win, but obey the same game/symlink read-only policy.
+pub fn configure_driver_cache(cache: &Path) -> Result<(), String> {
+    for (key, name) in [("__GL_SHADER_DISK_CACHE_PATH", "nvidia"), ("MESA_SHADER_CACHE_DIR", "mesa"), ("CUDA_CACHE_PATH", "cuda")] {
+        let path = std::env::var_os(key).map(PathBuf::from).unwrap_or_else(|| cache.join("driver-cache").join(name));
+        let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+        validate_output_tree(&path).map_err(|e| format!("{key}: {e}"))?;
+        std::fs::create_dir_all(&path).map_err(|e| format!("{key}: {e}"))?;
+        // Startup only, before the graphics driver or its compiler threads are loaded.
+        unsafe { std::env::set_var(key, &path); }
+        println!("Driver cache {key}={}", path.display());
+    }
+    // Explicit environment choices win; preparation inherits these same settings.
+    for (key, value) in [("__GL_SHADER_DISK_CACHE_SIZE", "8589934592"), ("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1"), ("MESA_SHADER_CACHE_MAX_SIZE", "8G")] {
+        if std::env::var_os(key).is_none() { unsafe { std::env::set_var(key, value); } }
+        println!("Driver cache {key}={:?}", std::env::var_os(key));
+    }
+    Ok(())
+}

@@ -15,8 +15,24 @@ pub struct Input {
     pub pad_axes: HashMap<sdl3::gamepad::Axis, i16>,
 }
 
+// Visibility is independent of F1 capture. Ignore small stick noise when choosing the
+// last input device, so a resting controller cannot hide a mouse being used in a menu.
+struct CursorPolicy { last_mouse: std::time::Instant, pad_last: bool }
+impl CursorPolicy {
+    fn new() -> Self { Self { last_mouse: std::time::Instant::now(), pad_last: false } }
+    fn mouse(&mut self) { self.last_mouse = std::time::Instant::now(); self.pad_last = false; }
+    fn visible(&self, over: bool, focused: bool, fullscreen: bool, captured: bool, idle: std::time::Duration) -> bool {
+        !over || !focused || (!captured && !self.pad_last && !(fullscreen && idle >= std::time::Duration::from_secs(3)))
+    }
+}
+fn cursor_pad_axis(old: i16, value: i16) -> bool {
+    (value as i32).abs() > 8000 && ((old as i32).abs() <= 8000 || (value as i32 - old as i32).abs() > 512)
+}
+
 struct State {
     hidden: bool,
+    cursor: CursorPolicy,
+    cursor_visible: bool,
     focused: bool,
     capture_wanted: bool,
     text_active: bool,
@@ -58,6 +74,8 @@ impl State {
         let (events, gamepads, pads) = input?;
         Ok(Self {
             hidden,
+            cursor: CursorPolicy::new(),
+            cursor_visible: true,
             focused: false,
             capture_wanted: false,
             text_active: false,
@@ -147,6 +165,12 @@ impl State {
                     }
                     if !repeat && k == K::F1 {
                         self.capture_wanted = !self.capture_wanted;
+                        self.cursor.mouse();
+                    }
+                    if !repeat && k == K::F9 && crate::gpu::capture::scene_probe_enabled() {
+                        crate::gpu::capture::arm_scene_probe();
+                        self.swallowed.insert(k);
+                        continue;
                     }
                     if !repeat && k == K::F10 {
                         crate::hle::libs::videoout::burst_hotkey();
@@ -188,6 +212,7 @@ impl State {
                 Event::MouseMotion {
                     x, y, xrel, yrel, ..
                 } => {
+                    if xrel != 0.0 || yrel != 0.0 { self.cursor.mouse(); }
                     self.input.pointer = (x, y);
                     self.input.relative.0 += xrel;
                     self.input.relative.1 += yrel;
@@ -201,6 +226,7 @@ impl State {
                     }
                 }
                 Event::MouseButtonDown { mouse_btn, .. } => {
+                    self.cursor.mouse();
                     use sdl3::mouse::MouseButton as B;
                     let index = match mouse_btn {
                         B::Left => Some(0),
@@ -221,16 +247,16 @@ impl State {
                         if mouse_btn == B::Right {
                             event(P::Right);
                         }
-                    } else if !CAPTURED.load(Ordering::Relaxed) {
-                        self.capture_wanted = true;
-                    } else {
+                    } else if CAPTURED.load(Ordering::Relaxed) {
                         self.input.mouse_buttons.insert(mouse_btn);
                     }
                 }
                 Event::MouseButtonUp { mouse_btn, .. } => {
+                    self.cursor.mouse();
                     self.input.mouse_buttons.remove(&mouse_btn);
                 }
                 Event::MouseWheel { x, y, .. } => {
+                    self.cursor.mouse();
                     if crate::pcsettings::bindings::mouse_down(None, (y * 120.0) as i32) {
                         continue;
                     }
@@ -254,12 +280,15 @@ impl State {
                     self.input.pad_buttons.clear();
                 }
                 Event::GamepadButtonDown { button, .. } => {
+                    self.cursor.pad_last = true;
                     self.input.pad_buttons.insert(button);
                 }
                 Event::GamepadButtonUp { button, .. } => {
+                    self.cursor.pad_last = true;
                     self.input.pad_buttons.remove(&button);
                 }
                 Event::GamepadAxisMotion { axis, value, .. } => {
+                    if cursor_pad_axis(*self.input.pad_axes.get(&axis).unwrap_or(&0), value) { self.cursor.pad_last = true; }
                     self.input.pad_axes.insert(axis, value);
                 }
                 _ => {}
@@ -282,6 +311,12 @@ impl State {
             self._sdl
                 .mouse()
                 .set_relative_mouse_mode(&self.window, capture);
+        }
+        let visible = self.cursor.visible(self.window.has_mouse_focus(), self.focused,
+            self.window.fullscreen_state() != sdl3::video::FullscreenType::Off, capture, self.cursor.last_mouse.elapsed());
+        if visible != self.cursor_visible {
+            self._sdl.mouse().show_cursor(visible);
+            self.cursor_visible = visible;
         }
         if !capture {
             self.input.relative = (0.0, 0.0);
@@ -661,5 +696,27 @@ mod hidpi_tests {
         assert_eq!(super::pointer_pixels_at((1200.0, 675.0), (2400, 1350), (3840, 2160)), (1920, 1080));
         assert_eq!(super::pointer_pixels_at((100.0, 50.0), (1100, 760), (1760, 1216)), (160, 80));
         assert_eq!(super::pointer_pixels_at((100.0, 50.0), (1100, 760), (1100, 760)), (100, 50));
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    #[test]
+    fn controller_mouse_idle_and_focus_do_not_change_capture() {
+        let mut p = CursorPolicy::new();
+        let idle = std::time::Duration::from_secs(4);
+        assert!(!p.visible(true, true, true, false, idle));
+        assert!(p.visible(true, true, false, false, idle));
+        p.pad_last = true;
+        assert!(!p.visible(true, true, false, false, std::time::Duration::ZERO));
+        assert!(p.visible(false, true, true, false, idle));
+        assert!(p.visible(true, false, true, false, idle));
+        p.mouse();
+        assert!(p.visible(true, true, true, false, std::time::Duration::ZERO));
+        assert!(!p.visible(true, true, true, true, std::time::Duration::ZERO));
+        assert!(!cursor_pad_axis(100, 200));
+        assert!(!cursor_pad_axis(15000, 15001));
+        assert!(cursor_pad_axis(0, 15000));
     }
 }

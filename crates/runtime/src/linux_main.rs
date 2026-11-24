@@ -158,6 +158,7 @@ fn run() -> Result<(), String> {
     let shader_path = std::env::var_os("DS_LINUX_SHADER_CACHE").map(PathBuf::from).unwrap_or_else(|| paths.shaders());
     let shaders = platform::files::output_path(&shader_path, &[&game.app]).map_err(|e| e.to_string())?;
     for output in [&cache, &user, &shaders] { platform::files::validate_output_tree(output).map_err(|e| e.to_string())?; }
+    platform::files::configure_driver_cache(&cache)?;
     for key in ["DS_SPV_DUMP", "DS_DUMP_DIR"] {
         if let Some(value) = std::env::var_os(key) {
             let path = std::path::absolute(value).map_err(|e| e.to_string())?;

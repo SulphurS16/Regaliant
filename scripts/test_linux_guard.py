@@ -16,17 +16,27 @@ import linux_guard as guard
 
 
 class ThermalTests(unittest.TestCase):
-    def test_hysteresis_and_bounded_pause(self):
-        s = guard.ThermalState(95, 85, 60)
-        self.assertEqual(s.step(0, 95), 'sample')
-        self.assertEqual(s.step(2, 96), 'pause')
-        self.assertEqual(s.step(4, 90), 'sample')
-        self.assertEqual(s.step(6, 85), 'sample')
-        self.assertEqual(s.step(8, 84), 'resume')
-        self.assertEqual(s.paused_s, 6)
-        self.assertEqual(s.step(10, 105), 'pause')
-        self.assertEqual(s.step(70, 90), 'abort')  # Bounded even between thresholds.
-        self.assertEqual(s.pauses, 2)
+    def test_sustained_pause_and_critical_abort(self):
+        s = guard.ThermalState(103, 97, 60)
+        self.assertEqual(s.step(0, 104), 'sample')
+        self.assertEqual(s.step(9, 104), 'sample')
+        self.assertEqual(s.step(10, 102), 'sample')  # Short spike reset.
+        self.assertEqual(s.step(12, 103), 'sample')
+        self.assertEqual(s.step(22, 103), 'pause')
+        self.assertEqual(s.step(82, 104), 'sample')  # Not a sustained105 C abort.
+        self.assertEqual(s.step(83, 97), 'sample')
+        self.assertEqual(s.step(84, 96), 'resume')
+        self.assertEqual(s.paused_s, 62)
+        self.assertEqual(s.step(90, 105), 'sample')
+        self.assertEqual(s.step(100, 105), 'pause')
+        self.assertEqual(s.step(149, 105), 'sample')
+        self.assertEqual(s.step(150, 105), 'abort')
+
+    def test_thermal_defaults_and_overrides(self):
+        p = guard.Policy({})
+        self.assertEqual((p.pause,p.resume,p.hold,p.abort_temp,p.abort),(103,97,10,105,60))
+        p = guard.Policy(dict(DS_RELAY_TEMP_PAUSE='99',DS_RELAY_TEMP_RESUME='90',DS_RELAY_TEMP_HOLD_S='2',DS_RELAY_TEMP_ABORT='104'))
+        self.assertEqual((p.pause,p.resume,p.hold,p.abort_temp),(99,90,2,104))
 
     def test_sensor_preference_fallback_and_disappearance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,9 +85,9 @@ class ThermalTests(unittest.TestCase):
     def test_pause_abort_reaps_real_sleeping_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             # Short timeout only for this test. Cold preflight, hot during execution.
-            env = {**os.environ, 'DS_RELAY_TEMP_ABORT_S': '.05'}
+            env = {**os.environ, 'DS_RELAY_TEMP_ABORT_S': '.05', 'DS_RELAY_TEMP_HOLD_S': '0'}
             calls = iter([80, 80])
-            with patch.object(guard, 'temperature', side_effect=lambda paths: next(calls, 100)):
+            with patch.object(guard, 'temperature', side_effect=lambda paths: next(calls, 106)):
                 p = guard.Process(['timeout', '-k', '1s', '10s', sys.executable, '-c', 'import time; time.sleep(20)'], output=Path(tmp), env=env, start_new_session=True, stdout=subprocess.DEVNULL)
                 self.assertEqual(p.wait(timeout=12), 75)
             data = json.loads((Path(tmp)/'thermal.json').read_text())
@@ -88,6 +98,18 @@ class ThermalTests(unittest.TestCase):
             aborted = next(r for r in rows if r['event'] == 'abort')
             self.assertGreaterEqual(sum(g['states'].get('T', 0) for g in aborted['owned_groups'].values()), 2)
             with self.assertRaises(ProcessLookupError): os.killpg(p.pid, 0)
+
+    def test_wall_timeout_still_ends_a_paused_wrapper_below_critical(self):
+        self.assertEqual(guard.timeout_seconds(['timeout','-k','5s','1.5m','app']),90)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'DS_RELAY_TEMP_HOLD_S':'0'}
+            calls = iter([80])
+            with patch.object(guard, 'temperature', side_effect=lambda paths: next(calls,104)):
+                p = guard.Process(['timeout','-k','1s','1s',sys.executable,'-c','import time; time.sleep(20)'],output=Path(tmp),env=env,start_new_session=True,stdout=subprocess.DEVNULL)
+                self.assertEqual(p.wait(timeout=12),75)
+            report=json.loads((Path(tmp)/'thermal.json').read_text())
+            self.assertEqual(report['aborted'],'wall timeout during thermal pause')
+            with self.assertRaises(ProcessLookupError): os.killpg(p.pid,0)
 
     def test_new_process_group_descendant_is_owned(self):
         p = subprocess.Popen([sys.executable, '-c', 'import subprocess,time; subprocess.Popen(["sleep","20"],start_new_session=True); time.sleep(20)'], start_new_session=True)

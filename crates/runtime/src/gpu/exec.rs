@@ -4239,10 +4239,8 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             // `pcache::create_with`.)
             let make = |via: super::pcache::Via| -> Result<vk::Pipeline, String> {
                 let mut ci = ci;
-                let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(ci.flags.as_raw() as u64 | super::vk::pbin::CAPTURE_DATA));
-                if via.capture {
-                    ci = ci.push_next(&mut f2);
-                }
+                let mut f2 = super::vk::pbin::creation_flags(ci.flags, via.capture);
+                if via.capture || via.binaries.is_some() { ci = ci.push_next(&mut f2); }
                 let bi;
                 if let Some(b) = via.binaries {
                     bi = super::vk::pbin::BinaryInfo { s_type: super::vk::pbin::ST_BINARY_INFO, p_next: ci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
@@ -4254,7 +4252,7 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
             // (The module as the driver gets it: `module_code`'s declaration included.)
             let _crumb = super::pcache::Crumb::set(|| format!("compute pipeline c{:016x}", cache_key.unwrap_or(0)), || vec![("cs", module_code(&out.spirv).into_owned())]);
             let pipeline = match cache_key {
-                Some(k) => super::pcache::create_with('c', k, super::pcache::translated_fingerprint(&[&out.spirv]), make),
+                Some(k) => super::pcache::create_with('c', k, super::pcache::creation_fingerprint(super::pcache::translated_fingerprint(&[&code]), &bindings, &ranges, flags, ci.flags, c.subgroup32 & vk::ShaderStageFlags::COMPUTE), make),
                 None => make(super::pcache::Via { cache: vk::PipelineCache::null(), capture: false, binaries: None }),
             };
             c.device.destroy_shader_module(module, None);
