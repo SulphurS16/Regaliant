@@ -69,7 +69,7 @@ fn reason(code: i32) -> String {
         5 => "the graphics card stopped responding",
         7 => "Windows ran out of memory",
         8 => "this PC's processor lacks instructions the game needs",
-        10 => "the game could not reserve the memory it needs",
+        10 => "the game could not set itself up at its start, most often because another program holds memory it needs (Open logs shows why)",
         11 => "no graphics card the game can use was found",
         13 => "it could not go on",
         STAGE_HUNG => "it stopped responding",
@@ -1517,6 +1517,23 @@ pub fn stop_then_play(app: &mut App) {
         crate::start_game(app);
     } else {
         app.shaders.then_play = true;
+    }
+}
+
+/// The launcher closes while a step runs (`close`, after `stop`): the step's processes are ended
+/// now, as the job would end them when the launcher exits, and their records of compiles in
+/// flight are removed (`inflight/inflight-<pid>.bin` in the store). Those ends are the player's,
+/// not a graphics driver's crash, and the game would otherwise take the compiles for suspects and
+/// leave them out of later preparations (the review of 2026-11-24 night; the game's
+/// `pcache::Inflight`).
+pub fn end_for_close(app: &mut App) {
+    let pids = crate::sys::end_job(5000);
+    let dir = app.paths.shaders().join("pipelines").join("inflight");
+    for pid in &pids {
+        let _ = std::fs::remove_file(dir.join(format!("inflight-{pid}.bin")));
+    }
+    if !pids.is_empty() {
+        log(app, &format!("closing: the preparation's processes {pids:?} ended, their records of compiles in flight removed"));
     }
 }
 

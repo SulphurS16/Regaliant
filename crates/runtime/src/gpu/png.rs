@@ -35,3 +35,35 @@ pub fn encode(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     chunk(b"IEND", &[]);
     out
 }
+
+/// A display screenshot has opaque coverage, even when a shader uses alpha as scratch
+/// data (FSR interpolation stores its inpainting weight there). Keep RGB unchanged.
+/// Raw image dumps and ordinary encode() retain the original alpha.
+#[cfg(any(target_os = "linux", test))]
+pub fn encode_opaque(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut pixels = rgba.to_vec();
+    for p in pixels.chunks_exact_mut(4) { p[3] = 255; }
+    encode(w, h, &pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn opaque_display_preserves_rgb_and_leaves_raw_mask_untouched() {
+        let rgba = [108,134,156,0, 185,185,185,255, 0,0,0,0];
+        let png = super::encode_opaque(3,1,&rgba);
+        // IHDR follows the signature. Read the encoder's IDAT, then its filter0 row.
+        let mut at = 8;
+        let mut row = Vec::new();
+        while at < png.len() {
+            let n = u32::from_be_bytes(png[at..at+4].try_into().unwrap()) as usize;
+            if &png[at+4..at+8] == b"IDAT" {
+                row = miniz_oxide::inflate::decompress_to_vec_zlib(&png[at+8..at+8+n]).unwrap();
+            }
+            at += n + 12;
+        }
+        assert_eq!(row, [0,108,134,156,255,185,185,185,255,0,0,0,255]);
+        assert_eq!(rgba[3],0);
+        assert_eq!(rgba[11],0);
+    }
+}

@@ -213,10 +213,11 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
     // A size whose image or staging buffers could not be made, and when: tried again after 2 s,
     // not every frame.
     static FAILED: Mutex<Option<((u32, u32), std::time::Instant)>> = Mutex::new(None);
-    let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay() else { return };
+    // (The text entry's box, or the save list's: `hle::libs::savedata`.)
+    let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay().or_else(crate::hle::libs::savedata::overlay) else { return };
     let c = ctx();
     let (rx, ry, rw, rh) = picture;
-    let (w, h) = crate::textbox::size(rh, content.keys.as_ref().map_or(0, |k| k.rows.len()));
+    let (w, h) = crate::textbox::size_for(rh, &content);
     if w > rw || h > rh || FAILED.lock().is_some_and(|(s, at)| s == (w, h) && at.elapsed() < std::time::Duration::from_secs(2)) {
         return;
     }
@@ -715,7 +716,17 @@ fn hidden_present_once() {
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&signal).swapchains(&scs).image_indices(&idxs);
         let q = pq.lock();
         if c.device.queue_submit(*q, &[si], h.fences[f]).is_ok() {
-            let _ = c.swapchain_d.queue_present(*q, &pi);
+            // (Through Streamline's present once DLSS runs, as a window's: it needs to see every
+            // frame's present, `upscale::note_sl_present`.)
+            match crate::gpu::upscale::present_hook() {
+                Some(p) => {
+                    let _ = p(*q, &pi);
+                    crate::gpu::upscale::note_sl_present();
+                }
+                None => {
+                    let _ = c.swapchain_d.queue_present(*q, &pi);
+                }
+            }
             h.presented += 1;
             h.last = Some(std::time::Instant::now());
         }
@@ -801,6 +812,10 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
 
 /// Presents one frame. Returns false if presentation is not possible (minimized).
 pub fn present(src: Source) -> bool {
+    #[cfg(target_os = "linux")]
+    if !crate::gpu::framegen::presenting() && ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::gpu::framegen::present_pair(&src);
+    }
     let c = ctx();
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else {
@@ -1019,8 +1034,18 @@ pub fn present(src: Source) -> bool {
             let raw = std::slice::from_raw_parts(ptr, (w * h * 4) as usize).to_vec();
             if let Some(rgba) = crate::gpu::images::to_rgba8(p.format, &raw) {
                 if let Some(dir) = crate::run_dir() {
-                    let path = dir.join(format!("window-{}.png", p.frame));
-                    if std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).is_ok() {
+                    #[cfg(target_os = "linux")]
+                    let prefix = if crate::gpu::framegen::presenting() { "generated" } else { "window" };
+                    #[cfg(windows)]
+                    let prefix = "window";
+                    let path = dir.join(format!("{prefix}-{}.png", p.frame));
+                    // Linux WSI uses OPAQUE composition. A generated image's alpha is
+                    // an SDK inpainting mask, not window transparency.
+                    #[cfg(target_os = "linux")]
+                    let png = crate::gpu::png::encode_opaque(w, h, &rgba);
+                    #[cfg(windows)]
+                    let png = crate::gpu::png::encode(w, h, &rgba);
+                    if std::fs::write(&path, png).is_ok() {
                         crate::info!("window shot of presented frame {}: {}", p.frame, path.display());
                     }
                 }
@@ -1048,11 +1073,15 @@ pub fn present(src: Source) -> bool {
         #[cfg(target_os = "linux")]
         let present_start = std::time::Instant::now();
         let presented = match crate::gpu::upscale::present_hook() {
-            Some(f) => match f(*q, &pi) {
-                vk::Result::SUCCESS => Ok(false),
-                vk::Result::SUBOPTIMAL_KHR => Ok(true),
-                e => Err(e),
-            },
+            Some(f) => {
+                let r = f(*q, &pi);
+                crate::gpu::upscale::note_sl_present();
+                match r {
+                    vk::Result::SUCCESS => Ok(false),
+                    vk::Result::SUBOPTIMAL_KHR => Ok(true),
+                    e => Err(e),
+                }
+            }
             None => c.swapchain_d.queue_present(*q, &pi),
         };
         drop(q);

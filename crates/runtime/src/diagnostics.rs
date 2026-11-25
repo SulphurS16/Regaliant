@@ -39,6 +39,12 @@ fn apply_diagnostics() -> Vec<String> {
             notes.push(format!("'{k}' left (the port's own)"));
             continue;
         }
+        // (Test switches stay out of the players' file: `DS_SIM_*` make the game fail on purpose,
+        // and `DS_SIM_MODULE` loads the module it names; the review of 2026-11-25 evening.)
+        if k.starts_with("DS_SIM_") {
+            notes.push(format!("'{k}' left (a test switch)"));
+            continue;
+        }
         // (What the environment already holds wins: the launcher's settings, a developer's.)
         if std::env::var_os(k).is_some() {
             if inherited.iter().any(|n| n == k) {
@@ -88,13 +94,14 @@ mod diagnostics_tests {
             assert_eq!(std::env::var("DS_DIAG_TEST_B").unwrap(), "environment");
             assert!(std::env::var_os("DS_HOSTED").is_none());
             assert!(std::env::var_os("NOT_A_SWITCH").is_none());
+            assert!(std::env::var_os("DS_SIM_MODULE").is_none());
             unsafe { super::set_unless_given("DS_DIAG_TEST_A", "preparation"); }
             assert_eq!(std::env::var("DS_DIAG_TEST_A").unwrap(), "preparation");
             return;
         }
         let root = std::env::temp_dir().join(format!("regaliant-diagnostics-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let text = "# comment\nDS_DIAG_TEST_A=file\nDS_DIAG_TEST_B=file\nDS_HOSTED=1\nNOT_A_SWITCH=1\n";
+        let text = "# comment\nDS_DIAG_TEST_A=file\nDS_DIAG_TEST_B=file\nDS_HOSTED=1\nDS_SIM_MODULE=should-not-load\nNOT_A_SWITCH=1\n";
         for utf16 in [false, true] {
             let bytes = if utf16 { [vec![0xff, 0xfe], text.encode_utf16().flat_map(u16::to_le_bytes).collect()].concat() } else { text.as_bytes().to_vec() };
             std::fs::write(root.join("diagnostics.txt"), bytes).unwrap();
@@ -102,7 +109,7 @@ mod diagnostics_tests {
                 .args(["--exact", "diagnostics_tests::settings_file_and_environment_precedence", "--nocapture"])
                 .env("REGALIANT_DIAGNOSTICS_TEST", &root).env("DSPORT_HOME", &root)
                 .env("DS_DIAG_TEST_B", "environment").env_remove("DS_DIAG_TEST_A")
-                .env_remove("DS_HOSTED").env_remove("DS_DIAGNOSTICS_SET").env_remove("NOT_A_SWITCH")
+                .env_remove("DS_HOSTED").env_remove("DS_DIAGNOSTICS_SET").env_remove("NOT_A_SWITCH").env_remove("DS_SIM_MODULE")
                 .output().unwrap();
             assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         }

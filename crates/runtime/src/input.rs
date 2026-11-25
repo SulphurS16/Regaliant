@@ -371,6 +371,8 @@ fn scripted(st: &mut PadState, flip: u64, quiet: bool) {
 /// `prepplay`: it plays by its own presses while the player may be using the PC); the presses
 /// and sticks given through `press_for`, `hold_stick` and the control channel still reach the game.
 pub static SYSTEM_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// An XInput controller connected at some point of the session (`pspad`'s summary when none was).
+pub static XINPUT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The XInput controllers seen: connected at the last ask, their report number when found,
 /// whether they changed since (in use), and when a missing one is asked for again.
@@ -453,6 +455,7 @@ pub fn xinput_state() -> Option<XINPUT_STATE> {
                 x.first[i] = s.dwPacketNumber;
                 x.active[i] = crate::platform::controller::initial_sample_active();
                 crate::info!("controller: XInput controller {i} connected");
+                XINPUT_SEEN.store(true, Relaxed);
             } else if s.dwPacketNumber != x.first[i] {
                 x.active[i] = true;
             }
@@ -583,9 +586,9 @@ fn xinput(st: &mut PadState) -> (u32, i16, i16) {
             phys |= 1 << i;
         }
     }
-    // The system text box (the character's name): the pad is its alone while it is open
-    // (`pad_state`).
-    if crate::hle::libs::ime_dialog::active() {
+    // The system text box (the character's name) or the save list: the pad is its alone while
+    // it is open (`pad_state`).
+    if crate::hle::libs::ime_dialog::active() || crate::hle::libs::savedata::list_active() {
         return (phys, g.sThumbLX, g.sThumbLY);
     }
     // A controller binding being captured: the pad is the menu's alone (`pcsettings::bindings`);
@@ -1150,10 +1153,11 @@ pub fn motion_tick() {
 /// Whether `src` is held: in the window or by the control channel (a sided
 /// modifier held there also holds the common one).
 fn held(src: Src) -> bool {
-    use crate::gpu::vk::window::{MOUSE_BUTTONS, key_down};
+    use crate::gpu::vk::window::{MOUSE_BUTTONS, MOUSE_SWALLOW, key_down};
     let window = match src {
         Src::Key(k) => key_down(k),
-        Src::Mouse(m) => MOUSE_BUTTONS.load(Relaxed) & (1 << m) != 0,
+        // (A click the save list took is not the game's until released.)
+        Src::Mouse(m) => MOUSE_BUTTONS.load(Relaxed) & !MOUSE_SWALLOW.load(Relaxed) & (1 << m) != 0,
         Src::WheelUp | Src::WheelDown => false,
     };
     if window {
@@ -1508,7 +1512,11 @@ pub fn pad_state() -> PadState {
     // (The control channel's presses held while the box was open stay its own until released,
     // as the pad's do: `swallow_pad`.)
     static SCRIPT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if crate::hle::libs::ime_dialog::pad_input(phys | script_bits, lx, ly) {
+    // (Both see every poll: each keeps the buttons held from before it opened from being a
+    // press. The save list: Load Game's characters, `hle::libs::savedata`.)
+    let ime = crate::hle::libs::ime_dialog::pad_input(phys | script_bits, lx, ly);
+    let list = crate::hle::libs::savedata::list_pad_input(phys | script_bits, lx, ly);
+    if ime || list {
         SCRIPT_KEPT.store(script_bits, Relaxed);
         return PadState::default();
     }

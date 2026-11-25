@@ -4014,10 +4014,15 @@ fn keep_pipe(map: &Mutex<Option<HashMap<u64, PipeEntry>>>, key: u64, pipe: Pipe)
 /// to this session, so the driver's shader cache serves nothing it compiled
 /// in an earlier one.
 pub(super) fn module_code(spirv: &[u32]) -> std::borrow::Cow<'_, [u32]> {
-    let code = match super::vk::max_reconvergence().then(|| declare_max_reconvergence(spirv)).flatten() {
+    let mut code = match super::vk::max_reconvergence().then(|| declare_max_reconvergence(spirv)).flatten() {
         Some(v) => std::borrow::Cow::Owned(v),
         None => std::borrow::Cow::Borrowed(spirv),
     };
+    if super::vk::nan_preserve() {
+        if let Some(v) = declare_float_modes(&code, NAN_PRESERVE_MODES, super::vk::nan_preserve_widths()) {
+            code = std::borrow::Cow::Owned(v);
+        }
+    }
     // (`DS_SPV_DUMP=<dir>`: every module written there as the driver gets
     // it (before the nonce), by its content's hash: a module that crashes
     // the driver's compiler is among the last written.)
@@ -4132,6 +4137,127 @@ pub(super) fn declare_max_reconvergence(spirv: &[u32]) -> Option<Vec<u32>> {
     out.extend_from_slice(&spirv[ext_at..mode_at]);
     for f in entries {
         out.extend_from_slice(&[(3 << 16) | OP_EXECUTION_MODE, f, EXEC_MODE_MAXIMALLY_RECONVERGES]);
+    }
+    out.extend_from_slice(&spirv[mode_at..]);
+    Some(out)
+}
+
+/// `SignedZeroInfNanPreserve` for 16-, 32- and 64-bit floats (`vk::nan_preserve`).
+const NAN_PRESERVE_MODES: &[(u32, u32)] = &[
+    (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 16),
+    (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 32),
+    (rspirv::spirv::ExecutionMode::SignedZeroInfNanPreserve as u32, 64),
+];
+
+/// The module with the float-controls modes declared for each entry point (the capabilities, the
+/// extension and the execution modes), or None when it does not parse as expected. `widths` (bit 0:
+/// 16, bit 1: 32, bit 2: 64) are the widths the device lets a module declare; a 16- or 64-bit mode
+/// is also left out of a module without that float type.
+pub(super) fn declare_float_modes(spirv: &[u32], modes: &[(u32, u32)], widths: u32) -> Option<Vec<u32>> {
+    use rspirv::spirv::{Capability as C, ExecutionMode as M};
+    const OP_EXTENSION: u32 = 10;
+    const OP_MEMORY_MODEL: u32 = 14;
+    const OP_ENTRY_POINT: u32 = 15;
+    const OP_EXECUTION_MODE: u32 = 16;
+    const OP_CAPABILITY: u32 = 17;
+    const OP_EXECUTION_MODE_ID: u32 = 331;
+    const EXT: &str = "SPV_KHR_float_controls";
+    if spirv.len() < 5 || spirv[0] != 0x0723_0203 {
+        return None;
+    }
+    let (mut cap_at, mut ext_at, mut mode_at) = (None, None, None);
+    let mut caps = Vec::new();
+    let mut has_ext = false;
+    let mut entries = Vec::new();
+    let mut i = 5;
+    while i < spirv.len() {
+        let (wc, op) = ((spirv[i] >> 16) as usize, spirv[i] & 0xffff);
+        if wc == 0 || i + wc > spirv.len() {
+            return None;
+        }
+        match op {
+            OP_CAPABILITY => {
+                caps.push(spirv[i + 1]);
+                cap_at = Some(i + wc);
+                ext_at = Some(i + wc);
+            }
+            OP_EXTENSION => {
+                let s: Vec<u8> = spirv[i + 1..i + wc].iter().flat_map(|w| w.to_le_bytes()).take_while(|&b| b != 0).collect();
+                has_ext |= s == EXT.as_bytes();
+                ext_at = Some(i + wc);
+            }
+            OP_MEMORY_MODEL => mode_at = Some(i + wc),
+            OP_ENTRY_POINT => {
+                if wc < 3 {
+                    return None;
+                }
+                entries.push(spirv[i + 2]);
+                mode_at = Some(i + wc);
+            }
+            OP_EXECUTION_MODE | OP_EXECUTION_MODE_ID => mode_at = Some(i + wc),
+            _ if mode_at.is_some() => break,
+            _ => {}
+        }
+        i += wc;
+    }
+    let (cap_at, ext_at, mode_at) = (cap_at?, ext_at?, mode_at?);
+    if entries.is_empty() || !(cap_at <= ext_at && ext_at <= mode_at) {
+        return None;
+    }
+    let width_bit = |w: u32| match w {
+        16 => 1,
+        32 => 2,
+        _ => 4,
+    };
+    let typed = |w: u32| match w {
+        16 => caps.contains(&(C::Float16 as u32)),
+        64 => caps.contains(&(C::Float64 as u32)),
+        _ => true,
+    };
+    let modes: Vec<(u32, u32)> = modes.iter().copied().filter(|&(_, w)| widths & width_bit(w) != 0 && typed(w)).collect();
+    if modes.is_empty() {
+        return None;
+    }
+    let modes = &modes[..];
+    let cap_of = |m: u32| -> u32 {
+        match m {
+            x if x == M::DenormPreserve as u32 => C::DenormPreserve as u32,
+            x if x == M::DenormFlushToZero as u32 => C::DenormFlushToZero as u32,
+            x if x == M::SignedZeroInfNanPreserve as u32 => C::SignedZeroInfNanPreserve as u32,
+            x if x == M::RoundingModeRTE as u32 => C::RoundingModeRTE as u32,
+            _ => C::RoundingModeRTZ as u32,
+        }
+    };
+    let mut new_caps: Vec<u32> = Vec::new();
+    for &(m, _) in modes {
+        let c = cap_of(m);
+        if !caps.contains(&c) && !new_caps.contains(&c) {
+            new_caps.push(c);
+        }
+    }
+    let version = ((spirv[1] >> 16) & 0xff, (spirv[1] >> 8) & 0xff);
+    let need_ext = !has_ext && version < (1, 4);
+    let mut out = Vec::with_capacity(spirv.len() + 2 * new_caps.len() + 8 + 4 * modes.len() * entries.len());
+    out.extend_from_slice(&spirv[..cap_at]);
+    for c in &new_caps {
+        out.extend_from_slice(&[(2 << 16) | OP_CAPABILITY, *c]);
+    }
+    out.extend_from_slice(&spirv[cap_at..ext_at]);
+    if need_ext {
+        let mut name: Vec<u8> = EXT.as_bytes().to_vec();
+        name.push(0);
+        while name.len() % 4 != 0 {
+            name.push(0);
+        }
+        let words: Vec<u32> = name.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        out.push(((1 + words.len() as u32) << 16) | OP_EXTENSION);
+        out.extend_from_slice(&words);
+    }
+    out.extend_from_slice(&spirv[ext_at..mode_at]);
+    for &f in &entries {
+        for &(m, w) in modes {
+            out.extend_from_slice(&[(4 << 16) | OP_EXECUTION_MODE, f, m, w]);
+        }
     }
     out.extend_from_slice(&spirv[mode_at..]);
     Some(out)
@@ -7840,6 +7966,77 @@ impl RangeLog {
     fn stats_text(&self) -> String {
         let v: Vec<u64> = self.stats.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         format!("{} lookups ({} with nothing unfinished, {} with no bucket overlapping, {} under the lock, {} of them finding a batch)", v[0], v[1], v[2], v[3], v[4])
+    }
+}
+
+#[cfg(test)]
+mod float_modes_tests {
+    use rspirv::binary::Assemble;
+    use rspirv::dr::Builder;
+    use rspirv::spirv;
+
+    /// (opcode, operands) of each instruction after the header.
+    fn insts(w: &[u32]) -> Vec<(u32, Vec<u32>)> {
+        let mut out = Vec::new();
+        let mut i = 5;
+        while i < w.len() {
+            let wc = (w[i] >> 16) as usize;
+            out.push((w[i] & 0xffff, w[i + 1..i + wc].to_vec()));
+            i += wc.max(1);
+        }
+        out
+    }
+
+    /// A compute module with 32-bit floats only (SPIR-V 1.3): its declared form gains the
+    /// capability, the extension and one execution mode, the 16- and 64-bit ones left out, and
+    /// passes spirv-val where the local Vulkan SDK copy has it; a device allowing no 32-bit
+    /// declaration leaves it as it was.
+    #[test]
+    fn nan_preserve_declared_for_the_module_widths() {
+        let mut b = Builder::new();
+        b.set_version(1, 3);
+        b.capability(spirv::Capability::Shader);
+        b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+        let void = b.type_void();
+        let f32t = b.type_float(32, None);
+        let fnt = b.type_function(void, []);
+        let one = b.constant_bit32(f32t, 1.0f32.to_bits());
+        let f = b.begin_function(void, None, spirv::FunctionControl::NONE, fnt).unwrap();
+        b.begin_block(None).unwrap();
+        let _ = b.f_add(f32t, None, one, one).unwrap();
+        b.ret().unwrap();
+        b.end_function().unwrap();
+        b.entry_point(spirv::ExecutionModel::GLCompute, f, "main", []);
+        b.execution_mode(f, spirv::ExecutionMode::LocalSize, [1, 1, 1]);
+        let code = b.module().assemble();
+        let out = super::declare_float_modes(&code, super::NAN_PRESERVE_MODES, 7).expect("declared");
+        let list = insts(&out);
+        let cap = spirv::Capability::SignedZeroInfNanPreserve as u32;
+        assert_eq!(list.iter().filter(|(op, o)| *op == 17 && o[0] == cap).count(), 1);
+        let ext: Vec<u32> = {
+            let mut s = b"SPV_KHR_float_controls".to_vec();
+            s.push(0);
+            while s.len() % 4 != 0 {
+                s.push(0);
+            }
+            s.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        assert_eq!(list.iter().filter(|(op, o)| *op == 10 && *o == ext).count(), 1);
+        let mode = spirv::ExecutionMode::SignedZeroInfNanPreserve as u32;
+        let widths: Vec<u32> = list.iter().filter(|(op, o)| *op == 16 && o.len() == 3 && o[1] == mode).map(|(_, o)| o[2]).collect();
+        assert_eq!(widths, vec![32]);
+        assert!(super::declare_float_modes(&code, super::NAN_PRESERVE_MODES, 1).is_none());
+        #[cfg(windows)]
+        let val = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../local-data/research/vulkan-sdk/1.4.363.0/Bin/spirv-val.exe");
+        #[cfg(target_os = "linux")]
+        let val = std::path::PathBuf::from("/usr/bin/spirv-val");
+        if val.is_file() {
+            let p = std::env::temp_dir().join(format!("nan-preserve-{}.spv", std::process::id()));
+            std::fs::write(&p, out.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            let r = std::process::Command::new(&val).args(["--target-env", "vulkan1.3"]).arg(&p).output().unwrap();
+            let _ = std::fs::remove_file(&p);
+            assert!(r.status.success(), "spirv-val: {}", String::from_utf8_lossy(&r.stderr));
+        }
     }
 }
 
@@ -12032,6 +12229,13 @@ pub struct Exec {
     /// fast clears or overwrites of (a use stops the chunk); its closed batches before the chunk.
     held_run_writes: Option<std::sync::Arc<super::ranges::Ranges>>,
     held_run_keys: Option<std::sync::Arc<HashMap<super::images::ImageKey, u8>>>,
+    /// The metadata the held run's fast-cleared images were bound with, and the images, found
+    /// at the chunk's first use (`claim_meta`: once a chunk, not a draw).
+    held_run_metas: Option<Vec<(u64, super::images::ImageKey)>>,
+    /// Clears this held executor took over from another image on the same metadata
+    /// (`claim_meta`): the metadata's target now and that target's clear words, which its
+    /// resolve uses (the cache's `meta_of` still names the other image until the chunk commits).
+    held_claimed: HashMap<u64, (super::images::ImageKey, [u32; 2])>,
     held_base: usize,
     pub(crate) stopped: bool,
     /// Why (statistics), and the reason a caller gives a flush that follows.
@@ -13789,6 +13993,8 @@ impl Exec {
                 held_extra: super::ranges::Ranges::new(),
                 held_run_writes: None,
                 held_run_keys: None,
+                held_run_metas: None,
+                held_claimed: HashMap::new(),
                 held_base: 0,
                 stopped: false,
                 stop_why: "",
@@ -16905,7 +17111,22 @@ impl Exec {
             for x in &mine {
                 self.held_clears.remove(&x.0);
             }
-            let clears = super::images::with(|im| mine.iter().filter_map(|&(k, m, v, kept, layers)| im.fast_clear_of(k, m, v, kept, layers)).collect::<Vec<_>>());
+            // (A clear taken over from another image (`claim_meta`) with its new target's words.)
+            let claimed = &self.held_claimed;
+            let clears = super::images::with(|im| {
+                mine.iter()
+                    .filter_map(|&(k, m, v, kept, layers)| {
+                        im.fast_clear_of(k, m, v, kept, layers).map(|mut c| {
+                            if let Some(&(ck, words)) = claimed.get(&m)
+                                && ck == k
+                            {
+                                c.clear = words;
+                            }
+                            c
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
             note_clear_resolve(self.rendering.is_some());
             self.end_rendering();
             self.record_fast_clears(clears, false);
@@ -16929,6 +17150,42 @@ impl Exec {
         }
         let clears = super::images::with(|im| im.take_clears(keys));
         self.record_fast_clears(clears, check);
+    }
+
+    /// A target bound now with metadata `meta` (a draw's colour or depth target): a fast clear
+    /// pending on that metadata under another image is this target's (`Images::claim_meta`). A
+    /// held executor moves its own clears among its images; a clear the work before it noted on
+    /// that metadata (the cache's, or its held run's) is not its to take: it stops, as for the
+    /// current frame's other clears, and the draw is recorded again by the executor after it.
+    pub(crate) fn claim_meta(&mut self, key: super::images::ImageKey, meta: u64, clear: [u32; 2]) {
+        if meta == 0 {
+            return;
+        }
+        if self.held {
+            if !self.held_clears.is_empty() {
+                let others: Vec<super::images::ImageKey> = self.held_clears.iter().filter(|(k, v)| **k != key && v.0 == meta && v.3 == 0).map(|(k, _)| *k).collect();
+                for o in others {
+                    if let Some(e) = self.held_clears.remove(&o) {
+                        super::images::merge_pending(&mut self.held_clears, key, e);
+                        super::images::META_CLAIMS[1].fetch_add(1, Ordering::Relaxed);
+                        self.held_claimed.insert(meta, (key, clear));
+                    }
+                }
+            }
+            if self.held_run_metas.is_none() {
+                let clears: Vec<super::images::ImageKey> = self.held_run_keys.as_ref().map(|m| m.iter().filter(|&(_, &kind)| kind == 0).map(|(k, _)| *k).collect()).unwrap_or_default();
+                let metas = if clears.is_empty() { Vec::new() } else { super::images::with(|im| clears.iter().filter_map(|k| im.meta_bound(*k).map(|m| (m, *k))).collect()) };
+                self.held_run_metas = Some(metas);
+            }
+            let run_hit = self.held_run_metas.as_ref().is_some_and(|v| v.iter().any(|&(m, k)| m == meta && k != key));
+            if run_hit || (super::images::pending_meta_hit(meta) && super::images::with(|im| im.meta_pending_elsewhere(key, meta))) {
+                self.stop("fast clear (another image's, on this target's metadata)");
+            }
+            return;
+        }
+        if super::images::pending_meta_hit(meta) {
+            super::images::with(|im| im.claim_meta(key, meta, clear));
+        }
     }
 
     /// Records `clears` (`resolve_fast_clears`): each image cleared to the
@@ -17017,7 +17274,22 @@ impl Exec {
                         FAST_CLEARS_NOT_UNIFORM[1].fetch_add(1, Ordering::Relaxed);
                         v
                     } else {
-                        FAST_CLEARS_NOT_UNIFORM[0].fetch_add(1, Ordering::Relaxed);
+                        // (Said for the first 20 a session: which image, and what its metadata
+                        // held, so a log tells a stale read from other data over the block.)
+                        if FAST_CLEARS_NOT_UNIFORM[0].fetch_add(1, Ordering::Relaxed) < 20 {
+                            let shown: Vec<String> = words.iter().take(n as usize / 4).take(8).map(|w| format!("{w:08x}")).collect();
+                            crate::info!(
+                                "images: fast clear of {:#x} {}x{} {:?} refused: its metadata {:#x} reads {} (not one code; for flip {}, [{}])",
+                                c.key.base,
+                                c.key.width,
+                                c.key.height,
+                                c.key.format,
+                                c.meta,
+                                shown.join(" "),
+                                crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1,
+                                self.name
+                            );
+                        }
                         continue;
                     }
                 }
@@ -19404,6 +19676,8 @@ impl Exec {
         self.held_base = self.closed.len();
         self.held_run_writes = Some(writes);
         self.held_run_keys = Some(keys);
+        self.held_run_metas = None;
+        self.held_claimed.clear();
     }
 
     /// The held chunk's end (its batch closed): its record; the executor records as a
@@ -19429,6 +19703,8 @@ impl Exec {
         self.past_grow = false;
         self.held_run_writes = None;
         self.held_run_keys = None;
+        self.held_run_metas = None;
+        self.held_claimed.clear();
         self.held_promises.clear();
         self.held_kinds.clear();
         self.cp_written.clear();
@@ -19859,12 +20135,13 @@ impl Exec {
         // What the preparation found (its own block, shared with its cache
         // entry), apart from the SGPR data written below.
         let found = p.found.clone();
+        let facts = super::record_opts::static_bind().then_some(found.tr.binding_facts);
         if self.held {
             self.held_reads.extend_from_slice(&found.reads);
             self.note_kinds(2, found.reads.len());
         }
         super::images::BINDING_SHADER.with(|s| s.set(p.addr));
-        let res_info = rdna::translate::res_info_offset(&found.tr.plan) as usize;
+        let res_info = facts.map_or_else(|| rdna::translate::res_info_offset(&found.tr.plan) as usize, |f| f.res_info);
         let nb = found.tr.out.bindings.len();
         // A recycled binding's vectors keep their capacity (`recycle`).
         let mut bound = self.bound_pool.pop().unwrap_or_default();
@@ -19880,13 +20157,13 @@ impl Exec {
         {
             // Address-mode translations: the zero page in the address block's
             // header (`Spec::addresses`).
-            let addr_at = rdna::translate::addr_info_offset(&found.tr.plan) as usize;
-            let has_marks = found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks);
+            let addr_at = facts.map_or_else(|| rdna::translate::addr_info_offset(&found.tr.plan) as usize, |f| f.addr_info);
+            let has_marks = facts.map_or_else(|| found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks), |f| f.marks);
             // (Every address-mode or GPU-resolved stage reads it: a GPU-resolved scalar load
             // outside the guest span reads the zero page, buffers or none. Before 2026-11-18 only
             // stages with address-mode buffers had it, and a block's dwords start at zero.)
             let spec = &found.tr.spec;
-            if spec.addresses || spec.gpu_loads != 0 || spec.gpu_res != 0 || found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Address(_))) {
+            if spec.addresses || spec.gpu_loads != 0 || spec.gpu_res != 0 || facts.map_or_else(|| found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Address(_))), |f| f.address) {
                 p.sgpr_data[addr_at] = fx.zero_va as u32;
                 p.sgpr_data[addr_at + 1] = (fx.zero_va >> 32) as u32;
             }
@@ -20158,7 +20435,7 @@ impl Exec {
                                 trace_writes(|| format!("{:?} shader {:#x}{} {{{}}}", p.stage, p.addr, super::shaders::program_hash(p.addr).ok().and_then(super::particles::origin).map(|d| format!(" (from {d})")).unwrap_or_default(), if watch_range().is_some() { watch_resources(p) } else { String::new() }), base, size);
                                 bound.writes.push((base, size));
                                 if write_journal_on() {
-                                    let marks = found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks);
+                                    let marks = facts.map_or_else(|| found.tr.out.bindings.iter().any(|b| b.kind == BindingKind::Marks), |f| f.marks);
                                     journal_write(base, size, &self.name, p.addr, i as u32, if from_mirror.is_some() { "mirrored" } else { "home" }, marks && from_mirror.is_some());
                                 }
                                 if super::xwait::on() {
@@ -20436,7 +20713,7 @@ impl Exec {
         }
         // Held batches: a storage image's binding marks it written in the
         // image cache, which the work before them would see.
-        if self.held && found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))) {
+        if self.held && facts.map_or_else(|| found.tr.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_))), |f| f.storage_image) {
             self.stop("storage image");
             return Err(STOPPED.into());
         }
@@ -20598,7 +20875,7 @@ impl Exec {
         let Some((ring, ring_ptr)) = self.slots[self.cur].rings[which] else { return Err("no SGPR data ring".into()) };
         // A uniform buffer (`Spec::sgpr_ubo`) is bound at its alignment, with
         // the translation's whole uvec4 array (16-byte rounding).
-        let ubo = p.tr.out.bindings.iter().any(|b| b.kind == BindingKind::SgprUniform);
+        let ubo = if super::record_opts::static_bind() { p.tr.binding_facts.uniform } else { p.tr.out.bindings.iter().any(|b| b.kind == BindingKind::SgprUniform) };
         let pc = p.tr.out.sgpr_pc;
         // A batched translation's uniform window of the ring (`Spec::sgpr_ubo`
         // 3): its data placed as for a storage buffer.
@@ -20736,6 +21013,36 @@ impl Exec {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn capture_framegen_inputs(&mut self, p: &Prepared) {
+        if !super::framegen::enabled() { return; }
+        // Resource indices and constant offsets below are tied to decoded code,
+        // not the allocation-dependent program VA.
+        if p.code_hash != 0xfe9965945c763809 {
+            super::framegen::reject_taa("unrecognized temporal AA code");
+            return;
+        }
+        let (Some(Resolved::Image(td)), Some(Resolved::Image(tv)), Some(Resolved::Image(to))) =
+            (p.resources.get(TAA_RES[1]), p.resources.get(TAA_RES[2]), p.resources.get(TAA_RES[3])) else { super::framegen::note("TAA deferred", "missing depth/MV/output image resources 2/4/9"); return; };
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        // The equipment menu's preview runs the same TAA. It must not replace the
+        // scene's depth/motion snapshot used to interpolate the final display image.
+        if !super::upscale::main_view(to.width, to.height, frame) { return; }
+        let r = super::images::with(|im| -> Result<_, String> { Ok((im.upscale_tex(td, false, frame)?, im.upscale_tex(tv, false, frame)?)) });
+        if let Ok((depth, motion)) = r {
+            let user = p.sgpr_data.first().copied().unwrap_or(0) as u64
+                | (p.sgpr_data.get(1).copied().unwrap_or(0) as u64 & 0xffff) << 32;
+            let constants = super::framegen::read_constants(user, depth.size);
+            super::framegen::note("TAA scheduled", format_args!("depth {:?} {:?}, MV {:?} {:?}", depth.size, depth.format, motion.size, motion.format));
+            super::vk::defer::external(self.cmd(), Box::new(move |cmd| {
+                match constants {
+                    Ok(c) => super::framegen::capture_taa(cmd, depth, motion, c),
+                    Err(e) => super::framegen::reject_taa(&e),
+                }
+            }));
+        } else if let Err(e) = r { super::framegen::note("TAA lookup failed", e); }
+    }
+
     /// The chosen upscaler after the title's TAA dispatch (`gpu::upscale`): the TAA's colour,
     /// depth and motion vectors in, the frame's jitter from the title's jitter function
     /// (`crate::jitter`), its own output image out, whose colour then replaces the TAA output's
@@ -20763,6 +21070,11 @@ impl Exec {
             ONCE.call_once(|| crate::warn!("upscaler: the TAA's resources are not the four images expected: the title's TAA runs"));
             return false;
         };
+        // (Only the scene's TAA: the title's smaller views, such as a menu's character preview,
+        // keep their own result; `upscale::main_view`.)
+        if !super::upscale::main_view(to.width, to.height, frame) {
+            return false;
+        }
         let r = super::images::with(|im| -> Result<_, String> { Ok((im.upscale_tex(&tc, false, frame)?, im.upscale_tex(&td, false, frame)?, im.upscale_tex(&tv, false, frame)?, im.upscale_tex(&to, true, frame)?)) });
         let (color, depth, velocity, taa_out) = match r {
             Ok(v) => v,
@@ -20804,8 +21116,8 @@ impl Exec {
         if !super::upscale::record(cmd, &inp) {
             return false;
         }
-        let (view, w, h) = (taa_out.view, to.width, to.height);
-        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, view, w, h, exposure)));
+        let (src, view, w, h) = (inp.output.view, taa_out.view, to.width, to.height);
+        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, view, w, h, exposure)));
         // (The upscaler and the merge bound pipelines and descriptors of their own.)
         self.dyncache = Default::default();
         true
@@ -21440,9 +21752,9 @@ impl Exec {
         }
         // Phase times only when profiling (a clock read costs ~20 ns); the
         // total always (slow dispatches are reported).
-        let t_start = std::time::Instant::now();
+        let t_start = super::record_opts::Timer::start();
         self.fe2_min_want = u32::MAX;
-        let t0 = profiling().then_some(t_start);
+        let t0 = profiling().then(std::time::Instant::now);
         let since = |t0: Option<std::time::Instant>| t0.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         // No groups (direct, or arguments the CPU read): nothing runs, so
         // nothing is prepared or waited for (~100,000 in a boot to the gate,
@@ -21643,6 +21955,11 @@ impl Exec {
         }
         // (`imgprobe <n> <u> <v> taa`: every image probed before the TAA, the frame's work
         // before it completed first.)
+        #[cfg(target_os = "linux")]
+        if p.addr == TAA_CS && self.held && super::framegen::enabled() {
+            self.stop("frame generation TAA snapshot");
+            return Err(STOPPED.into());
+        }
         if p.addr == TAA_CS && !self.held {
             let take = {
                 let mut g = TAA_IMG_PROBE.lock();
@@ -22526,6 +22843,8 @@ impl Exec {
         // The chosen upscaler after the title's TAA (`gpu::upscale`, `gpu::upmerge`).
         if !batched && p.addr == TAA_CS && indirect.is_none() {
             self.taa_upscale(&p, &bound);
+            #[cfg(target_os = "linux")]
+            self.capture_framegen_inputs(&p);
         }
         trace_cs_images(&self.name, &p, &bound);
         self.tap_cs(&p, &bound);
@@ -22755,7 +23074,7 @@ fn clear_pass_line() -> String {
 /// One status line for hang reports.
 pub fn status() -> String {
     format!(
-        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait{}; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
+        "    gpu exec: {} dispatches executed ({} with arguments read by the GPU, {} of them from a resident shadow, {} of them behind a barrier of their own; {} render passes ended into the next full barrier; draws sampling an attachment of their rendering instance: {} kept it, {} ended it (color written / not, depth z-written / s-written / cleared / not, stored {:?}; pixel shaders {}); {} CP writes by the GPU, {} title timestamps written by the CPU, left to the CPU {:?}; {} buffers shadowed in VRAM, {} not for lack of space; resident shadows: {} reused, {} read-only bindings served, {} merges ({} before an in-place use), {} skipped; {} draws executed ({} reading their arguments on the GPU, {} repeating the draw before (chains ended by opcode: {}), {} barriers before a dispatch rewrote them), {} without effect, {} skipped; {} invocations stopped by the loop watchdog; {} fast clears ({} with the fill's value, no wait{}; read from memory and not one code throughout: {} refused, {} with the value of the fill an unknown write had replaced; {} of layers alone; {} taken over by the target bound next with their metadata, {} of them in held work), {} fill-kernel dispatches recorded as buffer fills ({} of them only clearing the GPU-written images they cover, {} MiB not stored), {} dispatches' write notes skipped as repeats; {} completions waited, {}; waits by opcode {}\n",
         EXECUTED.load(Ordering::Relaxed),
         GPU_INDIRECT.load(Ordering::Relaxed),
         SHADOW_ARGS.load(Ordering::Relaxed),
@@ -22793,6 +23112,8 @@ pub fn status() -> String {
         FAST_CLEARS_NOT_UNIFORM[0].load(Ordering::Relaxed),
         FAST_CLEARS_NOT_UNIFORM[1].load(Ordering::Relaxed),
         FAST_CLEARS_LAYERED.load(Ordering::Relaxed),
+        super::images::META_CLAIMS[0].load(Ordering::Relaxed) + super::images::META_CLAIMS[1].load(Ordering::Relaxed),
+        super::images::META_CLAIMS[1].load(Ordering::Relaxed),
         FILLS_IN_PLACE.load(Ordering::Relaxed),
         FILL_SKIPS[0].load(Ordering::Relaxed),
         FILL_SKIPS[1].load(Ordering::Relaxed) >> 20,
@@ -22804,6 +23125,7 @@ pub fn status() -> String {
         + &slot_mem_line()
         + &clear_pass_line()
         + &super::images::pressure_line()
+        + &super::upmerge::status_line()
         + &super::vk::gate_line()
         + &super::fe2::unimported_line()
         + &super::vk::system_line()

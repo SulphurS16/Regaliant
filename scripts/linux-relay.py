@@ -184,11 +184,14 @@ def session_environment(inherited, profile):
     # Pin instrumentation per child, even if a caller bypasses the shell wrapper.
     label, profile = profile, profile_kind(profile)
     env = inherited.copy()
+    # Existing relays must remain real-frame measurements even with an FG player seed.
+    if '-fg-' not in label:
+        env.update(DS_FRAME_GENERATION='off', DS_FG_SHOTS='0', DS_FG_INPUT_DUMP='0')
     env.update({key: '0' for key in (
         'DS_NAN_PROBE', 'DS_NAN_EARLY', 'DS_PROFILE_GPU', 'DS_PROFILE_GPU_STAMPS',
         'DS_BATCH_STAMPS', 'DS_CAPTURE_CODE', 'DS_CAPTURE_TARGETS_FRAME', 'DS_RELAY_TARGETS',
         'DS_CULLREAD_DIAG', 'DS_RECORD_PROFILE', 'DS_STEP_LAPS', 'DS_OP_CENSUS', 'DS_WW_CENSUS', 'DS_RELAY_CPU_PROFILE', 'DS_LINUX_FAULT_TIMING', 'DS_LINUX_INTERVAL_SHOTS', 'DS_SCREENSHOT')})
-    env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_VK_VALIDATION='1', DS_LINUX_VOLATILE_BACKOFF='0', DS_LINUX_WRITE_WATCH='mprotect', DS_LINUX_VBLANK_GRID='0', DS_FRAME_STALLS='1', DS_LINUX_COALESCE_SPARSE='0', DS_RELAY_CLOSE_WINDOW='0', DS_WINDOW_SHOT='0')
+    env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_VK_VALIDATION='1', DS_LINUX_VOLATILE_BACKOFF='0', DS_LINUX_WRITE_WATCH='uffd', DS_LINUX_VBLANK_GRID='0', DS_FRAME_STALLS='1', DS_LINUX_COALESCE_SPARSE='0', DS_RELAY_CLOSE_WINDOW='0', DS_WINDOW_SHOT='0')
     if profile in ('clean', 'warm', 'legacy'):
         env.update(DS_RELAY_GAMEPLAY_SECONDS='60', DS_VK_VALIDATION='0')
     elif profile == 'gpu-timing':
@@ -202,17 +205,24 @@ def session_environment(inherited, profile):
                    DS_RELAY_CLOSE_WINDOW='1', DS_LINUX_PRESENT_MODE='fifo', DS_RELAY_UI_PROBE='0',
                    DS_SCENE_PROBE='0', DS_TRACE_CLEARS='0', DS_PB_VERIFY_CAPTURE='0', DS_CAPTURE='',
                    DS_CP_CLASSES='0', DS_WB_BUCKETS='0', DS_WB_BUCKETS_SPLIT='0', DS_WB_SAME='0', DS_FE2_HOLD='0', DS_RECORD_PROFILE='0')
-        env['DS_LINUX_WRITE_WATCH'] = 'uffd' if label.endswith('-uffd') else 'mprotect'
+        env['DS_LINUX_WRITE_WATCH'] = 'mprotect' if label.endswith('-mprotect') else 'uffd'
         env.pop('DS_SYNC_INPUT_BATCH', None)  # Removed after a device-lost relay.
         env['DS_LINUX_ADDRESS_WAKE'] = '1'  # Verified promise wake-return semantics; normal play default too.
         env.pop('DS_RECORD_FAST', None)  # Removed after a no-gain A/B.
         env['DS_PAR_WHOLE_RUN'] = '1' if '-whole-run-' in label else '0'
+        quick = '-whole-run-quick-' in label
+        enabled = env.get('DS_RELAY_QUICK_WINS', 'tsc,static-bind').split(',')
+        env['DS_RECORD_TSC'] = '1' if quick and 'tsc' in enabled else '0'
+        env['DS_RECORD_STATIC_BIND'] = '1' if quick and 'static-bind' in enabled else '0'
         env['DS_PIPELINE_CRUMBS'] = '0'  # Filesystem diagnostics belong in startup relay only.
         if 'sample' in label: env['DS_LINUX_FAULT_TIMING'] = '1'
         if 'diagnostic' in label:
             env.update(DS_PROFILE_GPU='1', DS_PROFILE_GPU_STAMPS='seg', DS_BATCH_STAMPS='1', DS_RELAY_STEADY_DIAGNOSTIC='1',
                        DS_CP_CLASSES='1', DS_WB_BUCKETS='1', DS_WB_BUCKETS_SPLIT='1', DS_STEP_LAPS='1', DS_OP_CENSUS='1', DS_WW_CENSUS='1', DS_RECORD_PROFILE='1')
         else: env['DS_RELAY_STEADY_DIAGNOSTIC'] = '0'
+        if 'validation' in label:
+            env.update(DS_VK_VALIDATION='1', DS_RELAY_STEADY_DIAGNOSTIC='1', DS_PROFILE_GPU='0', DS_BATCH_STAMPS='0')
+            env.pop('VK_LOADER_LAYERS_DISABLE', None)
     elif profile == 'startup':
         env.update(DS_VK_VALIDATION='0', DS_PIPELINE_CRUMBS='1', DS_FRAME_CAP='30', DS_UNCAPPED='0', DS_RELAY_IDLE_COMPARE='0')
     elif profile == 'cache-reuse':
@@ -221,6 +231,7 @@ def session_environment(inherited, profile):
         raise ValueError(f'unknown relay profile: {profile}')
     if profile == 'legacy': env.update(DS_LINUX_VOLATILE_BACKOFF='1', DS_LINUX_WRITE_WATCH='mprotect')
     if label.startswith(('clean', 'warm')) or label.endswith('-uffd'): env['DS_LINUX_WRITE_WATCH'] = 'uffd'
+    if label.startswith('mprotect-') or label.endswith('-mprotect'): env['DS_LINUX_WRITE_WATCH'] = 'mprotect'
     if label == 'sparse-original': env['DS_LINUX_COALESCE_SPARSE'] = '0'
     if profile in ('present', 'present-validation'):
         env.update(DS_RELAY_GAMEPLAY_SECONDS='10' if profile == 'present-validation' else '60',
@@ -608,7 +619,7 @@ def pipeline_reuse(run):
 def prepare_cache(repo, game, run, cache, seed):
     output = run/'preparation'
     output.mkdir()
-    env = session_environment(os.environ, 'mprotect-1')
+    env = session_environment(os.environ, 'clean-1')
     env.update(DSPORT_HOME=str(output/'user'), DS_LINUX_SHADER_CACHE=str(cache),
                DS_PREPARE_SEED=str(seed), DS_PREPARE_LEVELS='8-1', DS_PREPARE_TOUR='2:2:0.25',
                DS_PREPARE_SHOTS='1', DS_LINUX_HIDDEN='1', SDL_AUDIO_DRIVER='dummy', DS_RELAY_FPS_LIMIT='30')
@@ -633,7 +644,7 @@ def prepare_cache(repo, game, run, cache, seed):
 
 
 def suite_labels(mode, full):
-    if not full: return ['mprotect-1', 'present-fifo-cold']
+    if not full: return ['clean-1', 'present-fifo-cold']
     if mode == 'offscreen': return ['mprotect-1', 'mprotect-2', 'clean-1', 'round9-route', 'gpu-timing', 'host-profile']
     return ['present-fifo-cold', 'present-fifo-warm', 'present-mailbox-cold', 'present-mailbox-warm', 'present-fifo-uffd', 'present-fifo-gpu-timing', 'present-validation']
 
@@ -730,7 +741,7 @@ Pipeline reuse proof: pipeline-reuse-summary.json and per-interval *-pipeline-re
 Host-profile records existing CPU step/packet/write-watch counters to cpu-gameplay-profile.txt, reset after loading. It optionally attaches perf for20s only during stationary gameplay; inspect perf-console.log, perf-exit-code.txt and perf-report.txt. Missing tools or denied events are explicit. gpu-timing has a separate GPU segment timeline; instrumentation changes batching and is not a performance baseline.
 Per-thread CPU/wchan/runqueue in thread-times.csv/summary, GPU clocks/util/power in gpu-clocks.csv, CPU thermal/clock/load/cgroup evidence retained. Sparse page-entry->range counts and compilation/cache statistics remain in dsport.log.
 Visible sessions:800x450, null audio, scripted controls, no focus/grab/fullscreen requests; finish through SDL close. Full suite adds a separate validation session and a20s real SDL silence check without changing sinks.
-All argv/env/cache paths in command.json. Every process bounded and reaped. Default player presentation is FIFO; tracking remains mprotect; uffd removed signals but did not match throughput. No commits or game-tree writes.
+All argv/env/cache paths in command.json. Every process bounded and reaped. Default player presentation is FIFO; tracking defaults to uffd after mprotect tour corruption; explicit mprotect sessions are diagnostic. No commits or game-tree writes.
 """
     (run/'summary.txt').write_text(summary)
     (root/'summary.txt').write_text(summary)

@@ -5,6 +5,8 @@
 use super::vm;
 #[path = "signal_report.rs"]
 mod report;
+#[path = "fault_report.rs"]
+mod fault_report;
 pub use report::{CompileNote, compiler_crash_file};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -109,7 +111,7 @@ unsafe extern "C" fn handler(signal: i32, info: *mut libc::siginfo_t, context: *
                 recover(
                     (*info).si_addr() as u64,
                     error & 2 != 0,
-                    uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64,
+                    uc,
                 )
             }
         {
@@ -353,6 +355,51 @@ mod tests {
         }
     }
 
+    /// A real four-byte access crossing into a reservation must not manufacture a mapping.
+    /// Temporary section holes are covered separately by readers_survive_section_split_races.
+    #[test]
+    fn reserved_boundary_access_is_not_a_lazy_commit() {
+        if let Ok(kind) = std::env::var("REGALIANT_RESERVED_FAULT_TEST") {
+            use crate::platform::os::*;
+            crate::hle::kernel::time::init();
+            let _stack = super::SignalStack::new().unwrap();
+            super::install(-1).unwrap();
+            unsafe {
+                let memory = VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!memory.is_null());
+                assert_eq!(VirtualAlloc(memory, 4096, MEM_COMMIT, PAGE_READWRITE), memory);
+                let second = (memory as *mut u8).add(4096);
+                if kind.starts_with("decommitted") {
+                    assert_eq!(VirtualAlloc(second.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), second.cast());
+                    std::ptr::write_bytes(second, 0xab, 4096);
+                    assert_ne!(VirtualFree(second.cast(), 4096, MEM_DECOMMIT), 0);
+                }
+                assert!(!mapping_allows(second as usize, false));
+                assert!(!mapping_allows(second as usize, true));
+                // Use assembly: Rust's aligned volatile load/store cannot express the
+                // unaligned, cross-page mov that triggered the tour failure.
+                let source = second.sub(2);
+                if kind.ends_with("write") {
+                    std::arch::asm!("mov dword ptr [{p}], 0x12345678", p = in(reg) source, options(nostack));
+                } else {
+                    std::arch::asm!("mov eax, dword ptr [{p}]", p = in(reg) source, out("eax") _, options(nostack));
+                }
+            }
+            panic!("reserved boundary access unexpectedly returned");
+        }
+        for kind in ["reserved-read", "reserved-write", "decommitted-read", "decommitted-write"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::signals::tests::reserved_boundary_access_is_not_a_lazy_commit", "--nocapture"])
+                .env("REGALIANT_RESERVED_FAULT_TEST", kind)
+                .output().unwrap();
+            let report = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(128 + libc::SIGSEGV), "{kind}: {report}");
+            assert!(report.contains("state 0x2000"), "{kind}: {report}");
+            assert!(report.contains("guest VMA None"), "{kind}: {report}");
+            assert!(report.contains("FATAL Linux signal"), "{kind}: {report}");
+        }
+    }
+
     #[test]
     fn synchronous_fault_report() {
         if let Ok(kind) = std::env::var("REGALIANT_SIGNAL_TEST") {
@@ -430,11 +477,14 @@ struct Request {
     address: u64,
     write: bool,
     rip: u64,
+    pointers: [u64; 4], // rbx (stream object), rsi, rdi, rsp
     done: AtomicI32,
 }
 
 // Only raw syscalls, fixed stack storage and lock-free atomics run in signal context.
-unsafe fn recover(address: u64, write: bool, rip: u64) -> bool {
+unsafe fn recover(address: u64, write: bool, context: &libc::ucontext_t) -> bool {
+    let registers = &context.uc_mcontext.gregs;
+    let rip = registers[libc::REG_RIP as usize] as u64;
     let fd = REQUEST_FD.load(Ordering::Acquire);
     if fd < 0
         || unsafe { libc::syscall(libc::SYS_gettid) } as i32 == SERVICE_TID.load(Ordering::Relaxed)
@@ -445,6 +495,8 @@ unsafe fn recover(address: u64, write: bool, rip: u64) -> bool {
         address,
         write,
         rip,
+        pointers: [libc::REG_RBX, libc::REG_RSI, libc::REG_RDI, libc::REG_RSP]
+            .map(|r| registers[r as usize] as u64),
         done: AtomicI32::new(0),
     };
     let pointer = &request as *const Request as usize;
@@ -538,11 +590,7 @@ fn answer(pointer: usize) {
             r.write,
             crate::mem::describe_host(r.address, 1)
         );
-        if let Some(memory) = crate::mem::MEM.try_lock() {
-            if let Some(v) = memory.find(r.address) {
-                crate::error!("guest VMA: {v:?}");
-            }
-        }
+        fault_report::unrecovered(r.address, r.rip, r.pointers);
         if let Some(dir) = crate::run_dir() {
             if let Ok(maps) = std::fs::read("/proc/self/maps") {
                 let _ = std::fs::write(dir.join("fault-maps.txt"), maps);

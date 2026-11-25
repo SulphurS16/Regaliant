@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.1.7
+
+- Fixed the crash with Aspect Ratio 21:9 or 32:9 and Visual Mode Cinematic, also at every
+  start after it (issue #20). At shapes wider than 16:9 the game now renders at most 1512
+  lines, which its render targets have room for.
+- Fixed DLSS, FSR and XeSS not working after a restart of the game. The Anti-Aliasing setting
+  still showed the upscaler, but the game used its own TAA. Now the chosen upscaler takes over
+  as soon as it is ready.
+- Fixed a crash inside the graphics driver a few seconds after DLSS started, seen here with the
+  newest DLSS file (310.9.16). When the game combined two batches of graphics work, it gave the
+  upscaler the wrong command buffer. DLSS, FSR and XeSS now draw into the right one. This likely
+  also fixes the game closing without a message with FSR on (issue #5).
+- The shader preparation now always uses the game's own TAA, even with an upscaler saved. Its
+  hidden sessions show nothing, so a saved DLSS choice cannot get in its way.
+- A crash inside the graphics driver now leaves a line in the log that names where it happened.
+- Ctrl+F10 in the game's window writes what the game is waiting for into the log. If the game
+  hangs but keeps drawing, such as a loading screen that never ends (issue #14), press it,
+  wait a few seconds before closing the game, then attach the log.
+- Motion Blur Fix's choices are now named by what they give: No Blur (the default), Reduced
+  Blur and Game's Blur. They were On, Reduced Blur and Off, and "Off" read as no blur while it
+  turned on the game's full motion blur, which smears every camera move (issue #6). Your saved
+  choice stays as it was.
+- When another program holds part of the memory the game needs ("status 10") with memory that
+  names no owner, the message and `early-failure.txt` now also list the modules other programs
+  put into the game at that moment, to help find the program (issue #15).
+
+## 0.1.6
+
+- Fixed the shader preparation and the game ending when the graphics driver stops on a debug
+  break while it compiles a shader (seen with NVIDIA's driver 621.40 as "crashed (status
+  0x80000003)", and likely the silent ends of issue #5). The game runs under its own helper,
+  which counts as a debugger, so the driver broke where it would otherwise go on. It now goes
+  on. Should the driver still fail there, the shader is left out, the step runs again, and the
+  log names the shader.
+- On PCs where Vulkan lists the graphics card twice, for example through Windows' OpenCL,
+  OpenGL and Vulkan Compatibility Pack, the game now takes the card's own driver. Before, it
+  could take the other entry and stop with "vkCreateDevice: Extension specified does not
+  exist". The log lists every device with its driver and what it lacks.
+- When another program holds part of the memory the game needs ("status 10"), the game tries
+  again for a moment. If it still cannot start, a file in the logs folder names what holds the
+  memory (the launcher's Open logs shows it).
+
+## 0.1.5
+
+- Fixed the game not starting at all for players who put their own DLSS file
+  ('nvngx_dlss.dll') in the 'upscalers' folder and whose DLSS version could not be loaded: every
+  start, and the shader preparation, ended with an error at once. DLSS is now first tried in a
+  separate short check; if that check fails, the game starts without DLSS and its log says why.
+  It tries again when the DLSS files or Regaliant change. On PCs without an NVIDIA driver DLSS is
+  not loaded at all.
+- When a graphics driver crashes while it compiles one of the game's shaders, the game now
+  remembers which compiles were running even when the crash leaves no error report, and the
+  next start leaves them out of the background compiles (a compile that crashes again is left
+  out everywhere). Before, such a crash could repeat at every start, as seen with NVIDIA's
+  driver 621.40. The log now names the shaders on that list.
+- Fixed video memory filling up and the game slowing down the longer it ran with DLSS, XeSS or
+  FSR chosen. In menus that show your character (the equipment menu), the game runs its
+  anti-aliasing on the small preview too, and the upscaler followed it: it switched size every
+  frame or two and kept a new 30 MB image each time, never freed. A 16 GB card filled within
+  minutes. The upscaler now stays on the game's view and frees images it no longer needs.
+- Fixed HUD trails, menus that stayed on screen after closing, and likely some black screens
+  (seen with HDR on at 2160p). After the game rebuilt its images, for example on a display mode
+  change, it could use one block of the graphics card's compression data for two images. The
+  port then cleared the wrong image each frame: the HUD layer kept its old picture, and the
+  scene's lighting was cleared before the HUD was drawn over it.
+- Load Game now shows your characters to choose from, as the PS5 does. Before, it loaded the
+  first one without asking. Choose with up and down or the mouse wheel. Load with Cross, A,
+  Enter or a left click. Go back with Circle, B, Esc or a right click.
+- Add-ons: the game also looks for your add-on packages in an 'Add-ons' folder in
+  '%LOCALAPPDATA%\Regaliant' and next to 'regaliant.exe', besides the one in
+  '%APPDATA%\Regaliant' (AppData\Roaming), and finds them by the content ID inside them,
+  whatever their names. Its log now says what it found where. Their items go to Stockpile
+  Thomas's storage in the Nexus when a character loads (the pre-order's weapon under the
+  weapons tab). The game gives the Digital Deluxe items only to characters created while the
+  add-ons are in place.
+- A controller the port does not see now leaves a line in the log after a minute: which
+  controllers Windows lists and which programs that hide or translate controllers are running.
+
+## 0.1.4
+
+- Fixed the mostly black picture in play on RTX 50-series graphics cards (black shapes and streaks
+  across the view from the first tunnel on). The game gives the unused slots of some draws
+  "not a number" positions so that the graphics card drops them, and the port moves them out of
+  view; the driver for these cards was allowed to skip that check and drew them across the
+  screen. The game's shaders now tell the driver to keep it, on RTX 50-series cards and on AMD and
+  Intel ones. Confirmed on an RTX 5090. On these cards the launcher prepares the shaders again
+  once; RTX 40-series and older cards keep their prepared shaders.
+
 ## 0.1.3
 
 - Game folders whose executable and libraries are decrypted but still in their SELF containers

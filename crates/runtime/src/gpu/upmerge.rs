@@ -19,13 +19,34 @@ struct Img {
     h: u32,
 }
 
+/// An output image of another size than the current one: taken back when that size returns,
+/// freed once the GPU work that may use it completed (`seq`: the batch sequence that work came
+/// before, taken two flips after it was put aside, when every batch recorded with it was handed
+/// over).
+struct Retired {
+    img: Img,
+    frame: u64,
+    seq: Option<u64>,
+}
+
 struct Merge {
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     target: Option<Img>,
-    /// Images of earlier sizes (kept: frames in flight may still use them; sizes change rarely).
-    retired: Vec<Img>,
+    /// Images of other sizes. Until 2026-11-24 they were kept for good: the title's small views'
+    /// TAA (the equipment menu's character preview at 640x360) changed the size every frame or
+    /// two, and each change made a new image (30 MiB at 2560x1440) that was never freed: a
+    /// player's 16 GB card filled in minutes (issue #4: 537 images in one session).
+    retired: Vec<Retired>,
 }
+
+/// Flips after an image is put aside before the batch sequence its work came before is taken:
+/// far more than a batch takes to be handed over (`FRAMES` is also stored by the display's
+/// thread, and a flip need not hand the open batch over: the review of 2026-11-24 night).
+const RETIRE_FLIPS: u64 = 120;
+
+/// Images made and freed (the status line).
+pub static IMAGES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 unsafe impl Send for Merge {}
 
@@ -84,19 +105,68 @@ unsafe fn image(w: u32, h: u32) -> Result<Img, String> {
     }
 }
 
-/// The upscaler's output image at `w`x`h` (made or remade; GENERAL layout once `record` ran).
+/// The status line of the upscaler's output images (none when no upscaler ran).
+pub fn status_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let made = IMAGES[0].load(Relaxed);
+    if made == 0 {
+        return String::new();
+    }
+    format!(
+        "    upscaler output images: {made} made, {} freed; the title's TAA runs of smaller views than the scene's left to it: {}\n",
+        IMAGES[1].load(Relaxed),
+        super::upscale::SMALL_VIEWS.load(Relaxed)
+    )
+}
+
+/// Frees `img` (its GPU work completed).
+unsafe fn destroy(img: Img) {
+    let c = ctx();
+    unsafe {
+        c.device.destroy_image_view(img.view, None);
+        c.device.destroy_image(img.image, None);
+        c.device.free_memory(img.memory, None);
+    }
+    IMAGES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The upscaler's output image at `w`x`h` (made, or taken back from the images of other sizes;
+/// GENERAL layout once `record` ran).
 pub fn target(w: u32, h: u32) -> Result<super::upscale::Tex, String> {
     let mut g = MERGE.lock();
     if g.is_none() {
         *g = Some(unsafe { new_merge() }?);
     }
     let m = g.as_mut().unwrap();
-    if m.target.as_ref().is_none_or(|t| (t.w, t.h) != (w, h)) {
-        let img = unsafe { image(w, h) }?;
-        if let Some(old) = m.target.replace(img) {
-            m.retired.push(old);
+    // Images put aside: the batch sequence their work comes before, two flips on; freed once
+    // that completed.
+    let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    let done = super::exec::completed_seq();
+    let mut keep = Vec::with_capacity(m.retired.len());
+    for mut r in m.retired.drain(..) {
+        if r.seq.is_none() && frame >= r.frame + RETIRE_FLIPS {
+            r.seq = Some(super::exec::next_seq());
         }
-        crate::info!("upscaler: output image {w}x{h} made");
+        if r.seq.is_some_and(|s| done >= s) && (r.img.w, r.img.h) != (w, h) {
+            unsafe { destroy(r.img) };
+        } else {
+            keep.push(r);
+        }
+    }
+    m.retired = keep;
+    if m.target.as_ref().is_none_or(|t| (t.w, t.h) != (w, h)) {
+        let img = match m.retired.iter().position(|r| (r.img.w, r.img.h) == (w, h)) {
+            Some(i) => m.retired.swap_remove(i).img,
+            None => {
+                let img = unsafe { image(w, h) }?;
+                IMAGES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::info!("upscaler: output image {w}x{h} made");
+                img
+            }
+        };
+        if let Some(old) = m.target.replace(img) {
+            m.retired.push(Retired { img: old, frame, seq: None });
+        }
     }
     let t = m.target.as_ref().unwrap();
     Ok(super::upscale::Tex {
@@ -128,10 +198,11 @@ pub fn begin(cb: vk::CommandBuffer, image: vk::Image) {
     unsafe { c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[b]) };
 }
 
-/// Records into `cb` the merge of the upscaler's output into the TAA's (`out_view`, a storage
-/// view of it, `w`x`h`; `exposure` the TAA's constant buffer as it binds it), with barriers before
-/// and after.
-pub fn record(cb: vk::CommandBuffer, out_view: vk::ImageView, w: u32, h: u32, exposure: vk::DescriptorBufferInfo) {
+/// Records into `cb` the merge of the upscaler's output (`src_view`, the image `target` gave for
+/// this TAA: by the time a deferred recording replays this, another size may be the current
+/// one) into the TAA's (`out_view`, a storage view of it, `w`x`h`; `exposure` the TAA's constant
+/// buffer as it binds it), with barriers before and after.
+pub fn record(cb: vk::CommandBuffer, src_view: vk::ImageView, out_view: vk::ImageView, w: u32, h: u32, exposure: vk::DescriptorBufferInfo) {
     let c = ctx();
     // (The upscaler's evaluation, recorded just before, failed: the TAA's output stays.)
     if !super::upscale::last_eval_ok() {
@@ -139,13 +210,12 @@ pub fn record(cb: vk::CommandBuffer, out_view: vk::ImageView, w: u32, h: u32, ex
     }
     let g = MERGE.lock();
     let Some(m) = g.as_ref() else { return };
-    let Some(t) = m.target.as_ref() else { return };
     let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     unsafe {
         c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
         c.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, m.pipeline);
         let infos = [
-            [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: t.view, image_layout: vk::ImageLayout::GENERAL }],
+            [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: src_view, image_layout: vk::ImageLayout::GENERAL }],
             [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: out_view, image_layout: vk::ImageLayout::GENERAL }],
         ];
         let ebuf = [exposure];

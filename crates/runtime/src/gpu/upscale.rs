@@ -40,7 +40,7 @@ use ash::vk;
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
 use windows_sys::Win32::Foundation::HMODULE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,21 +88,69 @@ static SWITCHED: AtomicBool = AtomicBool::new(false);
 
 /// The upscaler chosen now: the PC tab's Anti-Aliasing (DS_UPSCALER at start).
 pub fn choice() -> Kind {
-    let v = CHOICE.load(Relaxed);
+    let v = CHOICE.load(SeqCst);
     if v != u8::MAX {
         return Kind::from_u8(v);
     }
     let k = Kind::parse(&std::env::var("DS_UPSCALER").ok().unwrap_or_default());
-    CHOICE.store(k as u8, Relaxed);
+    CHOICE.store(k as u8, SeqCst);
     k
 }
 
-/// A new choice from the settings (applied from the next frame).
+/// The game's TAA for the whole run, whatever the settings choose, and why: the shader
+/// preparation's self-play (`prepplay::setup`, before the log and the settings; `set_choice`
+/// logs it).
+static PINNED_TAA: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub fn pin_taa(why: &'static str) {
+    let _ = PINNED_TAA.set(why);
+    CHOICE.store(Kind::Off as u8, SeqCst);
+}
+
+/// A new choice from the settings (applied from the next frame). An upscaler that is not ready
+/// yet takes over once it is (`now_ready`); until then, and for good if it never is, the game's
+/// TAA runs (`active`). The switch starts a new history at the upscaler's first frame.
 pub fn set_choice(v: &str) {
     let k = Kind::parse(v);
-    if CHOICE.swap(k as u8, Relaxed) != k as u8 {
+    if let Some(why) = PINNED_TAA.get() {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if k != Kind::Off && !TOLD.swap(true, Relaxed) {
+            crate::info!("upscaler: {} chosen in the settings, the game's TAA for this run ({why})", k.name());
+        }
+        return;
+    }
+    // (SeqCst with `note_sl_present`'s: one of the two sees the other's store, so the last line
+    // logged for a choice of DLSS is right.)
+    if CHOICE.swap(k as u8, SeqCst) != k as u8 {
         SWITCHED.store(true, Relaxed);
-        crate::info!("upscaler: {} chosen{}", k.name(), if k != Kind::Off && !ready(k) { " (not available here: the game's TAA stays)" } else { "" });
+        let note = if k == Kind::Off || ready(k) {
+            ""
+        } else if may_become_ready(k) {
+            " (the game's TAA until it is ready)"
+        } else {
+            " (not available here: the game's TAA stays)"
+        };
+        crate::info!("upscaler: {} chosen{note}", k.name());
+    }
+}
+
+/// The device is made (`device_created`): XeSS and FSR are ready by then or not at all.
+static DEVICE_MADE: AtomicBool = AtomicBool::new(false);
+
+/// Whether `k`, not ready now, may still become ready in this session: before the device is made
+/// any upscaler may; after it only DLSS, while it starts on its own thread.
+fn may_become_ready(k: Kind) -> bool {
+    if k == Kind::Off || failed_flag(k).load(Relaxed) {
+        return false;
+    }
+    !DEVICE_MADE.load(Relaxed) || (k == Kind::Dlss && DLSS_DEVICE_OK.load(Relaxed))
+}
+
+/// `k` just became ready: when it is the one chosen, it replaces the game's TAA from the next
+/// frame (the switch of `set_choice` is still pending, so its history starts new).
+fn now_ready(k: Kind) {
+    if choice() == k && ready(k) {
+        crate::info!("upscaler: {} in use from now (the chosen Anti-Aliasing)", k.name());
     }
 }
 
@@ -130,13 +178,29 @@ fn failed_flag(k: Kind) -> &'static AtomicBool {
     }
 }
 
-/// Whether `k` is ready to run in this session.
+/// Whether `k` is ready to run in this session (DLSS: once a frame's present went through
+/// Streamline, `SL_PRESENTED`).
 fn ready(k: Kind) -> bool {
     match k {
         Kind::Off => false,
         Kind::Xess => XESS_READY.load(Relaxed) && !XESS_FAILED.load(Relaxed),
-        Kind::Dlss => DLSS_READY.load(Relaxed) && !DLSS_FAILED.load(Relaxed),
+        Kind::Dlss => DLSS_READY.load(SeqCst) && !DLSS_FAILED.load(Relaxed) && SL_PRESENTED.load(SeqCst),
         Kind::Fsr => FSR_READY.load(Relaxed) && !FSR_FAILED.load(Relaxed),
+    }
+}
+
+/// A frame's present went through Streamline's vkQueuePresentKHR (`present_hook`): DLSS runs only
+/// after that. Streamline's per-frame bookkeeping (presentCommon) needs every frame's present; in
+/// runs that presented nothing through it (no window: the hidden present went to the driver
+/// directly until 2026-11-25), DLSS evaluated anyway warned "presentCommon() was not observed" and
+/// in three runs of four ended the process seconds later, an access violation inside the driver
+/// at a submission (NGX DLSS 310.9.16, driver 610.88; a window's session ran clean).
+static SL_PRESENTED: AtomicBool = AtomicBool::new(false);
+
+/// A present went through Streamline's vkQueuePresentKHR (`vk::present`).
+pub fn note_sl_present() {
+    if !SL_PRESENTED.swap(true, SeqCst) {
+        now_ready(Kind::Dlss);
     }
 }
 
@@ -145,6 +209,10 @@ pub fn active() -> bool {
     ready(choice())
 }
 
+#[path = "upscale_view.rs"]
+mod view;
+pub use view::{main_view, SMALL_VIEWS};
+
 /// The last evaluation recorded (at replay) succeeded: the merge that follows it copies its
 /// output only then (`gpu::upmerge`; a failed one leaves the title's TAA output as it is).
 static EVAL_OK: AtomicBool = AtomicBool::new(false);
@@ -152,11 +220,6 @@ static EVAL_OK: AtomicBool = AtomicBool::new(false);
 /// Whether the upscaler's evaluation just recorded into the command buffer succeeded.
 pub fn last_eval_ok() -> bool {
     EVAL_OK.load(Relaxed)
-}
-
-/// Whether `name` (dlss, fsr, xess) is ready in this session.
-pub fn is_ready(name: &str) -> bool {
-    ready(Kind::parse(name))
 }
 
 /// Whether `name` is ready or will be shortly (DLSS starts on a thread of its own after the
@@ -461,13 +524,20 @@ pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device
     if XESS_DEVICE_OK.load(Relaxed) && xess().is_some() {
         XESS_READY.store(true, Relaxed);
         crate::info!("upscaler: XeSS ready");
+        now_ready(Kind::Xess);
     }
     if FSR_DEVICE_OK.load(Relaxed) && ffx().is_some() {
         FSR_READY.store(true, Relaxed);
         crate::info!("upscaler: FSR ready");
+        now_ready(Kind::Fsr);
     }
     if DLSS_DEVICE_OK.load(Relaxed) {
         dlss_device_created(instance, pdev, device, qf, queues);
+    }
+    DEVICE_MADE.store(true, Relaxed);
+    let k = choice();
+    if k != Kind::Off && !ready(k) && !may_become_ready(k) {
+        crate::info!("upscaler: {} (the chosen Anti-Aliasing) is not available here: the game's TAA stays", k.name());
     }
 }
 
@@ -878,9 +948,12 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let (h, exec) = (s.ctx as usize, x.execute);
     drop(st);
     unsafe {
-        super::vk::defer::external(cmd, Box::new(move |_| {
+        // (Into the command buffer the deferred list is played into, `cb`: a batch fused into an
+        // earlier one's buffer at submission plays there, its own buffer never begun; see
+        // `dlss_record`.)
+        super::vk::defer::external(cmd, Box::new(move |cb| {
             static N: AtomicU32 = AtomicU32::new(0);
-            let r = (exec)(h as Handle, cmd, &p);
+            let r = (exec)(h as Handle, cb, &p);
             EVAL_OK.store(r == 0, Relaxed);
             if r != 0 {
                 warn_some(&N, "xessVKExecute", r);
@@ -1228,6 +1301,112 @@ unsafe extern "C" fn sl_log(ty: u32, msg: *const c_char) {
     }
 }
 
+/// The system folder (nvapi64.dll, NVIDIA's driver library, is there with every NVIDIA driver).
+fn system_dir() -> Option<PathBuf> {
+    let mut sys = [0u16; 260];
+    let n = unsafe { windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(sys.as_mut_ptr(), sys.len() as u32) } as usize;
+    (n > 0 && n < sys.len()).then(|| PathBuf::from(String::from_utf16_lossy(&sys[..n])))
+}
+
+/// Streamline's files, NVIDIA's driver library and the port's version, as a line
+/// (`streamline-ok.txt` and `streamline-crashed.txt` hold the line they were written for: a check
+/// is made again once it differs, a driver update included).
+fn streamline_files_line(dir: &Path) -> String {
+    let mut v = vec![format!("Regaliant {}", env!("CARGO_PKG_VERSION"))];
+    let files = ["nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"].map(|f| dir.join(f));
+    for p in files.iter().cloned().chain(system_dir().map(|s| s.join("nvapi64.dll"))) {
+        let m = std::fs::metadata(&p).ok();
+        let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        v.push(format!("{name} {} {t}", m.map_or(0, |m| m.len())));
+    }
+    v.join("; ")
+}
+
+/// Whether process `pid` still runs.
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(h, &mut code) != 0 && code == 259;
+        CloseHandle(h);
+        alive
+    }
+}
+
+/// Streamline loads that ended a process, or checks that did not end (`note_streamline_death`),
+/// in a row for the same files: at `STREAMLINE_DEATHS` DLSS is left out. One alone is no proof: a
+/// launcher check or preparation step is ended from outside when the launcher closes or a check
+/// takes too long, and such an end in the load must not switch DLSS off (the review of 2026-11-24
+/// night); it only makes the separate check run again.
+const STREAMLINE_DEATHS: u32 = 2;
+
+/// One more death in Streamline's load for the files of `line` (`streamline-deaths.txt`: the
+/// count and the line), the separate check made to run again; at `STREAMLINE_DEATHS` the files'
+/// line goes to `streamline-crashed.txt`.
+fn note_streamline_death(cache: &Path, line: &str, what: &str) {
+    let deaths = cache.join("streamline-deaths.txt");
+    let n = std::fs::read_to_string(&deaths)
+        .ok()
+        .and_then(|t| t.split_once(' ').filter(|(_, l)| l.trim() == line.trim()).and_then(|(n, _)| n.parse::<u32>().ok()))
+        .unwrap_or(0)
+        + 1;
+    let _ = std::fs::remove_file(cache.join("streamline-ok.txt"));
+    if n >= STREAMLINE_DEATHS {
+        crate::warn!("upscaler: {what} ({n} in a row with these files): DLSS is left out");
+        let _ = std::fs::write(cache.join("streamline-crashed.txt"), line.trim());
+        let _ = std::fs::remove_file(&deaths);
+    } else {
+        crate::warn!("upscaler: {what}: Streamline's separate check runs again before DLSS is loaded");
+        let _ = std::fs::write(&deaths, format!("{n} {}", line.trim()));
+    }
+}
+
+/// Starts that died while Streamline loaded (2026-11-24 night: a player's every start, the shader
+/// preparation's compute step too, ended with an access violation right after XeSS's query, where
+/// Streamline loads, with their own nvngx_dlss.dll in the upscalers folder; the launcher said the
+/// preparation "crashed (status 0xc0000005)"). Each process leaves `streamline-loading-<pid>.txt`
+/// in the cache folder while it loads Streamline. A marker of a process that no longer runs (or
+/// one older than five minutes: the load takes seconds) is claimed by renaming it (a death counts
+/// once, however many processes start together) and counted (`note_streamline_death`). Returns
+/// why DLSS is left out, if it is (`streamline-crashed.txt` written for these files).
+fn streamline_crashed_before(dir: &Path) -> Option<String> {
+    let cache = crate::paths().cache.clone();
+    let crashed = cache.join("streamline-crashed.txt");
+    if let Ok(rd) = std::fs::read_dir(&cache) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name.strip_prefix("streamline-loading-").and_then(|s| s.strip_suffix(".txt")).and_then(|s| s.parse::<u32>().ok()) else { continue };
+            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 300);
+            if pid == std::process::id() || !(old || !process_alive(pid)) {
+                continue;
+            }
+            let claimed = cache.join(format!("streamline-loading-{pid}.claimed-{}", std::process::id()));
+            if std::fs::rename(e.path(), &claimed).is_err() {
+                continue;
+            }
+            let line = std::fs::read_to_string(&claimed).unwrap_or_default();
+            let _ = std::fs::remove_file(&claimed);
+            note_streamline_death(&cache, &line, &format!("an earlier start (process {pid}) ended while it loaded Streamline (DLSS)"));
+        }
+    }
+    let was = std::fs::read_to_string(&crashed).ok()?;
+    if was.trim() == streamline_files_line(dir) {
+        Some(format!(
+            "Streamline's load ended starts or its separate check with these files, so DLSS is left out (it is tried again when they, the graphics driver or Regaliant's version change, or after deleting {})",
+            crashed.display()
+        ))
+    } else {
+        let _ = std::fs::remove_file(&crashed);
+        None
+    }
+}
+
 fn load_sl() -> Result<SlLib, LoadError> {
     let dir = std::env::var_os("DS_SL_DIR").map(PathBuf::from).unwrap_or_else(lib_dir);
     // DLSS itself: the player's own nvngx_dlss.dll (from a game with DLSS or
@@ -1237,7 +1416,145 @@ fn load_sl() -> Result<SlLib, LoadError> {
     if !ngx.is_file() {
         return Err(LoadError::Missing);
     }
+    // (Without NVIDIA's driver Streamline has nothing to run on: its library nvapi64.dll is in
+    // the system folder with every NVIDIA driver.)
+    if system_dir().is_some_and(|s| !s.join("nvapi64.dll").is_file()) {
+        return Err("no NVIDIA graphics driver here (nvapi64.dll is not in the system folder): DLSS needs an NVIDIA RTX card".to_string().into());
+    }
     check_signature(&ngx, "NVIDIA Corporation")?;
+    if let Some(why) = streamline_crashed_before(&dir) {
+        return Err(why.into());
+    }
+    let cache = crate::paths().cache.clone();
+    let _ = std::fs::create_dir_all(&cache);
+    let line = streamline_files_line(&dir);
+    // A start loads Streamline itself only once a separate process has loaded these files
+    // (`probe_streamline`; `streamline-ok.txt` holds their line): the player's DLSS runtime that
+    // ended every start ended only that process, and the game starts without DLSS.
+    let ok = cache.join("streamline-ok.txt");
+    if std::fs::read_to_string(&ok).ok().as_deref().map(str::trim) != Some(line.as_str()) {
+        let t0 = std::time::Instant::now();
+        match run_probe(&dir) {
+            ProbeEnd::Ended(code) => {
+                crate::info!("upscaler: Streamline's separate check loaded these files in {:.2} s (exit {code})", t0.elapsed().as_secs_f32());
+                let _ = std::fs::write(&ok, &line);
+            }
+            // (A fault's NTSTATUS: the load itself crashed, not an end from outside.)
+            ProbeEnd::Faulted(code) => {
+                let crashed = cache.join("streamline-crashed.txt");
+                let _ = std::fs::write(&crashed, &line);
+                return Err(format!(
+                    "Streamline's separate check of these files crashed (code {code:#x}), so DLSS is left out (it is tried again when they, the graphics driver or Regaliant's version change, or after deleting {})",
+                    crashed.display()
+                )
+                .into());
+            }
+            ProbeEnd::Other(why) => {
+                note_streamline_death(&cache, &line, &format!("Streamline's separate check {why}"));
+                return Err(format!("Streamline's separate check {why}: DLSS is left out for this start").into());
+            }
+        }
+    }
+    // (Removed whatever the load's outcome; left behind only if the process dies in it.)
+    let marker = cache.join(format!("streamline-loading-{}.txt", std::process::id()));
+    let _ = std::fs::write(&marker, &line);
+    // (Diagnosis: `DS_SL_CRASH_TEST=2` ends the process here, as a crash in the load would; `1`
+    // ends the separate check instead.)
+    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "2") {
+        crate::warn!("upscaler: DS_SL_CRASH_TEST: ending the process while Streamline loads");
+        std::process::abort();
+    }
+    let r = load_sl_from(&dir);
+    let _ = std::fs::remove_file(&marker);
+    // (Loaded: the deaths in a row end here.)
+    if r.is_ok() {
+        let _ = std::fs::remove_file(cache.join("streamline-deaths.txt"));
+    }
+    r
+}
+
+/// Exit codes of `dsport --probe-streamline`: loaded, refused without a fault, out of time (its
+/// own limit, `PROBE_SECS`).
+const PROBE_LOADED: u32 = 0;
+const PROBE_REFUSED: u32 = 3;
+const PROBE_TIMED_OUT: u32 = 4;
+const PROBE_SECS: u64 = 30;
+
+/// How the separate check ended.
+enum ProbeEnd {
+    /// Loaded, or refused without a fault (`PROBE_LOADED`, `PROBE_REFUSED`).
+    Ended(u32),
+    /// A fault's code (an NTSTATUS error, 0xC0000000 and up: an access violation, a fail-fast).
+    Faulted(u32),
+    /// Out of time, ended from outside, not started or not waited for.
+    Other(String),
+}
+
+/// Runs `dsport --probe-streamline <dir>` at normal priority (a launcher check's lower one is not
+/// inherited) and waits up to `PROBE_SECS` and a little more (it ends itself at `PROBE_SECS`).
+fn run_probe(dir: &Path) -> ProbeEnd {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return ProbeEnd::Other(format!("could not start ({e})")),
+    };
+    let mut child = match std::process::Command::new(exe)
+        .arg("--probe-streamline")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return ProbeEnd::Other(format!("could not start ({e})")),
+    };
+    let t0 = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().map_or(u32::MAX, |c| c as u32);
+                return match code {
+                    PROBE_LOADED | PROBE_REFUSED => ProbeEnd::Ended(code),
+                    PROBE_TIMED_OUT => ProbeEnd::Other(format!("did not end within {PROBE_SECS} s")),
+                    c if c >= 0xC000_0000 && c != u32::MAX => ProbeEnd::Faulted(c),
+                    c => ProbeEnd::Other(format!("was ended from outside (code {c:#x})")),
+                };
+            }
+            Ok(None) if t0.elapsed() < std::time::Duration::from_secs(PROBE_SECS + 5) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                return ProbeEnd::Other(format!("did not end within {PROBE_SECS} s"));
+            }
+            Err(e) => return ProbeEnd::Other(format!("could not be waited for ({e})")),
+        }
+    }
+}
+
+/// `dsport --probe-streamline <dir>` (`main`, before anything else of a start): loads Streamline
+/// from `dir` as a start does (its library, slInit with DLSS, DLSS's requirements) and ends at
+/// once (no library's exit code runs): `PROBE_LOADED`, or `PROBE_REFUSED` when it refused without
+/// a fault; at `PROBE_SECS` it ends itself (`PROBE_TIMED_OUT`), so a load that hangs does not
+/// outlive the start that waits for it. A fault in it ends only this process (`load_sl`).
+pub fn probe_streamline(dir: &Path) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(PROBE_SECS));
+        unsafe { TerminateProcess(GetCurrentProcess(), PROBE_TIMED_OUT) };
+    });
+    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "1") {
+        std::process::abort();
+    }
+    let code = if load_sl_from(dir).is_ok() { PROBE_LOADED } else { PROBE_REFUSED };
+    unsafe { TerminateProcess(GetCurrentProcess(), code) };
+    std::process::exit(code as i32)
+}
+
+fn load_sl_from(dir: &Path) -> Result<SlLib, LoadError> {
+    let dir = dir.to_path_buf();
     let path = dir.join("sl.interposer.dll");
     let h = load_lib(&path, "NVIDIA Corporation")?;
     let f = |name: &CStr| export(h, &path, name);
@@ -1403,12 +1720,14 @@ fn dlss_device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, devic
             fail(Kind::Dlss, "no vkQueuePresentKHR from Streamline");
             return;
         };
-        let _ = SL_PRESENT.set(present);
         let mut ver: SlFeatureVersion = unsafe { std::mem::zeroed() };
         ver.base = SlBase::new(SL_FEATURE_VERSION, 1);
         let ngx = if unsafe { (s.version)(SL_FEATURE_DLSS, &mut ver) } == SL_OK { format!(", NGX DLSS {}.{}.{}", ver.ngx[0], ver.ngx[1], ver.ngx[2]) } else { String::new() };
-        DLSS_READY.store(true, Relaxed);
-        crate::info!("upscaler: DLSS ready in {:.2} s (Streamline {}.{}.{}{ngx})", t0.elapsed().as_secs_f32(), ver.sl[0], ver.sl[1], ver.sl[2]);
+        // (Ready before its present is published: the first present through Streamline then
+        // finds DLSS ready, and `note_sl_present` logs it in use; the review of 2026-11-25.)
+        DLSS_READY.store(true, SeqCst);
+        crate::info!("upscaler: DLSS ready in {:.2} s (Streamline {}.{}.{}{ngx}): in use from the first present through Streamline", t0.elapsed().as_secs_f32(), ver.sl[0], ver.sl[1], ver.sl[2]);
+        let _ = SL_PRESENT.set(present);
     });
     if let Err(e) = spawned {
         fail(Kind::Dlss, format!("no thread for its start ({e})"));
@@ -1541,8 +1860,15 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let extent = SlExtent { top: 0, left: 0, width: inp.in_width, height: inp.in_height };
     let out_extent = SlExtent { top: 0, left: 0, width: inp.width, height: inp.height };
     let (frame_token, set_constants, evaluate) = (s.frame_token, s.set_constants, s.evaluate);
+    // Recorded into the command buffer the deferred list is played into (`cb`), not the one it was
+    // recorded for (`cmd`): a batch fused into an earlier one's buffer at submission plays there,
+    // and its own buffer is never begun. Until 2026-11-25 the upscalers recorded into `cmd`: with
+    // DLSS (NGX 310.9.16) on, runs whose batches were fused hit an access violation inside the
+    // driver (a write through a null object at 0x10) within seconds, from DLSS's own recording
+    // (the frames of `exception::veh_body`'s first-chance line); unfused, the commands were in
+    // the right buffer by chance.
     unsafe {
-        super::vk::defer::external(cmd, Box::new(move |_| {
+        super::vk::defer::external(cmd, Box::new(move |cb| {
             static N_TOKEN: AtomicU32 = AtomicU32::new(0);
             static N_CONST: AtomicU32 = AtomicU32::new(0);
             static N_OPT: AtomicU32 = AtomicU32::new(0);
@@ -1566,7 +1892,7 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
             let tag = |i: usize, ty: u32| SlResourceTag { base: SlBase::new(SL_RESOURCE_TAG, 1), resource: &res[i], ty, lifecycle: SL_VALID_UNTIL_EVALUATE, extent: if i == 3 { out_extent } else { extent } };
             let tags = [tag(0, SL_DEPTH), tag(1, SL_MOTION_VECTORS), tag(2, SL_SCALING_INPUT_COLOR), tag(3, SL_SCALING_OUTPUT_COLOR)];
             let inputs: [*const SlBase; 5] = [&viewport.base, &tags[0].base, &tags[1].base, &tags[2].base, &tags[3].base];
-            let r = evaluate(SL_FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, cmd);
+            let r = evaluate(SL_FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, cb);
             EVAL_OK.store(r == SL_OK, Relaxed);
             if r != SL_OK {
                 warn_some(&N_EVAL, "slEvaluateFeature (DLSS)", r);
@@ -1975,11 +2301,14 @@ fn fsr_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let (ctx, dispatch) = (s.ctx, f.dispatch);
     drop(st);
     unsafe {
-        super::vk::defer::external(cmd, Box::new(move |_| {
+        // (Into the command buffer the deferred list is played into, `cb`: see `dlss_record`.)
+        super::vk::defer::external(cmd, Box::new(move |cb| {
             static N: AtomicU32 = AtomicU32::new(0);
             let mut c = ctx as FfxContext;
-            // (The whole description: a closure naming only `d.header`
-            // would capture just those 16 bytes.)
+            // (The whole description, its command buffer the one played into: a closure naming
+            // only `d.header` would capture just those 16 bytes.)
+            let mut d = d;
+            d.command_list = cb;
             let desc: *const FfxHeader = (&d as *const FfxDispatchUpscale).cast();
             let r = dispatch(&mut c, desc);
             EVAL_OK.store(r == FFX_OK, Relaxed);

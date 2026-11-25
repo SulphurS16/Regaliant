@@ -35,7 +35,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
-    HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData, HidP_GetCaps,
+    HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid, HidD_GetPreparsedData, HidD_GetProductString, HidP_GetCaps,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile};
@@ -396,7 +396,10 @@ fn open_device(path: &[u16]) -> Result<Option<Device>, ()> {
         if !got {
             return Err(());
         }
-        let Some(&(_, model, name)) = KNOWN.iter().find(|k| a.VendorID == SONY && a.ProductID == k.0) else { return Err(()) };
+        let Some(&(_, model, name)) = KNOWN.iter().find(|k| a.VendorID == SONY && a.ProductID == k.0) else {
+            note_other(path, a.VendorID, a.ProductID);
+            return Err(());
+        };
         let read = CreateFileW(path.as_ptr(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, std::ptr::null_mut());
         if read == INVALID_HANDLE_VALUE {
             // Another program holds it alone (DS4Windows with HidHide, for one): asked again
@@ -453,6 +456,86 @@ fn open_device(path: &[u16]) -> Result<Option<Device>, ()> {
             threads: Mutex::new(Vec::new()),
         }))
     }
+}
+
+/// Game controllers found that are not read here (`note_other`), for the summary.
+static OTHER_PADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// A HID device that is no PlayStation controller this port knows: when it is a game controller
+/// (a joystick or gamepad collection), said once with its ids and name and how it is (not) read,
+/// so a player's log tells an unsupported controller from none at all.
+fn note_other(path: &[u16], vid: u16, pid: u16) {
+    unsafe {
+        let h = CreateFileW(path.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut());
+        if h == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut pp = 0isize;
+        let mut caps: HIDP_CAPS = std::mem::zeroed();
+        let ok = HidD_GetPreparsedData(h, &mut pp) && HidP_GetCaps(pp, &mut caps) == HIDP_STATUS_SUCCESS;
+        if pp != 0 {
+            HidD_FreePreparsedData(pp);
+        }
+        if !ok || caps.UsagePage != 0x01 || (caps.Usage != 0x04 && caps.Usage != 0x05) {
+            CloseHandle(h);
+            return;
+        }
+        let mut buf = [0u16; 128];
+        let named = HidD_GetProductString(h, buf.as_mut_ptr().cast(), (buf.len() * 2) as u32);
+        CloseHandle(h);
+        let product = if named { String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]) } else { String::new() };
+        let what = if product.trim().is_empty() { format!("{vid:04x}:{pid:04x}") } else { format!("{vid:04x}:{pid:04x} '{}'", product.trim()) };
+        let how = match vid {
+            0x045E => "an Xbox controller, read through XInput",
+            SONY => "a Sony controller this port does not know, not read",
+            _ => "not read: Xbox and PlayStation controllers are; Steam Input can make others an Xbox controller for the games Steam starts",
+        };
+        crate::info!("controller: game controller {what} found: {how}");
+        OTHER_PADS.lock().push(what);
+    }
+}
+
+/// The running programs among `names` (executable names, compared without case).
+fn running(names: &[&str]) -> Vec<String> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let mut out: Vec<String> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e) != 0;
+        while ok {
+            let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            let exe = String::from_utf16_lossy(&e.szExeFile[..n]);
+            if names.iter().any(|w| w.eq_ignore_ascii_case(&exe)) && !out.iter().any(|o| o.eq_ignore_ascii_case(&exe)) {
+                out.push(exe);
+            }
+            ok = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// Once, a minute into the session: when no controller was seen at all (no XInput controller
+/// connected, no PlayStation controller found), what Windows offered instead and the running
+/// programs that commonly hide or translate controllers (a player's report of a controller that
+/// "stopped working", 2026-11-24, whose log said nothing about it).
+fn summarize_none_seen() {
+    if crate::input::SYSTEM_OFF.load(Relaxed) || crate::input::XINPUT_SEEN.load(Relaxed) || COUNT.load(Relaxed) > 0 {
+        return;
+    }
+    let hid = hid_paths().len();
+    let others = OTHER_PADS.lock().clone();
+    let tools = running(&["DS4Windows.exe", "DSX.exe", "DualSenseX.exe", "x360ce.exe", "Steam.exe"]);
+    crate::info!(
+        "controller: none seen in the first minute: no XInput controller in its 4 slots, no PlayStation controller among {hid} HID devices; other game controllers: {}; programs that hide or translate controllers running: {}",
+        if others.is_empty() { "none".to_string() } else { others.join(", ") },
+        if tools.is_empty() { "none".to_string() } else { tools.join(", ") }
+    );
 }
 
 /// The HID devices present now (their paths, NUL-terminated).
@@ -558,8 +641,14 @@ fn start_watcher() {
     }
     crate::info!("controller: looking for PlayStation controllers (Windows' HID, USB and Bluetooth) every 1.5 s");
     let _ = std::thread::Builder::new().name("pad-watcher".into()).spawn(|| {
+        let started = std::time::Instant::now();
+        let mut summarized = false;
         loop {
             scan();
+            if !summarized && started.elapsed() >= Duration::from_secs(60) {
+                summarized = true;
+                summarize_none_seen();
+            }
             std::thread::sleep(Duration::from_millis(1500));
         }
     });

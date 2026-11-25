@@ -228,6 +228,7 @@ fn run() -> Result<(), String> {
     gpu::precompile::set_store(shaders.join("shader-specs.txt"));
     gpu::capture::init_from_env();
     info!("Linux whole-run recording: {}", gpu::par::whole_run());
+    info!("Linux recording quick wins: tsc={} static_bind={}", gpu::record_opts::tsc(), gpu::record_opts::static_bind());
     if offscreen { gpu::tune::set("headless_present", 0); }
     if !headless && !load_only {
         // SDL instance extensions and surfaces must be obtained on this thread, before HLE
@@ -338,7 +339,8 @@ fn run() -> Result<(), String> {
             let [upload_bytes, writeback_bytes, upload_runs] = gpu::fe2::traffic_counters();
             let [uffd_takes, uffd_scans, uffd_pages, uffd_ns, _, uffd_errors, _] = platform::write_watch::counters();
             let [dirty_pages, unarmable_pages] = gpu::resident::dirty_counters();
-            info!("Linux heartbeat: {seconds}s flips={} submits={} draws={} dispatches={} recovered_faults={} direct_faults={} kernel_io_retries={} upload_bytes={upload_bytes} writeback_bytes={writeback_bytes} upload_runs={upload_runs} dirty_pages={dirty_pages} unarmable_pages={unarmable_pages} uffd_takes={uffd_takes} uffd_scans={uffd_scans} uffd_pages={uffd_pages} uffd_ns={uffd_ns} uffd_errors={uffd_errors}",
+            let [kernel_read_shorts, kernel_read_eof, kernel_read_errors] = mem::KERNEL_READ_STATUS.each_ref().map(|v| v.load(Relaxed));
+            info!("Linux heartbeat: {seconds}s flips={} submits={} draws={} dispatches={} recovered_faults={} direct_faults={} kernel_io_retries={} kernel_read_shorts={kernel_read_shorts} kernel_read_eof={kernel_read_eof} kernel_read_errors={kernel_read_errors} upload_bytes={upload_bytes} writeback_bytes={writeback_bytes} upload_runs={upload_runs} dirty_pages={dirty_pages} unarmable_pages={unarmable_pages} uffd_takes={uffd_takes} uffd_scans={uffd_scans} uffd_pages={uffd_pages} uffd_ns={uffd_ns} uffd_errors={uffd_errors}",
                 gpu::FRAMES.load(Relaxed), gpu::SUBMITS.load(Relaxed), gpu::cp::DRAWS.load(Relaxed), gpu::cp::DISPATCHES.load(Relaxed),
                 platform::signals::RECOVERED.load(Relaxed), platform::signals::DIRECT.load(Relaxed), mem::KERNEL_IO[1].load(Relaxed));
             if !headless && reported % 3 == 0 && std::env::var("DS_LINUX_INTERVAL_SHOTS").ok().as_deref() != Some("0") {
@@ -380,7 +382,34 @@ pub const EXIT_NO_GPU:u32=11;
 pub const EXIT_MEMORY:u32=7;
 pub fn keep_run(reason:&str){warn!("retaining Linux run diagnostics: {reason}");}
 pub fn no_gpu_exit(reason:&str)->!{fatal_exit(EXIT_NO_GPU,reason)}
-pub fn hung(why:&str,code:i32)->!{fatal_exit(code as u32,why)}
+/// SDL Ctrl+F10: keep the window responsive while gathering thread evidence.
+pub(crate) fn stacks_hotkey() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    if BUSY.swap(true, Ordering::SeqCst) { return; }
+    let spawned = std::thread::Builder::new().name("stacks-hotkey".into()).spawn(|| {
+        let result = (|| -> std::io::Result<()> {
+            let root = run_dir().ok_or_else(|| std::io::Error::other("no run directory"))?;
+            let dir = root.join(format!("threads-{}", SERIAL.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir)?;
+            platform::hang::dump(&dir, "Ctrl+F10 thread report")?;
+            info!("Ctrl+F10: thread waits, stack samples and mappings in {}", dir.display());
+            Ok(())
+        })();
+        if let Err(e) = result { warn!("Ctrl+F10 thread report: {e}"); }
+        BUSY.store(false, Ordering::SeqCst);
+    });
+    if spawned.is_err() { BUSY.store(false, Ordering::SeqCst); }
+}
+
+pub fn hung(why:&str,code:i32)->!{
+    if let Some(dir) = run_dir() {
+        if let Err(e) = platform::hang::dump(dir, why) { eprintln!("hang evidence: {e}"); }
+    }
+    gpu::pcache::clear_crash_suspects_keep_inflight();
+    fatal_exit(code as u32,why)
+}
 
 #[cfg(test)]
 mod linux_shutdown_tests {

@@ -46,3 +46,10 @@ pub fn save_root(path: std::path::PathBuf) -> std::path::PathBuf { path }
 
 pub fn prepare_kernel_io(_base:u64,_len:u64,_into_guest:bool) {}
 pub fn is_memory_fault(e: &std::io::Error) -> bool { matches!(e.raw_os_error(),Some(998|1784)) }
+
+// Windows retains its existing retry-based kernel-I/O path.
+pub fn with_kernel_io_pages<T>(base: u64, len: u64, into_guest: bool, op: impl FnOnce() -> T) -> T {
+    prepare_kernel_io(base, len, into_guest);
+    op()
+}
+pub fn note_kernel_read(_base: u64, _len: u64, _offset: u64, _result: &std::io::Result<usize>, _what: &dyn Fn() -> String) {}

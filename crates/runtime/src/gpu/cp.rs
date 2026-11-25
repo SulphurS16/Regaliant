@@ -1405,9 +1405,9 @@ fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
                     h.pop_front();
                 }
                 h.push_back((Instant::now(), value));
-                LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
             }
         }
+        LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
     }
     {
         let mut g = LAST_WRITE.lock();
@@ -1438,6 +1438,23 @@ struct ActiveWait {
 }
 
 static ACTIVE_WAITS: parking_lot::Mutex<Vec<ActiveWait>> = parking_lot::Mutex::new(Vec::new());
+/// Linux watchdog: bounded registry read, no guest memory dereference or driver call.
+#[cfg(target_os = "linux")]
+pub fn hang_waits() -> String {
+    let mut out = String::new();
+    if let Some(waits) = ACTIVE_WAITS.try_lock() {
+        out.push_str(&format!("active label waits: {}\n", waits.len()));
+        for w in waits.iter() {
+            out.push_str(&format!("addr={:#x} wide={} func={} mask={:#x} ref={:#x} latched={}\n",
+                w.addr, w.wide, w.func, w.mask, w.reference, w.hit.load(Ordering::Acquire)));
+        }
+    } else { out.push_str("active label wait registry busy\n"); }
+    if let Some(states) = STATE.try_lock() {
+        for (q, state) in states.iter() { out.push_str(&format!("{q}: {state}\n")); }
+    } else { out.push_str("CP state registry busy\n"); }
+    out
+}
+
 /// Blocking waits in progress (cheap check before taking the lock).
 static ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1518,9 +1535,9 @@ pub(super) fn gpu_label_written(queue: &str, addr: u64, value: u64, bytes: u8) {
                     h.pop_front();
                 }
                 h.push_back((Instant::now(), value));
-                LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
             }
         }
+        LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
     }
     let mut woke: Vec<u64> = Vec::new();
     {
@@ -7576,6 +7593,8 @@ impl Cp {
         // game, 2026-11-23: compute queue 0x48 waited for 0xa20 with the counter at 0xa84).
         let counter_gen = std::cell::Cell::new(u64::MAX);
         let counter_moved = std::cell::Cell::new(false);
+        let history_moved = std::cell::Cell::new(false);
+        let submitted_at = self.submitted_at;
         let r = self.poll_until_wake(
             at,
             &what,
@@ -7583,13 +7602,19 @@ impl Cp {
                 hit.load(Ordering::SeqCst)
                     || compare(func, read() & mask, reference & mask)
                     || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
-                    || (func & 7 == 3 && {
+                    || {
                         let g = LABEL_WRITES_GEN.load(Ordering::Acquire);
-                        counter_gen.replace(g) != g && counter_passed(a, wide, func, mask, reference) && {
-                            counter_moved.set(true);
-                            true
+                        counter_gen.replace(g) != g && {
+                            // A write can land between the first missed_write check and
+                            // ACTIVE_WAITS registration, then be reset. Recheck history,
+                            // not only counters: a 0/1 flag is deliberately no counter.
+                            let missed = submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since));
+                            history_moved.set(missed);
+                            let counter = !missed && counter_passed(a, wide, func, mask, reference);
+                            counter_moved.set(counter);
+                            missed || counter
                         }
-                    })
+                    }
             },
             &mut work,
             (gpu_label && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
@@ -7625,6 +7650,9 @@ impl Cp {
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 kind = b'P';
                 self.last_wait_epoch = epoch;
+            } else if history_moved.get() {
+                MISSED.fetch_add(1, Ordering::Relaxed);
+                kind = b'M';
             } else if counter_moved.get() {
                 if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                     crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed while waiting: the counter is at {:#x}", self.name, read());
@@ -7934,6 +7962,26 @@ mod tests {
         let h = g.get_or_insert_with(HashMap::new).entry(addr).or_default();
         h.clear();
         h.extend(values.iter().map(|&v| (Instant::now(), v)));
+    }
+
+    #[test]
+    fn late_flag_write_between_check_and_registration_is_observable() {
+        let addr = 0x39003900;
+        WAITED.lock().get_or_insert_with(HashSet::new).insert(addr);
+        let since = Instant::now();
+        assert!(!missed_write(addr, false, 3, u32::MAX as u64, 1, since));
+        // No active waiter yet; the GPU writes and the title resets the word.
+        gpu_label_written("test-late-flag", addr, 1, 4);
+        assert!(missed_write(addr, false, 3, u32::MAX as u64, 1, since));
+        assert!(!counter_passed(addr, false, 3, u32::MAX as u64, 1));
+        // A second submission must not consume the earlier frame's flag. A repeated
+        // write refreshes the time AND generation so its poll sees this frame's write.
+        let later = Instant::now();
+        assert!(!missed_write(addr, false, 3, u32::MAX as u64, 1, later));
+        let before = LABEL_WRITES_GEN.load(Ordering::Acquire);
+        gpu_label_written("test-late-flag", addr, 1, 4);
+        assert!(LABEL_WRITES_GEN.load(Ordering::Acquire) > before);
+        assert!(missed_write(addr, false, 3, u32::MAX as u64, 1, later));
     }
 
     /// Equality waits on frame counters that moved on pass; waits on flags,

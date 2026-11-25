@@ -38,7 +38,15 @@ fn mode() -> u8 {
 fn decide() -> u8 {
     if MODE.compare_exchange(UNDECIDED, DECIDING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         crate::mem::reserve_guest_range_early();
-        let m = if env_is_system() { SYSTEM } else { MIMALLOC };
+        // (Without the guest range the start ends at status 10 (`main`): Windows' heap then, so
+        // mimalloc's segments, hinted into 2-6 TiB, do not appear in the report as the holder.
+        // Should main's later attempt succeed, the session runs on it: `name` says so in the
+        // log's first line.)
+        let for_range = !crate::mem::guest_range_reserved();
+        if for_range {
+            SYSTEM_FOR_RANGE.store(true, Ordering::Relaxed);
+        }
+        let m = if env_is_system() || for_range { SYSTEM } else { MIMALLOC };
         MODE.store(m, Ordering::Release);
         return m;
     }
@@ -56,9 +64,13 @@ fn env_is_system() -> bool {
     crate::mem::env_is("DS_ALLOC", "system")
 }
 
+/// Windows' heap was chosen because the guest range was not reserved at the first allocation.
+static SYSTEM_FOR_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Which heap is in use (status line).
 pub fn name() -> &'static str {
     match MODE.load(Ordering::Acquire) {
+        SYSTEM if SYSTEM_FOR_RANGE.load(Ordering::Relaxed) => "Windows heap (the guest range was held at the first allocation, reserved later: slower)",
         SYSTEM => "Windows heap (DS_ALLOC=system)",
         _ => "mimalloc",
     }

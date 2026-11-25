@@ -49,7 +49,8 @@ pub fn choice() -> Kind { Kind::Off }
 pub fn set_choice(_v: &str) {}
 pub fn active() -> bool { false }
 pub fn last_eval_ok() -> bool { false }
-pub fn is_ready(_name: &str) -> bool { false }
+pub fn pin_taa(_why: &'static str) {}
+pub fn note_sl_present() {}
 pub fn offered(_name: &str) -> bool { false }
 pub fn choices() -> Vec<(String, String)> { Vec::new() }
 pub fn render_scale() -> f32 { 1.0 }
@@ -61,3 +62,7 @@ pub fn device_created(_instance: &ash::Instance, _pdev: vk::PhysicalDevice, _dev
 pub fn present_hook() -> Option<vk::PFN_vkQueuePresentKHR> { None }
 pub fn record(_cmd: vk::CommandBuffer, _inp: &Inputs) -> bool { false }
 pub fn set_jitter_scale(_x: f32, _y: f32) {}
+
+#[path = "../../gpu/upscale_view.rs"]
+mod view;
+pub use view::{main_view, SMALL_VIEWS};

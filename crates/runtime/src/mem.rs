@@ -995,7 +995,41 @@ pub fn reserve_guest_range_early() {
     if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
+    // (Something taking part of the range while the process starts may let go of it soon, e.g.
+    // a module another program puts into every process, in its own setup: the first call tries
+    // again for up to a second (issue #15, 2026-11-25: a player's every shader preparation ended
+    // at status 10). Here, at the first allocation and before the heap is chosen: a retry after
+    // it would meet the heap's own memory, mimalloc's segments are hinted into 2-6 TiB (the
+    // review of 2026-11-25). Sleeping allocates nothing.)
+    static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let tries = if TRIED.swap(true, std::sync::atomic::Ordering::AcqRel) { 1 } else { 11 };
+    for i in 0..tries {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        reserve_guest_range_once();
+        if RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+    }
+}
+
+/// Whether the guest range is reserved (`reserve_guest_range_early`): the heap uses Windows'
+/// own when it is not, so a failed start's report names only what really holds the range.
+pub fn guest_range_reserved() -> bool {
+    RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// One attempt at the whole range (`reserve_guest_range_early`).
+fn reserve_guest_range_once() {
     let size = (GUEST_END - GUEST_BASE) as usize;
+    // (`DS_SIM_OCCUPIED=1`, a test: 64 KiB of the range taken first, as another program's
+    // module or memory took part of it on a player's PC (issue #15): the start then ends with
+    // status 10, naming the region.)
+    if env_is("DS_SIM_OCCUPIED", "1") {
+        unsafe { VirtualAlloc((GUEST_BASE + 0x1000_0000) as _, 0x1_0000, MEM_RESERVE, PAGE_NOACCESS) };
+        crate::platform::memory_diagnostics::sim_module();
+    }
     // Section-backed guest memory (no write watching: views have none).
     if env_is("DS_SECTIONS", "1") && crate::sections::reserve(GUEST_BASE, size as u64, DMEM_SIZE, ANON_SIZE).is_ok() {
         RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
@@ -1721,7 +1755,7 @@ fn take_written_census(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> 
     use std::sync::atomic::Ordering::Relaxed;
     if crate::sections::on() {
         let inflight = InFlight::new();
-        let t = std::time::Instant::now();
+        let t = crate::gpu::record_opts::Timer::start();
         let r = crate::gpu::resident::take_written(base, size, out);
         let ns = t.elapsed().as_nanos() as u64;
         ww_note(who, size.div_ceil(4096), ns, out.is_empty(), inflight.others);
@@ -1754,7 +1788,7 @@ fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
                 if view_window(a) {
                     // (Views have no write watching: their pages are armed
                     // through the host and faults tell their writes.)
-                    let (first, t) = (out.len(), std::time::Instant::now());
+                    let (first, t) = (out.len(), crate::gpu::record_opts::Timer::start());
                     crate::gpu::resident::take_written(a, e - a, out)?;
                     VIEW_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     VIEW_STATS[5].fetch_add((out.len() - first) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1816,7 +1850,7 @@ pub fn query_written(lo: u64, hi: u64) -> Option<(u64, u64)> {
 fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let inflight = InFlight::new();
-    let t = std::time::Instant::now();
+    let t = crate::gpu::record_opts::Timer::start();
     let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 256];
     let mut at = lo;
     if crate::gpu::tune::ww_probe() {
@@ -1862,26 +1896,56 @@ fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
 /// Reserves the whole guest range (`reserve_guest_range_early`). Must run
 /// before anything else allocates widely.
 pub fn reserve_guest_range() -> Result<(), String> {
+    // (Tried again for up to a second at the first allocation: `reserve_guest_range_early`.)
     reserve_guest_range_early();
     if !RESERVED_EARLY.load(std::sync::atomic::Ordering::Acquire) {
         let err = last_error();
-        // Find what occupies the range for a useful diagnostic.
+        // Find what occupies the range for a useful diagnostic: each region's kind and, for a
+        // module or a mapped file, its file (it names the program that put it there).
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let mut addr = GUEST_BASE;
         let mut busy = Vec::new();
+        let mut private = false;
         while addr < GUEST_END {
             let n = unsafe { VirtualQuery(addr as _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
             if n == 0 {
                 break;
             }
-            if info.State != MEM_FREE {
-                busy.push(format!("{:#x}+{:#x}", info.BaseAddress as u64, info.RegionSize));
+            if info.State != MEM_FREE && info.Type != MEM_IMAGE && info.Type != MEM_MAPPED {
+                private = true;
+            }
+            if info.State != MEM_FREE && busy.len() < 16 {
+                let kind = match info.Type {
+                    0x0100_0000 => "a module",
+                    MEM_MAPPED => "a mapped file",
+                    _ => "private memory",
+                };
+                let file = crate::platform::files::mapped_file_name(info.BaseAddress as u64);
+                let file = if file.is_empty() { file } else { format!(" {}", users_folder_hidden(&crate::log::redact(&file))) };
+                busy.push(format!("{:#x}+{:#x} {kind}{file}", info.BaseAddress as u64, info.RegionSize));
             }
             addr = info.BaseAddress as u64 + info.RegionSize as u64;
         }
-        return Err(format!("reserving guest range failed (error {err}); occupied: {busy:?}"));
+        // (Private memory names no owner: the modules other programs put into this process
+        // before it reserved the range are its likely owners, issue #15. Listed only then: a
+        // module or mapped file names its own, and a bystander listed beside it would be blamed;
+        // the review of 2026-11-25 evening.)
+        let others = if private { crate::platform::memory_diagnostics::foreign_modules() } else { Vec::new() };
+        let others = if others.is_empty() { String::new() } else { format!("; private memory names no owner, other programs' modules loaded then: {}", others.join(", ")) };
+        return Err(format!("reserving guest range failed (error {err}); occupied: {}{others}", busy.join("; ")));
     }
     Ok(())
+}
+
+/// `path` with the folder after `\Users\` shown as `<user>`: a mapped file's name comes as a
+/// device path (`\Device\HarddiskVolumeN\...`), which the log's own rule for the profile folder
+/// does not meet (the review of 2026-11-25).
+pub(crate) fn users_folder_hidden(path: &str) -> String {
+    let low = path.to_ascii_lowercase();
+    let Some(i) = low.find("\\users\\") else { return path.to_string() };
+    let start = i + "\\users\\".len();
+    let end = path[start..].find('\\').map_or(path.len(), |j| start + j);
+    format!("{}<user>{}", &path[..start], &path[end..])
 }
 
 /// Host memory calls for guest mappings in the profile window
@@ -2220,7 +2284,6 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
     use std::sync::atomic::Ordering::Relaxed;
     // Mirror mode: no-access pages with GPU-written dwords first.
     crate::gpu::resident::release_range(base, len);
-    crate::platform::file_hooks::prepare_kernel_io(base, len, into_guest);
     const TRIES: u32 = 8;
     let mut tries = 0;
     let traced = crate::gpu::fe2::traced(base & !4095, base.saturating_add(len));
@@ -2228,7 +2291,7 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
         if let Some(p) = traced {
             crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it begins (try {tries}, into guest {into_guest}): {} ({base:#x}+{len:#x})", what()));
         }
-        let r = op();
+        let r = crate::platform::file_hooks::with_kernel_io_pages(base, len, into_guest, &mut op);
         if let Some(p) = traced {
             crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it ended (try {tries}): {}", if r.is_ok() { "ok".to_string() } else { format!("{:?}", r.as_ref().err().and_then(|e| e.raw_os_error())) }));
         }
@@ -2249,7 +2312,6 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
                 crate::hostcensus::release(base, len);
                 crate::gpu::fe2::c4_release_sync(base, len, false);
                 crate::hosted::disarm(base, len);
-                crate::platform::file_hooks::prepare_kernel_io(base, len, into_guest);
                 std::thread::sleep(std::time::Duration::from_millis(1 << tries.min(5)));
                 continue;
             }
@@ -2262,6 +2324,40 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
         }
         return r;
     }
+}
+
+/// [positive short syscalls, EOF results, terminal read errors].
+pub static KERNEL_READ_STATUS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A positional file read into guest memory. Short successful reads advance both the
+/// destination and file offset; EFAULT retries repeat only the unfinished suffix. EOF is
+/// returned as a short total (APR requires the full total; ordinary reads may return EOF).
+pub fn kernel_read_at(what: &dyn Fn(u64) -> String, buf: &mut [u8], offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>) -> std::io::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        let at = offset.checked_add(done as u64).ok_or_else(|| std::io::Error::other("file offset overflow"))?;
+        let base = buf.as_ptr() as u64 + done as u64;
+        let len = buf.len() - done;
+        let label = || what(done as u64);
+        let result = kernel_io(&label, base, len as u64, true, || read(&mut buf[done..], at));
+        crate::platform::file_hooks::note_kernel_read(base, len as u64, at, &result, &label);
+        match result {
+            Ok(0) => { KERNEL_READ_STATUS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); break; }
+            Ok(n) if n <= len => {
+                if n < len { KERNEL_READ_STATUS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                done += n;
+            }
+            Ok(_) => return Err(std::io::Error::other("file read exceeded destination")),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                KERNEL_READ_STATUS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::warn!("{}: file read failed after {done} of {} bytes: {e}", what(done as u64), buf.len());
+                return Err(e);
+            }
+        }
+    }
+    Ok(done)
 }
 
 /// What guest [base, base+len) looks like now (diagnostics): its mappings,
@@ -3062,6 +3158,26 @@ mod tests {
     use super::*;
 
     /// Cached readable runs survive mapping changes that do not touch them.
+    #[test]
+    fn positional_read_eof_and_error_are_not_full_completion() {
+        let mut out = [0u8; 16];
+        let mut calls = 0;
+        let n = kernel_read_at(&|_| "EOF test".into(), &mut out, 41, |buf, off| {
+            calls += 1;
+            if calls == 1 { assert_eq!(off, 41); buf[..7].fill(0x5a); Ok(7) }
+            else { assert_eq!(off, 48); Ok(0) }
+        }).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(&out[..7], &[0x5a; 7]);
+        assert_eq!(&out[7..], &[0; 9]);
+        calls = 0;
+        let r = kernel_read_at(&|_| "error test".into(), &mut out, 0, |_, off| {
+            calls += 1;
+            if calls == 1 { Ok(7) } else { assert_eq!(off, 7); Err(std::io::Error::other("read failed")) }
+        });
+        assert!(r.is_err());
+    }
+
     #[test]
     fn readable_runs_survive_unrelated_changes() {
         let g0 = MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);

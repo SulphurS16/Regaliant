@@ -195,6 +195,12 @@ fn modes_checked_on(vendor: u32, device: u32) -> bool {
     vendor == 0x10de && (device < 0x2b80 || cfg!(target_os = "linux"))
 }
 
+// Subgroup control flow and floating-point preservation are independent policies. Linux
+// validates NVIDIA subgroup modes even on Blackwell; that must not disable its NaN guard.
+fn nan_preserve_default(vendor: u32, device: u32) -> bool {
+    vendor != 0x10de || device >= 0x2b80
+}
+
 /// Translated shaders declare maximal reconvergence (`exec::module_code`); set when the device is
 /// made.
 static MAX_RECONV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -211,6 +217,32 @@ static MAX_RECONV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// `DS_MAX_RECONV=1` / `0` forces it on or off where the device offers it.
 pub fn max_reconvergence() -> bool {
     MAX_RECONV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Translated shaders declare SignedZeroInfNanPreserve (`exec::module_code`); set when the device
+/// is made, with the widths the device allows (bit 0: 16, bit 1: 32, bit 2: 64).
+static NAN_PRESERVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether every translated shader declares `SignedZeroInfNanPreserve` (SPV_KHR_float_controls).
+/// Without it Vulkan lets a compiler assume that no value is a NaN or an infinity and ignore the
+/// sign of zero, so it may fold an `OpIsNan` or `OpIsInf` to false. The translation relies on
+/// them where the console's hardware does: a vertex whose position has a NaN or infinite
+/// component is moved outside the clip volume so that its primitive is dropped, as the console's
+/// clipper drops it (the title's instancing gives unused instance slots NaN positions;
+/// `translate::mem`'s position export), and v_cmp_class tests classes. On the RTX 40 series the
+/// tests held without the declaration; before that guard the RTX 4090 drew those primitives as
+/// streaks across the tutorial's opening tunnel, and on the RTX 50 series (driver 621.24 and
+/// 621.35) players see that tunnel black with "vertex explosions" (issues #4 and #6, 2026-11-24):
+/// on Blackwell, AMD and Intel (`nan_preserve_default`) shaders declare it
+/// since then, for the widths the device allows (the RTX 4090 and 5090 report all three).
+/// `DS_NAN_PRESERVE=1` / `0` forces it on or off where the device allows it.
+pub fn nan_preserve() -> bool {
+    NAN_PRESERVE.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0
+}
+
+/// The widths `nan_preserve` declares (bit 0: 16, bit 1: 32, bit 2: 64).
+pub fn nan_preserve_widths() -> u32 {
+    NAN_PRESERVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `DS_MAX_RECONV`: Some(on) when set to 1 or 0.
@@ -403,28 +435,78 @@ fn init_inner() -> Result<(), String> {
                 .pfn_user_callback(Some(debug_cb));
             let _ = du.create_debug_utils_messenger(&mci, None);
         }
-        // Pick a discrete GPU with a graphics+compute queue.
+        // Pick a device the port can use: Vulkan 1.3, a graphics+compute queue and the extensions
+        // it always enables; a native driver before a translation layer's device (Microsoft's
+        // D3D12 one, installed with Windows' compatibility pack, lists every card again, without
+        // push descriptors), then by kind: discrete, integrated, virtual, the CPU's; among
+        // equals the last discrete one, else the first (the old rule; a CPU driver such as
+        // lavapipe passes every check, the second review of 2026-11-25). (Until 2026-11-25 the
+        // last discrete device was taken whatever it offered: a player's RTX 3060 Ti failed with
+        // "vkCreateDevice: Extension specified does not exist", likely such a device.) None
+        // usable: the old rule, and its error.
         let pdevs = instance.enumerate_physical_devices().map_err(|e| format!("enumerate devices: {e}"))?;
-        let mut chosen = None;
+        let mut chosen: Option<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> = None;
+        let mut chosen_rank = i32::MIN;
+        let mut fallback: Option<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties)> = None;
         let mut seen = Vec::new();
         for &pd in &pdevs {
             let props = instance.get_physical_device_properties(pd);
-            seen.push(format!("{} ({:?})", CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy(), props.device_type));
+            let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+            let mut dp = vk::PhysicalDeviceDriverProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut dp);
+            instance.get_physical_device_properties2(pd, &mut p2);
+            let driver = CStr::from_ptr(dp.driver_name.as_ptr()).to_string_lossy().into_owned();
+            let layered = matches!(dp.driver_id, vk::DriverId::MESA_DOZEN | vk::DriverId::MESA_VENUS | vk::DriverId::MOLTENVK);
             let qfs = instance.get_physical_device_queue_family_properties(pd);
-            if let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)) {
-                let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
-                let prefer = if cfg!(target_os = "linux") {
-                    let rank = |p: &vk::PhysicalDeviceProperties| (p.vendor_id == 0x10de, p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU);
-                    chosen.as_ref().is_none_or(|(_, _, previous)| rank(&props) > rank(previous))
-                } else { chosen.is_none() || discrete };
-                if prefer {
-                    chosen = Some((pd, qf as u32, props));
+            let qf = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE));
+            let exts = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
+            let has = |n: &CStr| exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
+            let mut lacks: Vec<String> = Vec::new();
+            if vk::api_version_major(props.api_version) == 1 && vk::api_version_minor(props.api_version) < 3 {
+                lacks.push(format!("Vulkan 1.3 (it offers 1.{})", vk::api_version_minor(props.api_version)));
+            }
+            if qf.is_none() {
+                lacks.push("a graphics and compute queue".into());
+            }
+            for n in [ash::khr::swapchain::NAME, ash::khr::push_descriptor::NAME] {
+                if !has(n) {
+                    lacks.push(n.to_string_lossy().into_owned());
+                }
+            }
+            let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+            seen.push(format!(
+                "{name} ({:?}, driver {driver}{}{})",
+                props.device_type,
+                if layered { ", a translation layer" } else { "" },
+                if lacks.is_empty() { String::new() } else { format!("; lacks {}", lacks.join(", ")) }
+            ));
+            if let Some(qf) = qf {
+                if fallback.is_none() || discrete {
+                    fallback = Some((pd, qf as u32, props));
+                }
+                if lacks.is_empty() {
+                    let kind = match props.device_type {
+                        vk::PhysicalDeviceType::DISCRETE_GPU => 3,
+                        vk::PhysicalDeviceType::INTEGRATED_GPU => 2,
+                        vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
+                        _ => 0,
+                    };
+                    // Preserve Linux's NVIDIA preference among usable native devices.
+                    let rank = if layered { 0 } else { 20 } + kind * 2
+                        + i32::from(cfg!(target_os = "linux") && props.vendor_id == 0x10de);
+                    if rank > chosen_rank || (rank == chosen_rank && discrete) {
+                        chosen_rank = rank;
+                        chosen = Some((pd, qf as u32, props));
+                    }
                 }
             }
         }
         // (Every card Vulkan lists, for a player's report: a laptop with two graphics chips.)
-        crate::info!("Vulkan devices: {} (taken: the last discrete one with a graphics and compute queue, else the first)", seen.join(", "));
-        let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
+        crate::info!(
+            "Vulkan devices: {} (taken: a usable one, a native driver before a translation layer, then discrete, integrated, virtual, the CPU's (Linux prefers NVIDIA within a kind), among equals the last discrete one, else the first; none usable: the last discrete one, else the first)",
+            seen.join(", ")
+        );
+        let (pdev, qf, props) = chosen.or(fallback).ok_or("no Vulkan device with graphics+compute")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
         // (The design decides the translation's subgroup modes: `shaders::plain_modes`.)
         let checked = modes_checked_on(props.vendor_id, props.device_id);
@@ -713,6 +795,54 @@ fn init_inner() -> Result<(), String> {
             (p11.subgroup_size, stages, note)
         };
         crate::info!("{sg_note}");
+        // (What the driver lets a module declare about denormals, signed zeros, infinities, NaNs and
+        // rounding: translated modules declare none of it, so the driver's defaults decide; players'
+        // logs say what their design offers.)
+        {
+            let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p12);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            let b = |x: vk::Bool32| u32::from(x != 0);
+            let widths = b(p12.shader_signed_zero_inf_nan_preserve_float16) | b(p12.shader_signed_zero_inf_nan_preserve_float32) << 1 | b(p12.shader_signed_zero_inf_nan_preserve_float64) << 2;
+            let forced = match std::env::var("DS_NAN_PRESERVE").ok().as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            };
+            // Float preservation is independent of Linux's validated NVIDIA subgroup modes.
+            let preserve_default = nan_preserve_default(props.vendor_id, props.device_id);
+            let on = forced.unwrap_or(preserve_default) && widths & 2 != 0;
+            NAN_PRESERVE.store(if on { widths } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+            crate::info!(
+                "Vulkan: NaN, infinity and signed-zero preservation {} ({}; DS_NAN_PRESERVE=1 or 0 overrides)",
+                if on { "declared by every translated shader" } else { "not declared" },
+                match forced {
+                    Some(_) => "DS_NAN_PRESERVE",
+                    None if !preserve_default => "a design whose float behavior was checked",
+                    None => "explicit float preservation for this design",
+                }
+            );
+            crate::info!(
+                "Vulkan float controls: denormal modes {:?}, rounding modes {:?}; f16/f32/f64: signed zero, inf and NaN preserve {}{}{}, denormal preserve {}{}{}, flush to zero {}{}{}, RTE {}{}{}, RTZ {}{}{}",
+                p12.denorm_behavior_independence,
+                p12.rounding_mode_independence,
+                b(p12.shader_signed_zero_inf_nan_preserve_float16),
+                b(p12.shader_signed_zero_inf_nan_preserve_float32),
+                b(p12.shader_signed_zero_inf_nan_preserve_float64),
+                b(p12.shader_denorm_preserve_float16),
+                b(p12.shader_denorm_preserve_float32),
+                b(p12.shader_denorm_preserve_float64),
+                b(p12.shader_denorm_flush_to_zero_float16),
+                b(p12.shader_denorm_flush_to_zero_float32),
+                b(p12.shader_denorm_flush_to_zero_float64),
+                b(p12.shader_rounding_mode_rte_float16),
+                b(p12.shader_rounding_mode_rte_float32),
+                b(p12.shader_rounding_mode_rte_float64),
+                b(p12.shader_rounding_mode_rtz_float16),
+                b(p12.shader_rounding_mode_rtz_float32),
+                b(p12.shader_rounding_mode_rtz_float64),
+            );
+        }
         if subgroup_size != 32 {
             let left = (vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::GEOMETRY | vk::ShaderStageFlags::FRAGMENT) & !subgroup32;
             if !left.is_empty() {
@@ -861,6 +991,8 @@ fn init_inner() -> Result<(), String> {
         let mut pb_feat = pbin::Features { s_type: pbin::ST_FEATURES, p_next: std::ptr::null_mut(), pipeline_binaries: 1 };
         let mut pb_cache = pbin::CacheControl { s_type: pbin::ST_CACHE_CONTROL, p_next: std::ptr::null(), disable_internal_cache: 1 };
         crate::gpu::upscale::apply_features(&mut features, &mut f11, &mut f12, &mut f13, &up_dev);
+        #[cfg(target_os = "linux")]
+        crate::gpu::framegen::apply_features(&core, &mut features);
         crate::info!("Vulkan enabled extensions: {}", dexts.iter().map(|&p| CStr::from_ptr(p).to_string_lossy()).collect::<Vec<_>>().join(", "));
         crate::info!("Vulkan enabled features: synchronization2={} timelineSemaphore={} dynamicRendering={} bufferDeviceAddress={} subgroupSizeControl={}; queues: {}",
             f13.synchronization2, f12.timeline_semaphore, f13.dynamic_rendering, f12.buffer_device_address, f13.subgroup_size_control,
@@ -2361,6 +2493,12 @@ mod validation_switch_tests {
         assert_eq!(super::modes_checked_on(0x10de, 0x2bb1), cfg!(target_os = "linux"));
         assert!(!super::modes_checked_on(0x1002, 0x744c));
         assert!(!super::modes_checked_on(0x8086, 0x56a0));
+        // Linux NVIDIA subgroup support must not opt Blackwell out of float preservation.
+        assert!(!super::nan_preserve_default(0x10de, 0x2684));
+        assert!(super::nan_preserve_default(0x10de, 0x2b80));
+        assert!(super::nan_preserve_default(0x10de, 0x2bb1));
+        assert!(super::nan_preserve_default(0x1002, 0x744c));
+        assert!(super::nan_preserve_default(0x8086, 0x56a0));
     }
 
     #[test]

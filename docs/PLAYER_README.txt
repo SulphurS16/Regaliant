@@ -89,8 +89,9 @@ The game's SETTINGS screen has a PC tab with the port's settings. Most take effe
   folder, import of a PS5 save.
 - Key Bindings and Controller Bindings: every action's key, mouse button and controller button.
 
-Motion Blur Fix is on by default. It turns the game's motion blur off, so plants and detail
-stay sharp while the camera moves. Off uses the game's own Motion Blur setting.
+Motion Blur Fix is No Blur by default: the game's motion blur is off, so plants and detail
+stay sharp while the camera moves. Game's Blur uses the game's own Motion Blur setting, which
+smears every camera move. Reduced Blur keeps a tenth of it.
 
 DLSS needs one more file. NVIDIA's nvngx_dlss.dll is under NVIDIA's own license and does not
 come with the port. Copy your own into the "upscalers" folder beside regaliant.exe. Games with DLSS

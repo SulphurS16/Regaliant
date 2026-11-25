@@ -14,6 +14,7 @@ pub const MEM_RELEASE: u32 = 0x8000;
 pub const MEM_FREE: u32 = 0x10000;
 pub const MEM_PRIVATE: u32 = 0x20000;
 pub const MEM_MAPPED: u32 = 0x40000;
+pub const MEM_IMAGE: u32 = 0x1000000;
 pub const MEM_WRITE_WATCH: u32 = 0x200000;
 pub const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
 pub const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
@@ -1207,6 +1208,59 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn positional_file_read_completes_after_short_copy_and_efault() {
+        use std::os::fd::{FromRawFd, AsRawFd};
+        use std::os::unix::fs::FileExt;
+        crate::hle::kernel::time::init();
+        unsafe {
+            let fd = libc::memfd_create(c"regaliant-mixed-read-test".as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0);
+            let file = std::fs::File::from_raw_fd(fd);
+            let bytes: Vec<u8> = (0..6 * PAGE + 73).map(|i| (i.wrapping_mul(37) ^ (i >> 9)) as u8).collect();
+            assert_eq!(file.write_at(&bytes, 0).unwrap(), bytes.len());
+            let p = VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let _stack = crate::platform::signals::SignalStack::new().unwrap();
+            std::ptr::write_bytes(p, 0xcc, 8 * PAGE);
+            let reset = || {
+                let mut pages = [std::ptr::null_mut(); 8];
+                let mut n = pages.len();
+                let mut granularity = 0;
+                assert_eq!(GetWriteWatch(1, p, 8 * PAGE, pages.as_mut_ptr(), &mut n, &mut granularity), 0);
+            };
+            reset();
+            // Mixed pages before entry, then force a re-arm between preparation and the
+            // actual syscall. Linux returns a real short count first, then real EFAULT.
+            assert!(write_watch_fault(p as usize));
+            assert!(write_watch_fault(p as usize + 2 * PAGE));
+            let out = std::slice::from_raw_parts_mut((p as *mut u8).add(17), bytes.len());
+            let _write = crate::platform::file_hooks::host_write(out.as_ptr() as u64, out.len() as u64);
+            let mut calls = 0;
+            let mut saw_short = false;
+            let mut saw_fault = false;
+            let n = crate::mem::kernel_read_at(&|_| "mixed-protection file test".into(), out, 0, |buf, offset| {
+                calls += 1;
+                if calls <= 2 {
+                    reset();
+                    if calls == 1 { assert!(write_watch_fault(p as usize)); }
+                }
+                let r = file.read_at(buf, offset);
+                if calls == 1 { saw_short = r.as_ref().is_ok_and(|&n| n > 0 && n < buf.len()); }
+                if calls == 2 { saw_fault = r.as_ref().is_err_and(|e| e.raw_os_error() == Some(libc::EFAULT)); }
+                r
+            }).unwrap();
+            assert!(saw_short && saw_fault && calls >= 3);
+            assert_eq!(n, bytes.len());
+            assert_eq!(out, bytes, "every byte, including offsets after partial copies");
+            assert!(std::slice::from_raw_parts(p.cast::<u8>(), 17).iter().all(|&b| b == 0xcc));
+            assert!(std::slice::from_raw_parts((p as *const u8).add(17 + n), 8 * PAGE - 17 - n).iter().all(|&b| b == 0xcc));
+            assert!(file.as_raw_fd() >= 0);
+            drop(_write);
+            assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+        }
+    }
 
     #[test]
     fn partial_decommit_zeros_only_recommitted_private_pages() {

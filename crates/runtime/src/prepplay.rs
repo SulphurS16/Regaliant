@@ -326,6 +326,13 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
     }
     crate::audio::SILENT.store(true, Relaxed);
     crate::input::SYSTEM_OFF.store(true, Relaxed);
+    // The game's TAA, whatever upscaler the copied settings choose: DLSS's Streamline needs to see
+    // every frame's present and a self-play run presents nothing, and XeSS or FSR would spend GPU
+    // time on frames no one sees. (Until 2026-11-25 a saved upscaler never took effect at a
+    // start, so this did not come up.) The libraries still load as in play: the device must
+    // enable what a play session's does, or the pipeline binaries made here might not be taken
+    // there (`DS_UPSCALER=off` would have loaded none: the review of 2026-11-25).
+    crate::gpu::upscale::pin_taa("a self-play run presents nothing");
     // The self-play's own pacing, whatever the player's Frame Rate Limit (their PC settings are
     // copied: at 30 FPS the levels' frame-counted waits took twice their time, Uncapped would
     // shorten them under what the script asks for). The new game: the title's 59.94 frames a
@@ -371,6 +378,7 @@ pub fn setup(stage: Stage, cfg: &mut crate::Config) {
 /// Linux's CLI parent has already selected and validated an isolated user/cache root.
 #[cfg(target_os = "linux")]
 pub fn setup_linux(stage: Stage, paths: &dsconfig::paths::Paths, store: &Path, progress: PathBuf, threads: usize, chunk: Option<(usize, usize)>) -> Result<(), String> {
+    crate::gpu::upscale::pin_taa("a self-play run presents nothing");
     unsafe {
         crate::set_unless_given("DS_TEXT_HOOK", TEXT_HOOK);
         std::env::set_var("DS_IME_TEXT", NAME);
@@ -391,9 +399,10 @@ pub fn setup_linux(stage: Stage, paths: &dsconfig::paths::Paths, store: &Path, p
 }
 
 /// The self-play's own files made ready (`start`: after the one-session lock, before the settings
-/// and saves are read): the player's PC settings (some choose shader variants: the upscaler, the
-/// Visual Mode), display choices and game folder copied, never their saves, key bindings or
-/// trophies; for a new game, no saves, trophies or title folders of an earlier one.
+/// and saves are read): the player's PC settings (some choose shader variants: the Visual Mode;
+/// the upscaler is the game's TAA here, `upscale::pin_taa`, as it in fact was before 2026-11-25),
+/// display choices and game folder copied, never their saves, key bindings or trophies; for a new
+/// game, no saves, trophies or title folders of an earlier one.
 fn prepare_files(s: &Setup) {
     let paths = &s.own_paths;
     let player = &s.player_paths;
@@ -1402,6 +1411,7 @@ impl Play {
         crate::pcsettings::state_report();
         for (label, seconds, walking) in [("stationary", if diagnostic { 5 } else { 30 }, false),
                                          ("walking", if diagnostic { 5 } else { 60 }, true)] {
+            crate::gpu::framegen::request_dump(); // Only armed by the FG diagnostic relay.
             self.shot(&format!("steady-{label}-before"));
             self.relay_capture_barrier()?;
             // Settle after readback. This sleep is wall time, never game flips.
@@ -1447,6 +1457,7 @@ impl Play {
                 }
             }
             self.measuring = false;
+            crate::gpu::framegen::request_dump();
             self.shot(&format!("steady-{label}-after"));
             self.relay_capture_barrier()?;
             if !diagnostic {

@@ -401,6 +401,8 @@ pub fn translation_fingerprint(src: &dsconfig::zar::Source) -> Result<String, St
     // (Modules declaring maximal reconvergence, `vk::max_reconvergence`, are other code: a store
     // prepared without it is prepared again. Devices without it keep their fingerprints.)
     let fp = if super::vk::max_reconvergence() { (fp ^ 0x4d52_4331).wrapping_mul(0x100_0000_01b3) } else { fp };
+    // (So are modules declaring NaN, infinity and signed-zero preservation, `vk::nan_preserve`.)
+    let fp = if super::vk::nan_preserve() { (fp ^ 0x4e50_5631 ^ super::vk::nan_preserve_widths() as u64).wrapping_mul(0x100_0000_01b3) } else { fp };
     Ok(format!("{fp:016x}-{}-r{PREPARATION_RULES}", items.len()))
 }
 
@@ -456,7 +458,8 @@ pub fn translation_fingerprint_cached(src: &dsconfig::zar::Source, dir: Option<&
     // (Maximal reconvergence changes the fingerprint, `translation_fingerprint`: a key of its own
     // when it is on, the keys without it as they were.)
     let mr = if super::vk::max_reconvergence() { " mr" } else { "" };
-    let key = format!("{build} {} {driver} r{PREPARATION_RULES} {h:016x}{mr}", c.device_name);
+    let np = if super::vk::nan_preserve() { " np" } else { "" };
+    let key = format!("{build} {} {driver} r{PREPARATION_RULES} {h:016x}{mr}{np}", c.device_name);
     let file = dir.map(|d| d.join("fingerprint.txt"));
     if let Some(t) = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) {
         let get = |k: &str| t.lines().find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()));

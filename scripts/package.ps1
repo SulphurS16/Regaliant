@@ -38,6 +38,20 @@ if (-not $NoBuild) {
     & $cargo build --profile dist --locked --target $target -p dsport 2>&1 | ForEach-Object { "$_" }
     $code = $LASTEXITCODE
     if ($code -eq 0) {
+      # The profile must name this build's functions (scripts\pgo.ps1: their symbols' hashes come
+      # from the version), else dsport's own code goes without PGO.
+      $want = Get-Content "$((Resolve-Path $Pgo).Path).unit" -ErrorAction SilentlyContinue | Select-Object -First 1
+      $got = Get-ChildItem (Join-Path $root "target\$target\dist\.fingerprint") -Directory -Filter 'dsport-*' -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'bin-dsport') } |
+        Sort-Object { (Get-Item (Join-Path $_.FullName 'bin-dsport')).LastWriteTime } -Descending |
+        Select-Object -First 1 | ForEach-Object { $_.Name }
+      if (-not $want -or $want -ne $got) {
+        Pop-Location
+        Remove-Item Env:CARGO_ENCODED_RUSTFLAGS
+        Write-Host "the profile names the functions of $(if ($want) { $want } else { 'an unknown build (no .unit file beside it)' }), this build is ${got}: it would go without PGO for dsport's own code (train again after the version change: scripts\pgo.ps1)"
+        exit 1
+      }
+      Write-Host "PGO: the profile names this build's functions ($got)"
       $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]0x1f
       & $cargo build --profile dist --locked --target $target -p launcher 2>&1 | ForEach-Object { "$_" }
       $code = $LASTEXITCODE

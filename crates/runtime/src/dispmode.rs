@@ -156,9 +156,16 @@ fn headless_render() -> u64 {
     let lines = match TITLE_MODE.load(Ordering::Relaxed) {
         m @ 3..=5 => sizes(m).0 .1,
         _ => 1440,
-    } as u64;
+    };
+    let (w, h) = shaped_lines(lines, ow, oh);
+    (w as u64) << 32 | h as u64
+}
+
+/// `lines` (at most `max_lines`) at the output's shape `ow`x`oh`, the width a multiple of 8.
+pub(crate) fn shaped_lines(lines: u32, ow: u32, oh: u32) -> (u32, u32) {
+    let lines = (lines as u64).min(max_lines(ow, oh));
     let w = ((lines as f32 * ow as f32 / oh as f32 / 8.0).round() as u64 * 8).min(7680);
-    w << 32 | lines
+    (w as u32, lines as u32)
 }
 
 /// The Aspect Ratio setting at start: Automatic takes the primary screen's shape when the
@@ -275,14 +282,29 @@ pub extern "sysv64" fn hook_display(regs: *const u64, _arg: u32) {
     }
 }
 
-/// The render size for a window area of `w`x`h` at `pct` percent: 16:9, the height a multiple
-/// of 4 from 360 to 2160, the width the height's 16:9 rounded to a multiple of 4.
+/// The render size for a window area of `w`x`h` at `pct` percent: the output's shape, the height
+/// a multiple of 4 from 360 to `max_lines` (2160, or 1512 at shapes wider than 16:9), the width
+/// the height's at that shape rounded to a multiple of 4.
 pub fn scaled_size(w: u32, h: u32, pct: u32) -> (u32, u32) {
     let (ow, oh) = output_size();
-    // The output's shape fitted to the area, scaled; at most 2160 lines and the 3840x2160
+    scaled_for(w, h, pct, ow, oh)
+}
+
+/// The most lines the title's render targets take at the output's shape: 2160, and at shapes
+/// wider than 16:9 1512 (issue #20: its render-target pool, RTSharedAllocator, is one 687 MiB
+/// block made after the targets at the render and output sizes, from what they leave; at 21:9
+/// and 32:9 a render of 1868 or 2160 lines left less than that and the title stopped on its
+/// out-of-memory assertion, eboot+0x7f9cab, while 1440 to 1524 lines played in: Visual Mode
+/// Cinematic's 2160 lines at those shapes now render as Performance's largest, 1512).
+fn max_lines(ow: u32, oh: u32) -> u64 {
+    if ow as u64 * 9 > oh as u64 * 16 { 1512 } else { 2160 }
+}
+
+fn scaled_for(w: u32, h: u32, pct: u32, ow: u32, oh: u32) -> (u32, u32) {
+    // The output's shape fitted to the area, scaled; at most `max_lines` and the 3840x2160
     // frame's pixels (the most the title's targets were made for).
     let fit_h = (h as u64).min(w as u64 * oh as u64 / ow as u64);
-    let mut fh = (fit_h * pct as u64 / 100).clamp(360, 2160);
+    let mut fh = (fit_h * pct as u64 / 100).clamp(360, max_lines(ow, oh));
     let max_px = 3840u64 * 2160;
     while fh > 360 && fh * fh * ow as u64 / oh as u64 > max_px {
         fh -= 4;
@@ -480,4 +502,28 @@ pub fn status() -> String {
         s += &format!("    output size {}x{} set: mode changes {}, constructor {}, display targets {}, UI canvas {}, size getter {}\n", o >> 32, o as u32, n[0], n[1], n[2], n[3], n[4]);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_shapes_lines() {
+        // Visual Mode at the output's shape: 16:9 and 16:10 keep their lines, wider shapes take
+        // at most 1512 (issue #20: 21:9 and 32:9 at 1440-1524 lines played in, 1868 and 2160
+        // stopped the title on its render-target pool).
+        assert_eq!(shaped_lines(2160, 3840, 2160), (3840, 2160));
+        assert_eq!(shaped_lines(2160, 3456, 2160), (3456, 2160));
+        assert_eq!(shaped_lines(1440, 7680, 2160), (5120, 1440));
+        assert_eq!(shaped_lines(1512, 5120, 2160), (3584, 1512));
+        assert_eq!(shaped_lines(2160, 7680, 2160), (5376, 1512));
+        assert_eq!(shaped_lines(2160, 5120, 2160), (3584, 1512));
+        // Render Scale: 150% of a 3440x1440 window at 21:9, and of a 5120x1440 one at 32:9.
+        assert_eq!(scaled_for(3440, 1440, 150, 5120, 2160), (3584, 1512));
+        assert_eq!(scaled_for(5120, 1440, 150, 7680, 2160), (5376, 1512));
+        // 100% of those windows as before; 16:9 at 150% of 2560x1440 as before (2160 lines).
+        assert_eq!(scaled_for(3440, 1440, 100, 5120, 2160), (3412, 1440));
+        assert_eq!(scaled_for(2560, 1440, 150, 3840, 2160), (3840, 2160));
+    }
 }

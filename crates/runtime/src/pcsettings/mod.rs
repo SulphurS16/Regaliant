@@ -172,8 +172,10 @@ pub fn items() -> Vec<Item> {
         Item {
             id: s("MouseMotionBlur"),
             label: s("Motion Blur Fix"),
-            tooltip: s("On keeps plants sharp while the camera moves. Off uses the game's Motion Blur."),
-            kind: ItemKind::Choice(vec![s("Off"), s("Reduced Blur"), s("On")], 2),
+            // (Named by what each gives: "Off" read as no blur and gave the game's full blur to a
+            // player who saw every camera move smear, issue #6, 2026-11-25. The values stay.)
+            tooltip: s("No Blur keeps plants sharp while the camera moves. Game's Blur uses the game's Motion Blur."),
+            kind: ItemKind::Choice(vec![s("Game's Blur"), s("Reduced Blur"), s("No Blur")], 2),
         },
         Item {
             id: s("MouseSensitivity"),
@@ -231,6 +233,14 @@ pub fn graphics_items() -> Vec<Item> {
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
+        #[cfg(target_os = "linux")]
+        Item {
+            id: s("FrameGeneration"),
+            label: s("Frame Generation (Experimental)"),
+            tooltip: s("FSR3 inserts an intermediate frame at native resolution. Adds latency. Requires the optional Linux FSR3 library and a restart after installing it."),
+            kind: ItemKind::Choice(vec![s("Off"), s("FSR3 2x")], 0),
+        },
+        #[cfg(windows)]
         Item {
             id: s("HdrOutput"),
             label: s("HDR"),
@@ -344,14 +354,19 @@ pub fn apply() {
     convar::want_capped("sunShadowMaxDistance", SHADOW_REACH.get(get("ShadowDistance").unwrap_or(0) as usize).copied().flatten());
     // Anti-Aliasing by its code: the title's TAA, Off (r_aaMethod: EAAMethods::Off 0, TAA 1), or
     // an upscaler in the TAA's place (the TAA stays on: its dispatch is what they replace, its
-    // jitter what they need). A code whose upscaler is not ready here falls back to the TAA.
+    // jitter what they need). The upscaler stays chosen while it is not ready yet: these settings
+    // are first applied at the start, before the device that readies XeSS and FSR, and DLSS on a
+    // thread of its own a second or so after it; the title's TAA runs until then, and for good if
+    // it never is (`upscale::active`). Until 0.1.6 a code whose upscaler was not ready fell back to
+    // the TAA here, which at the start it always was: a saved DLSS, FSR or XeSS never took effect
+    // after a restart, while the menu still showed it (players' "DLSS not working", 2026-11-25).
     let aa = store::raw_value("Setting_PC_AntiAliasing").unwrap_or(AA_TAA);
     convar::want("r_aaMethod", (aa == AA_OFF).then_some(0));
     // (`DS_UPSCALER` decides in development runs.)
     if std::env::var_os("DS_UPSCALER").is_none() { crate::gpu::upscale::set_choice(match aa {
-        AA_DLSS if crate::gpu::upscale::is_ready("dlss") => "dlss",
-        AA_FSR if crate::gpu::upscale::is_ready("fsr") => "fsr",
-        AA_XESS if crate::gpu::upscale::is_ready("xess") => "xess",
+        AA_DLSS => "dlss",
+        AA_FSR => "fsr",
+        AA_XESS => "xess",
         _ => "off",
     }); }
     convar::want("r_bloomEnable", (get("Bloom") == Some(0)).then_some(0));
@@ -365,6 +380,8 @@ pub fn apply() {
     // start only away from the default), and as defaults: DS_FRAME_CAP and DS_UNCAPPED, and
     // scripts' `tune` lines, still decide where they are given.
     static FRAME_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    #[cfg(target_os = "linux")]
+    crate::gpu::framegen::set_choice(get("FrameGeneration").unwrap_or(0));
     let limit = get("FrameRateLimit").unwrap_or(1).min(2);
     let was = FRAME_LIMIT.swap(limit, std::sync::atomic::Ordering::Relaxed);
     if was != limit && !(was == u32::MAX && limit == 1) {
@@ -391,8 +408,9 @@ pub fn apply() {
     }
 }
 
-/// Motion Blur Fix (`MouseMotionBlur`): 0 Off (the game's own Motion Blur), 1 Reduced Blur
-/// (MOUSE_BLUR_REDUCED of it), 2 On (no motion blur: the default; at the game's default a mouse
+/// Motion Blur Fix (`MouseMotionBlur`): 0 Game's Blur (the game's own Motion Blur; "Off" until
+/// 2026-11-25), 1 Reduced Blur (MOUSE_BLUR_REDUCED of it), 2 No Blur ("On" until then; no motion
+/// blur: the default; at the game's default a mouse
 /// turn of 1,500 counts a second kept 10% of a still frame's detail, a tenth of the blur 49%,
 /// none 54%; at 4,000 a second 9%, 16% and 63%: FINDINGS.md 2026-11-07). With every device since
 /// 2026-11-13 night (the user: on by default with a controller too; mouse and keyboard only before).

@@ -1825,7 +1825,7 @@ impl Exec {
         }
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
         set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
-        let r = self.draw_inner(cp, &args);
+        let r = self.draw_inner(cp, &args, false);
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
@@ -2169,10 +2169,12 @@ impl Exec {
     }
 
     /// Records the draw; Ok(false) when it has no effect here.
-    fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
+    fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs, fg_hudless: bool) -> Result<bool, String> {
         self.fe2_min_want = u32::MAX;
         let delta_at = self.delta.at.take();
         if a.count == 0 || a.instances == 0 {
+            #[cfg(target_os = "linux")]
+            if fg_hudless { crate::gpu::framegen::note("HUDless skip: zero draw count", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
             return Ok(false);
         }
         // A draw of absurd size is logged (the first 16 a boot): 2026-11-06,
@@ -2182,6 +2184,8 @@ impl Exec {
             self.note_huge_draw(cp, a);
             if a.count as u64 * a.instances as u64 >= ABSURD_DRAW {
                 ABSURD_DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(target_os = "linux")]
+                if fg_hudless { crate::gpu::framegen::note("HUDless skip: absurd draw dropped", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                 return Ok(false);
             }
         }
@@ -2201,10 +2205,14 @@ impl Exec {
             if cb_mode == 3 {
                 self.report("MSAA resolve pass not implemented (skipped)".into());
             }
+            #[cfg(target_os = "linux")]
+            if fg_hudless { crate::gpu::framegen::note("HUDless skip: metadata CB mode", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
             return Ok(false);
         }
         let clip = reg(0x28810);
         if clip & (1 << 22) != 0 {
+            #[cfg(target_os = "linux")]
+            if fg_hudless { crate::gpu::framegen::note("HUDless skip: rasterization disabled", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
             return Ok(false); // DX_RASTERIZATION_KILL
         }
         if SKIP_VS_ANY.load(Ordering::Relaxed) && SKIP_VS.lock().as_ref().is_some_and(|s| s.contains(&super::super::shaders::ngg_addr(cp))) {
@@ -2228,6 +2236,25 @@ impl Exec {
         }
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+        #[cfg(target_os = "linux")]
+        let fg_composite = crate::gpu::framegen::composite(ps_addr);
+        #[cfg(windows)]
+        let fg_composite = { let _ = fg_hudless; false };
+        if fg_composite && self.held { self.stop("frame generation pre-UI snapshot"); return Err(super::STOPPED.into()); }
+        #[cfg(target_os = "linux")]
+        if fg_composite && !fg_hudless {
+            // The final SDR shader reads the scene AND the UI and applies gamma. With
+            // a transparent UI input it writes the exact HUDless display colour. The
+            // real draw below overwrites the temporary output in the same command order.
+            // Never interpolate stale display-buffer contents from before the composite.
+            match self.draw_inner(cp, a, true) {
+                Ok(true) => {},
+                Ok(false) => crate::gpu::framegen::note("HUDless draw skipped", "composite had no effect"),
+                Err(e) if e == super::STOPPED => return Err(e),
+                Err(e) => crate::gpu::framegen::note("HUDless draw failed", e),
+            }
+        }
+
         // Stages prepared ahead by the workers (`gpu::ahead`) when they still
         // hold, else here. A draw whose arguments the GPU reads takes the
         // start instance on the GPU (prepared here).
@@ -2242,7 +2269,7 @@ impl Exec {
         // GPU-resolved draws (`gpures`, stage G4): a pair whose per-item
         // chains the shaders resolve runs batched, its draws after a run's
         // first appended with their user data alone (no preparation).
-        let direct = ps_addr != 0 && !rect && self.recording && !sync_mode();
+        let direct = !fg_composite && ps_addr != 0 && !rect && self.recording && !sync_mode();
         let mut gpu_pair = if direct && matches!(super::super::tune::gpu_chains(), 1 | 3) && ctx().draw_indirect_count && ctx().device_addresses { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
         if gpu_pair.is_some() && self.draw_same {
             if let Some(drawn) = self.draw_gpu_append(cp, a, vs_addr, ps_addr)? {
@@ -2339,6 +2366,8 @@ impl Exec {
                             });
                             crate::info!("skiprw: draw {n} of flip {}: ps {:#x} record {:x?}", flip + 1, p.addr, rec);
                         }
+                        #[cfg(target_os = "linux")]
+                        if fg_hudless { crate::gpu::framegen::note("HUDless skip: diagnostic skiprw", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                         return Ok(false);
                     }
                 }
@@ -2535,7 +2564,7 @@ impl Exec {
         let delta_mode = super::super::tune::buffer_delta();
         let mut sig = std::mem::take(&mut self.delta_sig);
         let keys = [vs.tr.key, ps.as_ref().map_or(0, |p| p.tr.key)];
-        let has_sig = delta_mode != 0 && !batched && gpu_pair.is_none() && image_sig([Some(&vs), ps.as_ref()], &mut sig);
+        let has_sig = !fg_composite && delta_mode != 0 && !batched && gpu_pair.is_none() && image_sig([Some(&vs), ps.as_ref()], &mut sig);
         let mut delta = if has_sig { self.delta_check(delta_at, keys, &sig, a.index.is_some()) } else { None };
         if delta.is_some() && self.held {
             // A held executor's reads and its own clears and reloads, as the
@@ -2625,6 +2654,8 @@ impl Exec {
                 let col_format = reg(0x28714);
                 let target_mask = reg(0x28238) & reg(0x2823C);
                 let mut colors: [Option<Target>; MAX_RT] = [None; MAX_RT];
+                // Each colour target's metadata and clear words as bound now (`claim_meta`).
+                let mut color_metas: [(u64, [u32; 2]); MAX_RT] = [(0, [0; 2]); MAX_RT];
                 let mut blend = [0u32; MAX_RT];
                 let mut masks = [0u8; MAX_RT];
                 if cb_mode == 1 {
@@ -2661,6 +2692,7 @@ impl Exec {
                             continue;
                         }
                         colors[i as usize] = Some(t);
+                        color_metas[i as usize] = (s.meta, s.clear);
                         blend[i as usize] = reg(0x28780 + 4 * i);
                         masks[i as usize] = m as u8;
                     }
@@ -2710,6 +2742,8 @@ impl Exec {
                 lap.mark(6);
                 let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
                 if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
+                    #[cfg(target_os = "linux")]
+                    if fg_hudless { crate::gpu::framegen::note("HUDless skip: no writable attachments", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                     return Ok(false);
                 }
                 let attachless = colors.iter().all(Option::is_none) && depth.is_none();
@@ -2729,6 +2763,8 @@ impl Exec {
                 }
                 let (x0, y0, x1, y1) = scissor(cp, area);
                 if x1 <= x0 || y1 <= y0 {
+                    #[cfg(target_os = "linux")]
+                    if fg_hudless { crate::gpu::framegen::note("HUDless skip: empty scissor", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                     return Ok(false);
                 }
                 // Pipeline.
@@ -2812,6 +2848,8 @@ impl Exec {
                                             }
                                             ASYNC_GFX_WAITED[3].fetch_add(1, Ordering::Relaxed);
                                         }
+                                        #[cfg(target_os = "linux")]
+                                        if fg_hudless { crate::gpu::framegen::note("HUDless skip: pipeline compiling asynchronously", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                                         return Ok(false);
                                     }
                                 }
@@ -2865,6 +2903,21 @@ impl Exec {
                     None => self.grow_sampled_depth(&[&vs]),
                 }
                 let hz_t1 = hz_t.map(|_| std::time::Instant::now());
+                // A fast clear pending on a bound target's metadata under another image is this
+                // target's (`Exec::claim_meta`: the title reuses metadata blocks between targets).
+                for (i, c) in colors.iter().enumerate() {
+                    if let Some(t) = c {
+                        self.claim_meta(t.key, color_metas[i].0, color_metas[i].1);
+                    }
+                }
+                if let (Some(t), Some(s)) = (depth.as_ref(), dsurf.as_ref())
+                    && t.key.layers == 1
+                {
+                    self.claim_meta(t.key, s.meta, s.clear);
+                }
+                if self.stopped {
+                    return Err(super::STOPPED.into());
+                }
                 // Fast clears (metadata writes), reloads and block copies of the
                 // attachments and textures.
                 let mut used = std::mem::take(&mut self.keys_scratch);
@@ -2939,6 +2992,11 @@ impl Exec {
         }
         lap.mark(9);
         // The vector is kept for the next draw (empty: it drains at the end).
+        #[cfg(target_os = "linux")]
+        let fg_ui = if fg_hudless {
+            self.end_rendering();
+            Some(crate::gpu::framegen::transparent_ui(self.cmd())?)
+        } else { None };
         let mut bounds = std::mem::take(&mut self.draw_bounds);
         bounds.clear();
         let mut sgpr_at = [0u64; 2];
@@ -2991,6 +3049,16 @@ impl Exec {
             let (ring, at) = self.bind_sgpr(p, &mut b)?;
             sgpr_at[k] = at;
             sgpr_ring = ring;
+            #[cfg(target_os = "linux")]
+            if k == 1 {
+                if let Some(view) = fg_ui {
+                    let binding = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Image(0)))
+                        .ok_or("FG composite missing sampled UI resource 0")?.binding;
+                    let image = b.imgs.iter_mut().find(|b| b.0 == binding)
+                        .ok_or("FG composite UI descriptor was not bound")?;
+                    image.2.image_view = view;
+                }
+            }
             bounds.push(b);
             lap.mark(10 + k.min(1));
         }
@@ -3022,6 +3090,7 @@ impl Exec {
         let t_bind = since(t0);
         // (A buffer-delta draw keeps the instance: the draw before it
         // neither sampled nor stored an attachment of it.)
+        if fg_composite { self.end_rendering(); }
         let mut touches = true;
         if delta.is_none() {
             // Rendering instance: reuse it while the attachments stay the same
@@ -3499,6 +3568,16 @@ impl Exec {
                 self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
             }
         }
+        #[cfg(target_os = "linux")]
+        if fg_hudless {
+            self.end_rendering();
+            if let Some(target) = colors[0] {
+                crate::gpu::framegen::note("HUDless scheduled", format_args!("ps {ps_addr:#x}, target {:#x}, {}x{} {:?}", target.key.base, target.width, target.height, target.format));
+                crate::gpu::vk::defer::external(self.cmd(), Box::new(move |cmd| crate::gpu::framegen::capture_hudless(cmd, target)));
+            } else {
+                crate::gpu::framegen::note("HUDless draw skipped", "composite has no colour attachment 0");
+            }
+        }
         lap.mark(16);
         // Another draw like it can be recorded on the state this one left
         // (`draw_repeat`): GPU-read arguments, indices and arguments in
@@ -3507,7 +3586,7 @@ impl Exec {
         // (Not after a batched draw: its pipeline's vertex stage reads its
         // SGPR data from the run's table by draw index.)
         let repeat = match (&index_home, a.index) {
-            _ if batched => None,
+            _ if batched || fg_composite => None,
             (Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
                 Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1 })
             }

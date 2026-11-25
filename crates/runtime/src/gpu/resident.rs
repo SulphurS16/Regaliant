@@ -464,8 +464,11 @@ pub fn linux_write_fault(addr: u64) -> bool {
         if unsafe { libc::syscall(libc::SYS_mprotect, page, PAGE, libc::PROT_READ | libc::PROT_WRITE) } == 0 {
             let frame = super::FRAMES.load(Ordering::Relaxed) as u32 + 1;
             let volatile = note_write_fault(c, i, frame);
-            flag(c, i);
+            // Publish dirty state before attention, as on_fault does. A take can clear
+            // attention concurrently: flagging first let it still see CLEAN|ARMED|BUSY,
+            // skip the page, then lose this fault when the state became dirty afterwards.
             s.store((cur & !(ST_ARMED | ST_VALID | ST_BUSY | ST_CLEAN)) | if volatile { ST_VOLATILE } else { 0 }, Ordering::Release);
+            flag(c, i);
             STATS[S_FAULTS].fetch_add(1, Ordering::Relaxed);
             // The direct counter is in signals; protect()'s call/time averages cover only
             // its timed calls, not these signal-context syscalls.
@@ -843,8 +846,12 @@ pub fn arm(base: u64, len: u64) -> u64 {
 /// for write tracking).
 fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
     use crate::platform::os::Win32::System::Memory::PAGE_READONLY;
-    // No mapping change meanwhile (`ARM_LOCK`).
+    // No mapping change meanwhile (`ARM_LOCK`). Linux takes hold this guard across
+    // queries and attention clearing too; recursive read cannot block behind a writer.
+    #[cfg(windows)]
     let _arming = ARM_LOCK.read();
+    #[cfg(target_os = "linux")]
+    let _arming = ARM_LOCK.read_recursive();
     // Write tracking through the host (`via_host`): no other arm or disarm
     // between a page's host bit and protection being looked at and its
     // marks (`hosted::arm_lock`; the host itself only makes pages
@@ -1189,6 +1196,10 @@ pub static TAKE_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 pub fn take_written(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     #[cfg(target_os = "linux")]
     if crate::platform::write_watch::enabled() { return crate::platform::write_watch::take(base, size, out); }
+    // Match uffd: a commit/remap must not flag a page between a cached Uncommitted
+    // region query and clear_attn below, which would discard the new mapping's dirtiness.
+    #[cfg(target_os = "linux")]
+    let _mapping = arm_guard();
     if size == 0 {
         return Some(());
     }
@@ -4671,7 +4682,7 @@ mod tests {
             for policy in ["0", "1"] {
                 let out = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "gpu::resident::tests::linux_exact_tracking_across_epochs", "--nocapture"])
-                    .env("REGALIANT_TRACKING_TEST", policy).env("DS_LINUX_VOLATILE_BACKOFF", policy)
+                    .env("REGALIANT_TRACKING_TEST", policy).env("DS_LINUX_VOLATILE_BACKOFF", policy).env("DS_LINUX_WRITE_WATCH", "mprotect")
                     .env("DS_SECTIONS", "1").env("DS_RESIDENT", "0").env("DS_LINUX_DIRECT_FAULT", "1")
                     .output().unwrap();
                 assert!(out.status.success(), "policy {policy}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

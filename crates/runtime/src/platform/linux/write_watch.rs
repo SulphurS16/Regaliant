@@ -59,7 +59,7 @@ static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub fn enabled() -> bool { WATCH.get().is_some_and(Option::is_some) }
 pub fn initialize() {
     WATCH.get_or_init(|| {
-        let policy = std::env::var("DS_LINUX_WRITE_WATCH").unwrap_or_else(|_| "mprotect".into());
+        let policy = std::env::var("DS_LINUX_WRITE_WATCH").unwrap_or_else(|_| "uffd".into());
         if !matches!(policy.as_str(), "uffd" | "auto") { return None; }
         if !crate::sections::on() || crate::gpu::resident::wanted() {
             crate::warn!("Linux async write watch unavailable outside section tracking; using mprotect");
@@ -67,7 +67,7 @@ pub fn initialize() {
         }
         match Watch::new() {
             Ok(w) => { crate::info!("Linux write watch: uffd async WP + PAGEMAP_SCAN (guest views only)"); Some(Mutex::new(w)) }
-            Err(e) => { crate::warn!("Linux async write watch unavailable: {e}; using exact mprotect"); None }
+            Err(e) => { crate::warn!("Linux async write watch unavailable: {e}; falling back to mprotect (tour corruption reported; use a kernel permitting async WP for preparation)"); None }
         }
     });
     if !enabled() { crate::info!("Linux write watch: mprotect"); }
@@ -189,7 +189,7 @@ pub fn take(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     if lo < crate::mem::GUEST_BASE || hi > crate::mem::GUEST_END { return None; }
     // Same mapping lock/order as the mprotect backend. No signal calls this module.
     let _mapping = crate::gpu::resident::arm_guard();
-    let t = std::time::Instant::now();
+    let t = crate::gpu::record_opts::Timer::start();
     let mut w = WATCH.get()?.as_ref()?.lock();
     let first = out.len();
     if let Err(e) = w.take(lo, hi, out) {
@@ -354,6 +354,96 @@ mod tests {
         w.register(a, a+n).unwrap();
         out.clear(); w.scan(a, a+n, &mut out).unwrap(); assert_eq!(out.len(), 1024);
         unsafe { libc::munmap(new, n as usize); libc::munmap(alias, n as usize); }
+    }
+
+    #[test]
+    fn concurrent_guest_writes_rearm_and_masked_alias_writeback() {
+        const NAME: &str = "platform::write_watch::tests::concurrent_guest_writes_rearm_and_masked_alias_writeback";
+        let Ok(mode) = std::env::var("REGALIANT_WATCH_STRESS") else {
+            for mode in ["mprotect", "uffd"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", NAME, "--nocapture"])
+                    .env("REGALIANT_WATCH_STRESS", mode).env("DS_LINUX_WRITE_WATCH", mode)
+                    .env("DS_SECTIONS", "1").env("DS_RESIDENT", "0").env("DS_LINUX_VOLATILE_BACKOFF", "0")
+                    .env("DS_LINUX_DIRECT_FAULT", "1").output().unwrap();
+                assert!(out.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                eprintln!("{mode}: {}", String::from_utf8_lossy(&out.stdout));
+            }
+            return;
+        };
+        if mode == "uffd" && Watch::new().is_err() { println!("SKIP uffd stress: kernel/sandbox denies async WP"); return; }
+        crate::mem::reserve_guest_range().unwrap();
+        crate::gpu::resident::init_linux_faults();
+        crate::platform::signals::ensure_installed().unwrap();
+        let _stack = crate::platform::signals::SignalStack::new().unwrap();
+        const PAGES: usize = 16;
+        const WORDS: usize = PAGES * 4096 / 8;
+        const ROUNDS: u64 = 64;
+        let a = crate::mem::MMAP_BASE + (128 << 20);
+        let size = PAGES as u64 * PAGE;
+        crate::mem::MEM.lock().map(a, size, crate::mem::VmaKind::Flexible, 3, 0, 0, "watch-stress").unwrap();
+        let slot = crate::mem::bridge_aliases(a, a+size).unwrap();
+        let alias = crate::sections::alias_of(a, slot);
+        let word = |base: u64, i: usize| unsafe { &*((base + i as u64 * 8) as *const AtomicU64) };
+        let phase = std::sync::Barrier::new(6); // four guest writers, alias writeback, scanner
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let mut snapshot = vec![0; WORDS];
+        let mut out = Vec::new();
+        let mut scan = |snapshot: &mut [u64]| {
+            out.clear(); crate::gpu::resident::take_written(a, size, &mut out).unwrap();
+            for &page in &out {
+                let start = (page-a) as usize/8;
+                // The CPU upload snapshot reads only CPU-owned words. Concurrent GPU
+                // writes through the alias are intentionally NOT CPU dirtiness.
+                for i in (start..start+512).step_by(2) { snapshot[i] = word(a, i).load(std::sync::atomic::Ordering::Acquire); }
+            }
+        };
+        scan(&mut snapshot);
+        let mut mismatch = None;
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let (phase, done, word) = (&phase, &done, &word);
+                scope.spawn(move || {
+                    let _stack = crate::platform::signals::SignalStack::new().unwrap();
+                    for round in 1..=ROUNDS {
+                        phase.wait();
+                        for i in (worker*2..WORDS).step_by(8) {
+                            word(a, i).store((round << 32) | i as u64, std::sync::atomic::Ordering::Release);
+                        }
+                        done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        phase.wait();
+                    }
+                });
+            }
+            let (phase_ref, done_ref, word_ref) = (&phase, &done, &word);
+            scope.spawn(move || {
+                for round in 1..=ROUNDS {
+                    phase_ref.wait();
+                    // Model FE2's marked-word stores into its unprotected alias, NOT a
+                    // whole-page copy: CPU/GPU own disjoint words within every page.
+                    for i in (1..WORDS).step_by(2) { word_ref(alias, i).store((round << 32) | i as u64, std::sync::atomic::Ordering::Release); }
+                    done_ref.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    phase_ref.wait();
+                }
+            });
+            for round in 1..=ROUNDS {
+                done.store(0, std::sync::atomic::Ordering::Release);
+                phase.wait();
+                while done.load(std::sync::atomic::Ordering::Acquire) != 5 { scan(&mut snapshot); std::thread::yield_now(); }
+                phase.wait();
+                scan(&mut snapshot);
+                for i in 0..WORDS {
+                    let expected = (round << 32) | i as u64;
+                    for (where_, actual) in [("guest", word(a, i).load(std::sync::atomic::Ordering::Acquire)),
+                        ("alias", word(alias, i).load(std::sync::atomic::Ordering::Acquire)),
+                        ("snapshot", if i % 2 == 0 { snapshot[i] } else { expected })] {
+                        if actual != expected && mismatch.is_none() { mismatch = Some(format!("{mode} {where_} word {i} round {round}: {actual:#x} != {expected:#x}")); }
+                    }
+                }
+            }
+        });
+        assert!(mismatch.is_none(), "{}", mismatch.unwrap_or_default());
+        crate::mem::MEM.lock().unmap_range(a, a+size);
+        println!("{mode}: {ROUNDS} rounds, {} words checked in guest/alias; four writers + rearming + masked writeback", WORDS as u64 * ROUNDS);
     }
 
     #[test]

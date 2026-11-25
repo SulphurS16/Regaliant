@@ -35,7 +35,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Whole synchronization-free graphics runs on workers, including their first chunk.
-/// Experimental: keep off until cooled A/B and boundary images establish a benefit.
+/// Experimental and incorrect: reviewer saw flicker, green geometry and black pops.
+/// Keep off; whole-run resource/state handoff needs investigation before another A/B.
 pub fn whole_run() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("DS_PAR_WHOLE_RUN").ok().as_deref() == Some("1"))

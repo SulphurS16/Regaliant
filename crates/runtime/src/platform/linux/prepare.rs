@@ -47,6 +47,14 @@ fn bounded(cmd: &mut Command, seconds: u64, stop: &Path) -> Result<i32, String> 
     };
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
     let _ = child.wait();
+    // An explicitly stopped preparation is not evidence of a driver crash. Remove only
+    // this child's upstream in-flight record after it has exited; keep Linux's durable
+    // compile-pending quarantine and all records of children that failed by themselves.
+    if stopping.is_some() {
+        if let Some((_, Some(cache))) = cmd.get_envs().find(|(k, _)| *k == "DS_LINUX_SHADER_CACHE") {
+            let _ = std::fs::remove_file(Path::new(cache).join("pipelines/inflight").join(format!("inflight-{}.bin", child.id())));
+        }
+    }
     result
 }
 
@@ -79,6 +87,75 @@ impl State {
         atomic_write(&root.join("state.json"), &serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?)
     }
     fn invalidate_pipelines(&mut self) { self.completed.retain(|s| s == "newgame"); }
+
+    fn record_completed(&mut self, root: &Path, stage: &str) -> Result<(), String> {
+        if !self.completed.iter().any(|s| s == stage) { self.completed.push(stage.into()); }
+        self.save(root)
+    }
+
+    // Called only after validating the saved application, executable and output locations.
+    // Older supervisors rejected a successful newgame because its info log was not on stderr.
+    // Its isolated save is still valid across shader-policy/driver changes. Never recover tour
+    // health this way: those stages must be replayed when their pipeline policy changes.
+    fn recover_newgame(&mut self, root: &Path) -> Result<(), String> {
+        if !self.completed.iter().any(|s| s == "newgame")
+            && health_completed(&root.join("newgame.progress"), "newgame")
+        {
+            println!("Preparation newgame: recovered completion from newgame.health; keeping the isolated save");
+            self.record_completed(root, "newgame")?;
+        }
+        Ok(())
+    }
+}
+
+/// The shared Windows/Linux self-play writes this before teardown, independently of its log.
+/// Progress counts (including a full bar) and process exit 0 alone are not completion proof:
+/// the runtime's bounded run can also exit 0 before the self-play reaches its end.
+fn health_completed(progress: &Path, expected: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(progress.with_extension("health")) else { return false };
+    if !text.ends_with('\n') || text.lines().count() != 1 { return false; }
+    let Some(fields) = text.lines().next().and_then(|l| l.strip_prefix("prepare-health: ")) else { return false };
+    let (mut stage, mut status) = (None, None);
+    for field in fields.split(';').map(str::trim) {
+        if let Some(value) = field.strip_prefix("stage=") {
+            if stage.replace(value).is_some() { return false; }
+        } else if let Some(value) = field.strip_prefix("status=") {
+            if status.replace(value).is_some() { return false; }
+        }
+    }
+    stage == Some(expected) && status == Some("0")
+}
+
+fn stage_status(stage: &str, parts: usize, progress: &Path, exit: Result<i32, String>) -> Result<i32, String> {
+    let expected = if stage == "newgame" { "newgame".into() }
+        else if let Some(part) = stage.strip_prefix("tour-") { format!("tour {part}/{parts}") }
+        else { return exit };
+    // Like the Windows launcher, accept work completed before a teardown hang/crash/stop.
+    // begin_attempt removes the previous attempt's health before spawning this child.
+    if health_completed(progress, &expected) { return Ok(0); }
+    let code = exit?;
+    if code == 0 {
+        return Err(format!("{stage} exited without completion health for {expected}; checkpoint retained; inspect {} and user/linux-runs/*/dsport.log", progress.with_extension("health").display()));
+    }
+    Ok(code)
+}
+
+fn begin_attempt(progress: &Path) -> Result<(), String> {
+    for extension in ["stop", "health"] {
+        let path = progress.with_extension(extension);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(format!("cannot clear prior attempt's {}: {e}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn check_identity(console: &str) -> Result<serde_json::Value, String> {
+    console.lines().find_map(|l| l.strip_prefix("pipeline store identity: "))
+        .map(str::trim).filter(|s| !s.is_empty()).map(|s| serde_json::Value::String(s.into()))
+        .ok_or_else(|| "pipeline store check did not report its identity on stdout".into())
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
@@ -114,7 +191,7 @@ pub fn validate_child(root: &Path, paths: &dsconfig::paths::Paths) -> Result<(),
 // Keep player translation choices through the isolated child environment. The parent has
 // already applied diagnostics.txt, with explicit environment variables taking precedence.
 const POLICY_ENV: &[&str] = &[
-    "DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "DS_SG_APPENDS",
+    "DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_NAN_PRESERVE", "DS_PER_LANE", "DS_SG_APPENDS",
     "DS_MARKS_PART", "DS_IMG_DIM_INST", "DS_FMT_SEED", "DS_FMT_RT_ONLY",
     "DS_PIPELINE_BINARIES", "DS_PB_NO_INTERNAL", "DS_PIPELINE_STATS", "DS_PUSH_DESC",
     "DS_SUBGROUP32", "DS_BARY_GS", "DS_GPU_COMPAT", "DS_OUTPUT_SIZE", "DS_RENDER_SIZE",
@@ -122,10 +199,13 @@ const POLICY_ENV: &[&str] = &[
 fn policy_switch(key: &str) -> bool {
     POLICY_ENV.contains(&key) || crate::gpu::trcache::TRANSLATOR_ENV.contains(&key) || key.starts_with("RDNA_")
 }
+fn child_switch(key: &str) -> bool {
+    policy_switch(key) || ["DS_PREPARE_LEVELS", "DS_PREPARE_TOUR", "DS_PREPARE_SHOTS", "DS_READONLY_ROOTS", "DS_COMPILE_WORKERS", "DS_COMPILE_AHEAD", "DS_PRECOMPILE_WORKERS", "DS_ASYNC_GFX_WORKERS", "DS_RELAY_FPS_LIMIT", "DS_RELAY_STOP_FILE", "DS_LINUX_WRITE_WATCH", "DS_LINUX_IO_HISTORY"].contains(&key)
+}
 fn policy_identity(mut switches: Vec<(String, String)>, settings: &str, display: &[u8]) -> Result<String, String> {
     switches.retain(|(k, _)| policy_switch(k));
     switches.sort();
-    let bytes = serde_json::to_vec(&(rdna::SOURCE_HASH, "pipeline-contract-1-driver-cache-shared", switches, settings, display)).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&(rdna::SOURCE_HASH, "pipeline-contract-2-nan-preserve", switches, settings, display)).map_err(|e| e.to_string())?;
     let mut hash = dsconfig::sha::Sha256::new().map_err(|e| e.to_string())?;
     hash.update(&bytes).map_err(|e| e.to_string())?;
     Ok(dsconfig::sha::hex(&hash.finish().map_err(|e| e.to_string())?))
@@ -174,6 +254,7 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
     };
     if state.app != game.app || state.shaders != shaders || state.selection != selection { return Err(format!("preparation location/selection changed; retain {} and use a separate DSPORT_HOME", root.display())); }
     if state.eboot != dsconfig::game::executable_hash(&game).map_err(|e| e.to_string())? { return Err("game executable changed; use a fresh preparation directory".into()); }
+    state.recover_newgame(&root)?;
     if state.translation != translation {
         state.invalidate_pipelines(); state.translation = translation.clone();
         for i in 1..=3 { let _ = std::fs::remove_file(root.join(format!("tour-{i}.resume"))); }
@@ -205,18 +286,19 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
             }
             let progress = root.join(format!("{stage}.progress"));
             let stop = progress.with_extension("stop");
-            let _ = std::fs::remove_file(&stop);
-            let _ = std::fs::remove_file(progress.with_extension("health"));
+            begin_attempt(&progress)?;
             let attempt = format!("{}-{}-{}", dsconfig::utc_stamp(), std::process::id(), start.elapsed().as_millis());
             let log_path = root.join(format!("{stage}-{attempt}.log"));
             let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
             let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
             for (k, _) in std::env::vars_os() {
-                if k.to_string_lossy().starts_with("DS_") && !policy_switch(&k.to_string_lossy()) && !["DS_PREPARE_LEVELS", "DS_PREPARE_TOUR", "DS_PREPARE_SHOTS", "DS_READONLY_ROOTS", "DS_COMPILE_WORKERS", "DS_COMPILE_AHEAD", "DS_PRECOMPILE_WORKERS", "DS_ASYNC_GFX_WORKERS", "DS_RELAY_FPS_LIMIT", "DS_RELAY_STOP_FILE"].contains(&k.to_string_lossy().as_ref()) { cmd.env_remove(k); }
+                if k.to_string_lossy().starts_with("DS_") && !child_switch(&k.to_string_lossy()) { cmd.env_remove(k); }
             }
             cmd.args([std::ffi::OsStr::new("--app"), game.app.as_os_str()]).arg("--offscreen")
                 .env("DSPORT_HOME", &user).env("DS_LINUX_SHADER_CACHE", &shaders)
                 .env("DS_LINUX_HIDDEN", "1").env("SDL_AUDIO_DRIVER", "dummy")
+                // Preparation needs real flips, not interpolation/presentation from player settings.
+                .env("DS_FRAME_GENERATION", "off")
                 .env("DS_RELAY_GAMEPLAY_SECONDS", "0").env("DS_VK_VALIDATION", "0")
                 .env("VK_LOADER_LAYERS_DISABLE", "*validation*").env_remove("VK_INSTANCE_LAYERS").env_remove("VK_LOADER_LAYERS_ENABLE")
                 .env("TMPDIR", root.join("tmp")).env("TMP", root.join("tmp")).env("TEMP", root.join("tmp"))
@@ -233,7 +315,8 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
                 if limited { cmd.env("DS_PREPARE_BACKGROUND", "0"); }
             }
             println!("Preparation {stage}: {} ({}s remaining)", log_path.display(), left);
-            let code = bounded(&mut cmd, left.min(3600), &stop)?;
+            let exit = bounded(&mut cmd, left.min(3600), &stop);
+            let code = stage_status(&stage, parts, &progress, exit)?;
             state.save(&root)?;
             if code == PAUSED {
                 atomic_write(&root.join("summary.txt"), b"Paused at deadline or interrupt; repeat the same command to resume.\n")?;
@@ -250,21 +333,15 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
             if code != 0 { return Err(format!("{stage} exited {code}; resume state retained; inspect {}", log_path.display())); }
             if stage == "check-read" {
                 let text = std::fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
-                let identity = text.lines().find(|l| l.contains("pipeline store identity:")).map(|l| l.split("pipeline store identity:").nth(1).unwrap().trim().to_string());
-                let identity = serde_json::to_value(identity).map_err(|e| e.to_string())?;
+                let identity = check_identity(&text)?;
                 if state.driver.as_ref().is_some_and(|old| old != &identity) {
                     state.invalidate_pipelines();
                     for i in 1..=3 { let _ = std::fs::remove_file(root.join(format!("tour-{i}.resume"))); }
                 }
                 state.driver = Some(identity);
             }
-            if stage == "newgame" || stage.starts_with("tour-") {
-                let text = std::fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
-                let expected = format!("prepare-play: stage {} played to its end", if stage == "newgame" { "newgame" } else { "tour" });
-                if !text.contains(&expected) { return Err(format!("{stage} exited without completing; checkpoint retained, inspect {}", log_path.display())); }
-            }
-            if !stage.starts_with("check-") { state.completed.push(stage.clone()); }
-            state.save(&root)?;
+            if !stage.starts_with("check-") { state.record_completed(&root, &stage)?; }
+            else { state.save(&root)?; }
             break;
         }
     }
@@ -277,10 +354,101 @@ pub fn run(app: &Path, threads: u32, seconds: u64) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_state() -> State {
+        State { app:"game".into(), shaders:"shaders".into(), eboot:"eboot".into(), translation:"old-policy".into(), selection:";".into(), completed:Vec::new(), driver:None }
+    }
+
+    #[test]
+    fn tracking_ab_survives_child_environment_without_invalidating_shaders() {
+        for key in ["DS_LINUX_WRITE_WATCH", "DS_LINUX_IO_HISTORY"] {
+            assert!(child_switch(key));
+            assert!(!policy_switch(key));
+        }
+        assert!(!child_switch("DS_PAR_WHOLE_RUN"));
+    }
+
+    #[test]
+    fn completion_handoff_persists_without_console_info() {
+        const NAME: &str = "platform::prepare::tests::completion_handoff_persists_without_console_info";
+        if let Some(root) = std::env::var_os("REGALIANT_PREP_HANDOFF_CHILD") {
+            let root = PathBuf::from(root);
+            crate::log::init(&root.join("dsport.log")).unwrap();
+            crate::info!("prepare-play: stage newgame played to its end in 351 s");
+            crate::prepplay::write_health(Some(&root.join("newgame.progress")), &crate::prepplay::health_line("newgame", 0));
+            crate::log::flush();
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("regaliant-prep-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let progress = root.join("newgame.progress");
+        begin_attempt(&progress).unwrap();
+        let console = std::fs::File::create(root.join("console.log")).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", NAME, "--nocapture"]).env("REGALIANT_PREP_HANDOFF_CHILD", &root)
+            .stdout(console.try_clone().unwrap()).stderr(console);
+        let exit = bounded(&mut cmd, 10, &progress.with_extension("stop"));
+        assert_eq!(stage_status("newgame", 3, &progress, exit).unwrap(), 0);
+        assert!(!std::fs::read_to_string(root.join("console.log")).unwrap().contains("played to its end"));
+        assert!(std::fs::read_to_string(root.join("dsport.log")).unwrap().contains("played to its end"));
+        let mut state = test_state();
+        state.record_completed(&root, "newgame").unwrap();
+        let resumed: State = serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+        assert_eq!(resumed.completed, ["newgame"]); // The stage loop now skips it.
+
+        // Old supervisor's state, or termination after health but before state.json was saved.
+        state = test_state();
+        state.save(&root).unwrap();
+        state.recover_newgame(&root).unwrap();
+        state.invalidate_pipelines(); // Round 35's NaN-policy change must keep this save.
+        state.recover_newgame(&root).unwrap();
+        assert_eq!(state.completed, ["newgame"]);
+        let resumed: State = serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+        assert_eq!(resumed.completed, ["newgame"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completion_requires_current_matching_health_and_keeps_continue_checkpoint() {
+        let root = std::env::temp_dir().join(format!("regaliant-prep-status-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let progress = root.join("tour-1.progress");
+        let health = progress.with_extension("health");
+        std::fs::write(&progress, "8 8\n8 8\n100 100\n999\n").unwrap();
+        assert!(stage_status("tour-1", 3, &progress, Ok(0)).is_err());
+        for code in [PAUSED, crate::prepplay::EXIT_CONTINUE, crate::prepplay::EXIT_FAILED] {
+            crate::prepplay::write_health(Some(&progress), &crate::prepplay::health_line("tour 1/3", code));
+            assert_eq!(stage_status("tour-1", 3, &progress, Ok(code)).unwrap(), code);
+            assert!(stage_status("tour-1", 3, &progress, Ok(0)).is_err());
+        }
+        crate::prepplay::write_health(Some(&progress), &crate::prepplay::health_line("tour 1/3", 0));
+        assert_eq!(stage_status("tour-1", 3, &progress, Ok(0)).unwrap(), 0);
+        assert_eq!(stage_status("tour-1", 3, &progress, Ok(crate::prepplay::EXIT_HUNG)).unwrap(), 0);
+        assert_eq!(stage_status("tour-1", 3, &progress, Ok(PAUSED)).unwrap(), 0);
+        assert_eq!(stage_status("tour-1", 3, &progress, Err("teardown signal".into())).unwrap(), 0);
+        assert!(stage_status("tour-2", 3, &progress, Ok(0)).is_err());
+        assert!(stage_status("tour-1", 1, &progress, Ok(0)).is_err());
+        std::fs::write(progress.with_extension("resume"), "chunk=1/3\nlevel=2\n").unwrap();
+        begin_attempt(&progress).unwrap();
+        assert!(progress.with_extension("resume").is_file());
+        assert!(stage_status("tour-1", 3, &progress, Ok(0)).is_err());
+        for bad in ["prepare-health: stage=tour 1/3; status=0;", "prepare-health: stage=tour 1/3; status=0; status=13;\n", "prepare-health: stage=tour 1/3; status=00;\n"] {
+            std::fs::write(&health, bad).unwrap();
+            assert!(stage_status("tour-1", 3, &progress, Ok(0)).is_err());
+        }
+        begin_attempt(&progress).unwrap();
+        std::fs::create_dir(&health).unwrap();
+        assert!(begin_attempt(&progress).is_err()); // Stale evidence must be removable.
+        assert!(stage_status("tour-1", 3, &progress, Err("child spawn failed".into())).is_err());
+        assert_eq!(stage_status("compile", 3, &progress, Ok(0)).unwrap(), 0);
+        assert_eq!(check_identity("pipeline store identity: device; cache-id\npb-check = 0\n").unwrap(), serde_json::json!("device; cache-id"));
+        assert!(check_identity("pb-check = 0\n").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn preparation_identity_tracks_player_translation_and_settings() {
         let base = policy_identity(vec![], "", b"").unwrap();
-        for k in ["DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_PER_LANE", "RDNA_LANE_GUARDS", "DS_PIPELINE_BINARIES", "DS_PUSH_DESC", "DS_PIPELINE_STATS"] {
+        for k in ["DS_PLAIN_MODES", "DS_MAX_RECONV", "DS_NAN_PRESERVE", "DS_PER_LANE", "RDNA_LANE_GUARDS", "DS_PIPELINE_BINARIES", "DS_PUSH_DESC", "DS_PIPELINE_STATS"] {
             assert!(policy_switch(k));
             assert_ne!(base, policy_identity(vec![(k.into(), "0".into())], "", b"").unwrap());
         }

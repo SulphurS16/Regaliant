@@ -41,6 +41,11 @@ pub fn tsc_hz() -> u64 {
     clock().tsc_hz
 }
 
+#[cfg(target_os = "linux")]
+pub fn initialized_tsc_hz() -> Option<u64> {
+    CLOCK.get().map(|c| c.tsc_hz)
+}
+
 fn realtime() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
 }

@@ -57,3 +57,44 @@ pub fn prepare_kernel_io(base: u64, len: u64, into_guest: bool) {
 pub fn is_memory_fault(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::EFAULT)
 }
+
+/// Keep a section split/decommit from replacing the kernel's destination mid-copy.
+/// Release before kernel_io logs/retries: those paths may consult MEM. The operation
+/// must not acquire MEM (the mapping writer holds it while waiting for GUEST_READERS).
+pub fn with_kernel_io_pages<T>(base: u64, len: u64, into_guest: bool, op: impl FnOnce() -> T) -> T {
+    let _pages = crate::mem::GUEST_READERS.read_recursive();
+    prepare_kernel_io(base, len, into_guest);
+    op()
+}
+
+struct ReadNote { base: u64, end: u64, text: String }
+static READS: parking_lot::Mutex<std::collections::VecDeque<ReadNote>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
+fn read_history_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_LINUX_IO_HISTORY").ok().as_deref() == Some("1"))
+}
+pub fn note_kernel_read(base: u64, len: u64, offset: u64, result: &std::io::Result<usize>, what: &dyn Fn() -> String) {
+    if !read_history_enabled() { return; }
+    let text = format!("{} at {:.0} ms, flip {}: destination {base:#x}+{len:#x}, offset {offset:#x}, result {result:?}",
+        what(), crate::log::elapsed_ms(), crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+    let mut reads = READS.lock();
+    if reads.len() >= 8192 { reads.pop_front(); }
+    reads.push_back(ReadNote { base, end: base.saturating_add(len), text });
+}
+pub fn read_history(address: u64) -> Vec<String> {
+    if !read_history_enabled() { return vec!["disabled (DS_LINUX_IO_HISTORY=1 enables)".into()]; }
+    let Some(reads) = READS.try_lock() else { return vec!["file-read history busy".into()]; };
+    reads.iter().rev().filter(|r| r.base <= address && address < r.end).take(8).map(|r| r.text.clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn kernel_copy_excludes_mapping_replacement() {
+        super::with_kernel_io_pages(0, 0, false, || {
+            std::thread::scope(|scope| {
+                scope.spawn(|| assert!(crate::mem::GUEST_READERS.try_write().is_none())).join().unwrap();
+            });
+        });
+    }
+}

@@ -47,7 +47,6 @@ Shader preparation happens once. The first time you press Play, the game plays i
 - In a window on a 144 or 165 Hz screen the game shows an even 48 or 55 fps. Borderless or fullscreen with G-SYNC or FreeSync, or a 120 Hz screen, gives 60 ([more](docs/settings.md#frame-rate-and-refresh-rate)).
 - Shaders the preparation did not meet (rare effects, spells) still compile on first sight, and a level's first arrival can pause briefly.
 - A full playthrough has not been tested.
-- On RTX 50-series graphics cards the picture is mostly black in play ([issue #6](https://github.com/SulphurS16/Regaliant/issues/6)). The cause is being looked into.
 - AMD and Intel graphics cards, HDR screens and 16 GB of memory have not been tested.
 - Online features are not available. The game plays offline.
 
@@ -59,6 +58,7 @@ Goals, roughly in order. They are aims, not promises or dates.
 
 - A steady 60 fps everywhere, the busiest places included, then higher frame rates for high-refresh screens.
 - Shorter shader preparation, then none. Shaders get compiled in the background while you play, without stutter.
+- A native Linux build, once the Windows version runs stable. Until then, Linux, Proton and the Steam Deck are not supported.
 - Mod support: a mods folder whose files the game loads in place of its own, so mods never change your game files.
 - Online play: messages, bloodstains, co-op and invasions through a community server. This is the biggest goal and the furthest off.
 

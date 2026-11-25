@@ -114,3 +114,14 @@ pub mod sparse;
 #[cfg(target_os = "linux")]
 #[path = "linux/steady.rs"]
 pub mod steady;
+
+#[cfg(target_os = "linux")]
+#[path = "linux/hang.rs"]
+pub mod hang;
+
+#[cfg(windows)]
+#[path = "windows/memory_diagnostics.rs"]
+pub mod memory_diagnostics;
+#[cfg(target_os = "linux")]
+#[path = "linux/memory_diagnostics.rs"]
+pub mod memory_diagnostics;

@@ -63,6 +63,9 @@ pub static MOUSE_WHEEL: AtomicI32 = AtomicI32::new(0);
 /// Mouse buttons down: bit 0 left, 1 right, 2 middle, 3 and 4 the side
 /// buttons (X1, X2).
 pub static MOUSE_BUTTONS: AtomicU32 = AtomicU32::new(0);
+/// Mouse buttons kept from the game until they are released (bit as `MOUSE_BUTTONS`): a click the
+/// save list took (`hle::libs::savedata`).
+pub static MOUSE_SWALLOW: AtomicU32 = AtomicU32::new(0);
 /// The cursor is captured (hidden and held in the client area).
 pub static CAPTURED: AtomicBool = AtomicBool::new(false);
 static FOCUSED: AtomicBool = AtomicBool::new(false);
@@ -506,6 +509,7 @@ unsafe fn raw_input(lp: LPARAM) {
         }
         if f & up != 0 {
             MOUSE_BUTTONS.fetch_and(!(1 << bit), Ordering::Relaxed);
+            MOUSE_SWALLOW.fetch_and(!(1 << bit), Ordering::Relaxed);
         }
     }
     if f & 0x400 != 0 {
@@ -543,6 +547,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ACTIVATE => {
             // Active and not minimized.
             FOCUSED.store((wp & 0xFFFF) as u32 != WA_INACTIVE && (wp >> 16) & 0xFFFF == 0, Ordering::Relaxed);
+            // (The click that brings the window back is no choice in the save list.)
+            if (wp & 0xFFFF) as u32 != WA_INACTIVE {
+                crate::hle::libs::savedata::note_activation();
+            }
             unsafe { update_capture(hwnd) };
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
@@ -568,6 +576,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 MOVES.fetch_add(1, Ordering::Relaxed);
                 crate::input::note_device(crate::input::DEVICE_KBM);
             }
+            0
+        }
+        // The save list (Load Game's characters, `savedata`): the wheel chooses, a left click
+        // loads, a right click goes back.
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN if crate::hle::libs::savedata::list_active() => {
+            crate::input::note_device(crate::input::DEVICE_KBM);
+            // (The button is the list's until it is released: the game does not see it press
+            // after the list closes, `MOUSE_SWALLOW`.)
+            MOUSE_SWALLOW.fetch_or(if msg == WM_LBUTTONDOWN { 1 } else { 2 }, Ordering::Relaxed);
+            crate::hle::libs::savedata::list_click(msg == WM_LBUTTONDOWN);
+            0
+        }
+        WM_MOUSEWHEEL if crate::hle::libs::savedata::list_active() => {
+            crate::input::note_device(crate::input::DEVICE_KBM);
+            crate::hle::libs::savedata::list_wheel(((wp >> 16) & 0xFFFF) as i16 as i32);
             0
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
@@ -635,6 +658,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     return 0;
                 }
+                // The save list (Load Game's characters, `savedata`) likewise.
+                if crate::hle::libs::savedata::list_key_down(wp as u8, repeat) {
+                    crate::input::note_device(crate::input::DEVICE_KBM);
+                    if !crate::hle::libs::savedata::list_active() {
+                        IME_SWALLOW.store(wp as u32, Ordering::Relaxed);
+                    }
+                    return 0;
+                }
             }
             if (wp as u16 == VK_RETURN_CODE && msg == WM_SYSKEYDOWN) || wp as u16 == VK_F11_CODE {
                 // Alt+Enter, F11: windowed / the last fullscreen mode.
@@ -647,10 +678,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return 0;
             }
             if wp as u16 == VK_F10_CODE {
-                // F10: the next 60 frames saved (a glitch as it happens). (As a
-                // system key it would open the window's menu.)
+                // F10: the next 60 frames saved (a glitch as it happens); Ctrl+F10: every
+                // thread's wait and stack written to the log (a hang the game still draws
+                // through). (As a system key it would open the window's menu.)
                 if (lp >> 30) & 1 == 0 {
-                    crate::hle::libs::videoout::burst_hotkey();
+                    if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0 {
+                        crate::stacks_hotkey();
+                    } else {
+                        crate::hle::libs::videoout::burst_hotkey();
+                    }
                 }
                 return 0;
             }

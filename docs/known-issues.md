@@ -10,10 +10,9 @@
 - The sky in the opening cutscene is a little darker than on PS5. Some light shafts look softer too.
 - At 32:9 the character preview in the equipment menu stands at the right edge.
 - In character creation the header can turn bright cyan after the button prompts change, for example when you switch between the controller and the keyboard. It is only cosmetic.
-- In character creation the character fills only part of the screen when Render Scale is set to a percentage. Visual Mode shows it whole.
+- In character creation and in the equipment menu the character preview can fill only part of the screen, and look dark in the menu, when Render Scale is set to a percentage (seen at small render sizes such as 100% of a 1280x720 window). Visual Mode shows it right.
 - HDR has not been seen on an HDR screen yet.
 - AMD and Intel graphics cards have not been tested.
-- On RTX 50-series cards the picture is mostly black in play, with black shapes or only parts of the scene drawn (issues #4 and #6). The changes in 0.1.1 and 0.1.2 did not fix it. The cause is being narrowed down with tests that RTX 50 players run through a diagnostics file.
 - On graphics cards with 12 GB or less the game can run short of graphics memory in busy places. It then keeps some textures in system memory, and the frame rate there can drop.
 - On cards with 4 or 5 GB the game keeps its large images in system memory from the start. It runs, but slowly. Cards with less than 4 GB have not been tested.
 - PCs with 16 GB of memory have not been tested on a real PC. A simulation of one played the tested levels. 32 GB is recommended.

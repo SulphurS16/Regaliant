@@ -430,6 +430,33 @@ thread_local! {
     static PENDING_TLS: std::cell::RefCell<(u64, std::sync::Arc<super::fx::Set<ImageKey>>)> = std::cell::RefCell::new((u64::MAX, std::sync::Arc::new(Default::default())));
 }
 
+/// The metadata addresses fast clears are pending on (`pending_meta_hit`), published with
+/// `PENDING_SET`.
+static PENDING_META_SET: Mutex<Option<std::sync::Arc<super::fx::Set<u64>>>> = Mutex::new(None);
+
+thread_local! {
+    static PENDING_META_TLS: std::cell::RefCell<(u64, std::sync::Arc<super::fx::Set<u64>>)> = std::cell::RefCell::new((u64::MAX, std::sync::Arc::new(Default::default())));
+}
+
+/// Fast clears a target took over from another image sharing its metadata (`Images::claim_meta`):
+/// [the cache's, a held executor's own].
+pub static META_CLAIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a fast clear is pending on metadata `meta` under any image (without the cache's lock).
+pub fn pending_meta_hit(meta: u64) -> bool {
+    if meta == 0 || !any_pending() {
+        return false;
+    }
+    let g = PENDING_GEN.load(std::sync::atomic::Ordering::Acquire);
+    PENDING_META_TLS.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.0 != g {
+            *t = (g, PENDING_META_SET.lock().clone().unwrap_or_default());
+        }
+        t.1.contains(&meta)
+    })
+}
+
 /// Whether any of `keys` has a fast clear or an overwrite reload pending
 /// (`clears_pending || overwrites_pending` without the cache's lock).
 pub fn pending_hit(keys: &[ImageKey]) -> bool {
@@ -3406,6 +3433,8 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
         im.pending_published = im.pending_change;
         let set: super::fx::Set<ImageKey> = im.pending_clears.keys().copied().chain(im.overwritten_keys.iter().copied()).collect();
         *PENDING_SET.lock() = Some(std::sync::Arc::new(set));
+        let metas: super::fx::Set<u64> = im.pending_clears.values().map(|v| v.0).collect();
+        *PENDING_META_SET.lock() = Some(std::sync::Arc::new(metas));
         PENDING_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     if let Some(t) = held_from {
@@ -5486,6 +5515,61 @@ impl Images {
         }
         self.note_gen += 1;
         NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A target bound now with metadata `meta` takes over a fast clear pending on that metadata
+    /// under another image (whole images only), and becomes the metadata's image for later
+    /// fills. The title reuses one metadata block for two targets in a frame (at a 3840x2160
+    /// render, the lighting's output and the HDR HUD layer, 2026-11-24): each is fast-cleared just
+    /// before its use, but a fill finds the block's image by its last binding (`meta_of`, which
+    /// memoized targets do not refresh), so the HUD layer's clear went to the lighting target:
+    /// the layer kept its old contents (anything that moved on the HUD left copies behind, a
+    /// closed menu stayed on screen) and the lighting target was cleared before the HUD pass read
+    /// it. Whether a clear changed hands.
+    pub fn claim_meta(&mut self, key: ImageKey, meta: u64, clear: [u32; 2]) -> bool {
+        if meta == 0 {
+            return false;
+        }
+        let others: Vec<ImageKey> = self.pending_clears.iter().filter(|(k, v)| **k != key && v.0 == meta && v.3 == 0).map(|(k, _)| *k).collect();
+        for &o in &others {
+            if let Some(e) = self.pending_clears.remove(&o) {
+                merge_pending(&mut self.pending_clears, key, e);
+                META_CLAIMS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if trace_clears() {
+                    crate::info!(
+                        "trace clears: {:#x} ({:?} {}x{}) takes the clear pending on {:#x} ({}x{}): bound now with its metadata {meta:#x} (for flip {}, {})",
+                        key.base,
+                        key.format,
+                        key.width,
+                        key.height,
+                        o.base,
+                        o.width,
+                        o.height,
+                        crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1,
+                        std::thread::current().name().unwrap_or("?")
+                    );
+                }
+            }
+        }
+        if self.meta_of.insert(meta, (key, clear)) != Some((key, clear)) {
+            self.note_gen += 1;
+            NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        self.meta_now.insert(key, (meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
+        if !others.is_empty() {
+            self.pending_change += 1;
+        }
+        !others.is_empty()
+    }
+
+    /// Whether a fast clear is pending on metadata `meta` under another image than `key`.
+    pub fn meta_pending_elsewhere(&self, key: ImageKey, meta: u64) -> bool {
+        self.pending_clears.iter().any(|(k, v)| *k != key && v.0 == meta)
+    }
+
+    /// The metadata image `k` was last bound with (`meta_now`).
+    pub fn meta_bound(&self, k: ImageKey) -> Option<u64> {
+        self.meta_now.get(&k).map(|v| v.0)
     }
 
     /// The fast clear of image `k` with metadata at `meta` (`take_clears`'s

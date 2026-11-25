@@ -141,6 +141,21 @@ unsafe impl std::alloc::GlobalAlloc for GuardedAlloc {
 #[global_allocator]
 static ALLOCATOR: GuardedAlloc = GuardedAlloc;
 
+/// A failure before the log exists, written to `early-failure.txt` in a dated folder of its own
+/// in the logs folder, as a session's (so the launcher's Open logs selects it), personal paths
+/// left out as in the log; the sentence naming that file for the player's message, or nothing
+/// when it could not be written.
+fn early_failure_note(what: &str) -> String {
+    let dir = paths().logs().join(utc_stamp());
+    let file = dir.join("early-failure.txt");
+    let text = format!("{}\n", log::redact(what));
+    if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, text).is_ok() {
+        format!("\n\nThe details are in {} (the launcher's Open logs shows its folder).", log::redact(&file.display().to_string()))
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) fn utc_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let days = secs.div_euclid(86400);
@@ -356,7 +371,7 @@ pub fn keep_run(reason: &str) {
 ///   pcset <setting> <value>  a PC setting (`Setting_PC_...`) as if changed in the SETTINGS screen
 ///   convars                  the PC settings' title console variables and their values
 ///   convar <name> <value>    one of them set (`title`: the title's own again; tests)
-///   shot <name>              screenshot of the next presented flip -> shot_<name>.png
+///   shot <name>              screenshot of the next presented flip -> <name>.png (the run directory)
 ///   burst <name> <n> [x y w h] [half]  shots of the next n flips, each one (cropped, at half size) -> <name>_NNN.png
 ///   dump                     dump all GPU images at the next flip
 ///   trace                    log every draw/dispatch of an upcoming flip (FRAME lines)
@@ -831,9 +846,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // or `watch <slot> off`: hardware watchpoint on every
                 // registered thread (writes: all threads by default; rw:
                 // guest threads by default). Hits are logged (`watch N ...`).
+                // (The address as `debug_addr` reads it: a pointer chain from the executable too.)
                 let slot = parts.next().and_then(|v| v.parse::<usize>().ok()).filter(|&s| s < 4);
                 let arg = parts.next().unwrap_or("");
-                let addr = if arg == "off" { Some(0) } else { u64::from_str_radix(arg.trim_start_matches("0x"), 16).ok() };
+                let addr = if arg == "off" { Some(0) } else { debug_addr(arg).ok() };
                 let (mut rw, mut len, mut guest) = (1u32, 8u32, None::<bool>);
                 for o in parts.by_ref() {
                     match o {
@@ -1175,6 +1191,22 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 gpu::capture::arm_next();
                 Ok(())
             }
+            "peek" => {
+                // Debug: `peek <address> [<hex length up to 0x100>]`: logs the bytes at the
+                // address (`debug_addr`: hex, `eboot+<hex>`, `,<hex>` pointer steps).
+                let spec = parts.next().unwrap_or("");
+                let n = parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(8).clamp(1, 0x100);
+                match debug_addr(spec) {
+                    Ok(a) if gpu::cp::guest_readable(a, n) || mem::os_readable(a, n) => {
+                        let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, n as usize) };
+                        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        info!("control: peek {spec} = {a:#x}: {}", hex.join(" "));
+                        Ok(())
+                    }
+                    Ok(a) => Err(format!("{a:#x}+{n:#x} is not readable memory")),
+                    Err(e) => Err(format!("usage: peek <hex address | eboot+<hex>>[,<hex step>...] [<hex length>]: {e}")),
+                }
+            }
             "mem" => {
                 // Debug: `mem <hex address> <hex length>` writes guest memory
                 // to mem-<address>.bin in the run directory.
@@ -1495,6 +1527,27 @@ static FSCAN: parking_lot::Mutex<Option<FScan>> = parking_lot::Mutex::new(None);
 /// Candidate pages copied for `fscan floats` (64 MiB) at most.
 const FSCAN_COPY_PAGES: usize = 16384;
 
+/// An address for the debug commands (`peek`, `watch`): hex, or `eboot+<hex>` (the main
+/// executable's load address plus an offset), then `,<hex>` steps that each read the 8 bytes at
+/// the address so far and add the offset: `eboot+330ccb0,720,e8` is a field of an object a field
+/// of the object a global points to points to.
+fn debug_addr(spec: &str) -> Result<u64, String> {
+    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|_| format!("{s}: not hex"));
+    let mut steps = spec.split(',');
+    let first = steps.next().unwrap_or("");
+    let mut a = match first.strip_prefix("eboot+") {
+        Some(o) => pcsettings::convar::base().checked_add(hex(o)?).filter(|_| pcsettings::convar::base() != 0).ok_or("the executable's address is not known yet")?,
+        None => hex(first)?,
+    };
+    for s in steps {
+        if !(gpu::cp::guest_readable(a, 8) || mem::os_readable(a, 8)) {
+            return Err(format!("{a:#x} is not readable"));
+        }
+        a = unsafe { (a as *const u64).read_unaligned() }.wrapping_add(hex(s)?);
+    }
+    Ok(a)
+}
+
 fn page_hash(a: u64) -> u64 {
     let p = a as *const u64;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -1676,6 +1729,35 @@ fn host_thread_stacks() -> String {
         }
     }
     s
+}
+
+/// Ctrl+F10 in the window: what every thread waits on, then the stacks (the `stacks` report:
+/// ours and the title's, the GPU queues, the audio), written to the log, for a player's report
+/// of a hang the game still draws through (issue #14: a loading screen that never ends, its fog
+/// moving at 60 fps). On a thread of its own, so the window's messages go on meanwhile. The waits
+/// come first because they need no thread to answer; the stacks need each thread's context, and
+/// a thread stuck inside the driver may never give it (`stacks_bounded` waits 20 s). One report
+/// at a time; none after one whose stacks were not taken (its sampling thread may still wait).
+pub(crate) fn stacks_hotkey() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::SeqCst) {
+        info!("Ctrl+F10: the previous report is not finished (or its stacks were not taken): none now");
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("stacks-hotkey".into()).spawn(|| {
+        let flip = gpu::FRAMES.load(Ordering::Relaxed);
+        info!("Ctrl+F10 at flip {flip}: every thread and what it waits on:\n{}", thread_summary_ex(false));
+        let stacks = stacks_bounded();
+        let taken = !stacks.starts_with("the threads' stacks were not taken");
+        info!("Ctrl+F10 at flip {flip}: the stacks:\n{stacks}");
+        if taken {
+            BUSY.store(false, Ordering::SeqCst);
+        }
+    });
+    if spawned.is_err() {
+        BUSY.store(false, Ordering::SeqCst);
+    }
 }
 
 fn thread_summary_ex(with_stacks: bool) -> String {
@@ -2028,7 +2110,8 @@ pub fn hung(why: &str, code: i32) -> ! {
     // (A self-play stage's health line too, its counters as they stood.)
     prepplay::health_if_playing(code);
     session_ended();
-    gpu::pcache::clear_crash_suspects();
+    // (Its compiles in flight stay on record: a compile that does not return is a reason to end.)
+    gpu::pcache::clear_crash_suspects_keep_inflight();
     crate::log::flush();
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code as u32);
@@ -2062,6 +2145,18 @@ pub fn shutdown(code: i32) -> ! {
 
 
 fn main() {
+    // `--probe-streamline <dir>`: a start's separate check that Streamline loads (`gpu::upscale::
+    // probe_streamline`), before anything else: no log, no window, no error popups.
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("--probe-streamline") {
+            unsafe {
+                use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
+                SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+            }
+            gpu::upscale::probe_streamline(std::path::Path::new(&args.next().unwrap_or_default()));
+        }
+    }
     // Per-monitor DPI awareness for the whole process, before any window, monitor or surface is
     // asked about (a player's report, 2026-11-23: at 175% Windows scaling the picture covered the
     // top-left 2194x1234 of a 3840x2160 fullscreen. Only the window's thread was aware; the
@@ -2103,16 +2198,20 @@ fn main() {
     // (Before the log exists: the player is told, and the launcher shows the code.)
     if let Err(e) = mem::reserve_guest_range() {
         eprintln!("{e}");
+        // (Before the log exists, the reason also goes to a file in the logs folder, which the
+        // launcher's Open logs shows: a hidden step's player saw only "status 10", issue #15.)
+        let note = early_failure_note(&e);
         player_error(&format!("The game could not reserve the memory range its program needs ({e}).
 
-This happens when other software takes that range. Restart the PC and try again."));
+This happens when other software takes that range. Restart the PC and try again.{note}"));
         std::process::exit(EXIT_EARLY as i32);
     }
     let slot = match tls::init_slot() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
-            player_error(&format!("The game could not set up its threads ({e})."));
+            let note = early_failure_note(&format!("setting up the threads' slot failed: {e}"));
+            player_error(&format!("The game could not set up its threads ({e}).{note}"));
             std::process::exit(EXIT_EARLY as i32);
         }
     };

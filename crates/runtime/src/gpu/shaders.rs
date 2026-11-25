@@ -261,6 +261,7 @@ impl<T> std::ops::Deref for Local<T> {
 #[derive(Clone)]
 pub struct Translated {
     pub program_hash: u64,
+    pub binding_facts: super::record_opts::BindingFacts,
     pub out: Output,
     pub plan: Arc<Plan>,
     /// Cache key (program hash ^ specialization hash).
@@ -3773,7 +3774,8 @@ fn translated(insts: &[rdna::Inst], out: Output, plan: &Arc<Plan>, plan_key: u64
     atomic_res.sort_unstable();
     atomic_res.dedup();
     let program_hash = plan_key ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
-    Translated { program_hash, out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
+    let binding_facts = super::record_opts::BindingFacts::new(plan, &out.bindings);
+    Translated { program_hash, binding_facts, out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
 }
 
 /// `translate_code_for_spec` keeping neither the translation nor its plan,

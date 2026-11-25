@@ -150,6 +150,17 @@ pub trait FileExt {
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
     fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
 }
+
+pub fn mapped_file_name(address: u64) -> String {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some((lo, hi)) = fields.next().and_then(|s| s.split_once('-')) else { continue };
+        let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else { continue };
+        if (lo..hi).contains(&address) { return fields.skip(4).collect::<Vec<_>>().join(" "); }
+    }
+    String::new()
+}
 impl FileExt for std::fs::File {
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> { std::os::unix::fs::FileExt::read_at(self, buf, offset) }
     fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize> { std::os::unix::fs::FileExt::write_at(self, buf, offset) }

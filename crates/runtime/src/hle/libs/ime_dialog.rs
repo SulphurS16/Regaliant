@@ -422,6 +422,7 @@ pub fn overlay() -> Option<(u64, crate::textbox::Content)> {
         caret: phase % 2 == 0,
         hint: if d.pad_mode { pad_hint() } else { "Enter  Confirm      Esc  Cancel".into() },
         keys: d.pad_mode.then(|| keys_view(d)),
+        list: None,
     };
     // (The prompts' set is in the generation: the hint names its buttons.)
     let set = if d.pad_mode { crate::pcsettings::prompts::shown_set() as u64 } else { 0 };

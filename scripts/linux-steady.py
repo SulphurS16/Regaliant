@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Native 4K saved-scene relay: clean 30s stationary/60s walking, separate GPU diagnosis."""
 import argparse
+import hashlib
 import csv
 import importlib.util
 import json
@@ -87,14 +88,16 @@ def phase_report(data, reuse):
         threads.append(dict(t, cpu_ms_per_flip=cpu, runqueue_ms_per_flip=1000*t['runqueue_s']/max(count,1),
                             not_running_ms_per_flip=1000*max(0,seconds-t['cpu_s']-t['runqueue_s'])/max(count,1)))
     begin, end = reuse.get('begin',{}), reuse.get('end',{})
-    pipeline = {k:max(0,end.get(k,0)-begin.get(k,0)) for k in ('source_create_calls','source_create_ms','binary_hits','binary_total_ms','cache_create_calls','cache_create_ms','binary_refused','missing','store_write_failures')}
+    pipeline = {k:max(0,end.get(k,0)-begin.get(k,0)) for k in ('source_create_calls','source_create_ms','source_create_started','binary_hits','binary_total_ms','cache_create_calls','cache_create_ms','binary_refused','missing','store_write_failures')}
+    pipeline.update(source_active_begin=begin.get('source_create_active'),source_active_end=end.get('source_create_active'))
+    warm = all(k in begin and k in end for k in ('source_create_calls','source_create_ms','source_create_started','source_create_active')) and all(pipeline[k]==0 for k in ('source_create_calls','source_create_ms','source_create_started','source_active_begin','source_active_end'))
     return dict(seconds=seconds, flips=count, flips_per_second=count/max(seconds,.001),
         frame_times=fps_stats([v[0] for v in data['intervals_us_and_flip']]),
         rates_per_second={k:v/max(seconds,.001) for k,v in data['counters'].items()},
         per_flip={k:v/max(count,1) for k,v in data['counters'].items()},
         cpu_ms_per_flip_by_group=groups, system_cpu_ms_per_flip_by_group=system, threads=sorted(threads,key=lambda t:-t['cpu_ms_per_flip']),
         fault_cost=fault_cost(data['counters'],count),
-        jobs=data['job_workers'], pipelines=pipeline, fully_warm=all(k in begin and k in end for k in ('source_create_calls','source_create_ms')) and pipeline['source_create_calls']==0 and pipeline['source_create_ms']==0,
+        jobs=data['job_workers'], pipelines=pipeline, fully_warm=warm,
         upscaler=data['upscaler'])
 
 
@@ -170,7 +173,8 @@ def report(run, metrics, diagnostic=False):
     reasons=[]
     if metrics['exit_code'] or metrics['validation_errors'] or metrics['crash_bytes']: reasons.append('runtime/validation/crash failure')
     if metrics['thermal'].get('aborted'): reasons.append('thermal/guard abort')
-    if metrics['effective_validation'] is not False: reasons.append('validation off not confirmed')
+    validation = 'validation' in metrics.get('profile','')
+    if metrics['effective_validation'] is not validation: reasons.append('requested validation state not confirmed')
     if not sizes or sizes[-1] != ('3840','2160'): reasons.append('native guest render size not confirmed')
     if not swapchains or swapchains[-1] != ('3840','2160'): reasons.append('3840x2160 swapchain not confirmed; wrong monitor/size')
     if 'SDL window mode 1 applied' not in text: reasons.append('fullscreen not confirmed')
@@ -184,26 +188,30 @@ def report(run, metrics, diagnostic=False):
         if p.get('seconds',0)<seconds or p.get('flips',0)<30: reasons.append(label+' insufficient samples')
         if p.get('upscaler') != 'Off': reasons.append(label+' upscaler not disabled')
         if not diagnostic and not p.get('recording_self',{}).get('valid'): reasons.append(label+' missing/invalid TSC self profile')
-        if not p.get('fully_warm',False): reasons.append(label+' compiled pipelines inside measurement')
+        if not validation and not p.get('fully_warm',False): reasons.append(label+' compiled pipelines inside measurement')
         if not p.get('presentation',{}).get('wait_complete',{}).get('samples',0): reasons.append(label+' no KHR completion samples')
     for trace in metrics['timelines']:
         if not trace['thermal']['valid']:
             reason=trace.get('phase','trace')+' thermal pause/abort'
             if reason not in reasons: reasons.append(reason)
-    if diagnostic and 'sample' not in metrics.get('profile','') and not any(t.get('gpu_timestamp_spans',0)>0 for t in metrics['timelines']): reasons.append('no diagnostic GPU timestamps')
+    if diagnostic and not validation and 'sample' not in metrics.get('profile','') and not any(t.get('gpu_timestamp_spans',0)>0 for t in metrics['timelines']): reasons.append('no diagnostic GPU timestamps')
     if not diagnostic:
         for label in ('stationary','walking'):
             if not any(t.get('phase')==label and t.get('frames',0)>=2 and not t.get('gpu_timestamp_spans',0) for t in metrics['timelines']):
                 reasons.append(label+' missing adjacent CPU wait trace')
     if metrics['write_watch_requested'] != metrics['write_watch']: reasons.append('requested tracking backend unavailable/fell back')
     profile=metrics.get('profile','')
-    if re.match(r'steady-[ab]\d+-(baseline|whole-run)-',profile):
+    if re.match(r'steady-[abc]\d+-(baseline|whole-run|whole-run-quick)-',profile):
         kind=candidate_of(profile)
-        expected=f"Linux whole-run recording: {str(kind == 'whole-run').lower()}"
+        expected=f"Linux whole-run recording: {str(kind.startswith('whole-run')).lower()}"
         if expected not in text: reasons.append('recording candidate switches not confirmed')
+        quick = kind=='whole-run-quick'
+        enabled=os.environ.get('DS_RELAY_QUICK_WINS','tsc,static-bind').split(',')
+        expected=f"Linux recording quick wins: tsc={str(quick and 'tsc' in enabled).lower()} static_bind={str(quick and 'static-bind' in enabled).lower()}"
+        if expected not in text: reasons.append('quick-win switches not confirmed')
 
     whole=whole_run_counts(text)
-    if candidate_of(profile) == 'whole-run' and whole['runs'] == 0:
+    if candidate_of(profile).startswith('whole-run') and whole['runs'] == 0:
         reasons.append('whole-run path not exercised')
 
     screenshots=sorted(str(p.relative_to(run)) for p in (run/'user').rglob('*steady-*.png'))
@@ -220,9 +228,9 @@ def report(run, metrics, diagnostic=False):
     for d in gpu.values():
         for k,v in list(d.items()): d[k]=dict(samples=len(v),mean=sum(v)/len(v),min=min(v),max=max(v))
     cooled=cooldown_report(run/'monitor.jsonl')
-    if re.match(r'steady-[ab]\d+-',metrics.get('profile','')) and not cooled['valid']: reasons.append('session cooling to <=70C not confirmed')
-    result=dict(whole_run=whole,cooldown=cooled,valid_steady_state=not reasons and not diagnostic, diagnostic=diagnostic, invalid_reasons=reasons,
-        recording_candidate=candidate_of(metrics.get('profile','')), address_wake=True, pair=int(re.search(r'steady-[ab](\d+)-',metrics.get('profile','')).group(1)) if re.search(r'steady-[ab](\d+)-',metrics.get('profile','')) else 1,
+    if re.match(r'steady-[abc]\d+-',metrics.get('profile','')) and not cooled['valid']: reasons.append('session cooling to <=70C not confirmed')
+    result=dict(translation_identity=[l for l in text.splitlines() if 'fingerprint' in l.lower() or 'pipeline binaries:' in l.lower()],whole_run=whole,cooldown=cooled,valid_steady_state=not reasons and not diagnostic, diagnostic=diagnostic, invalid_reasons=reasons,
+        recording_candidate=candidate_of(metrics.get('profile','')), address_wake=True, pair=int(re.search(r'steady-[abc](\d+)-',metrics.get('profile','')).group(1)) if re.search(r'steady-[abc](\d+)-',metrics.get('profile','')) else 1,
         exit_code=metrics['exit_code'], selfplay=metrics.get('selfplay',[]),
         phases=phases, gpu_samples=gpu, waits=metrics['timelines'], display=[l for l in text.splitlines() if any(t in l for t in ('SDL display:', 'swapchain ', 'SDL window mode', 'pc settings: state:'))], requested_tracking=metrics['write_watch_requested'],
         actual_tracking=metrics['write_watch'], screenshots=screenshots,
@@ -279,12 +287,12 @@ def recording_comparison(results):
         groups.setdefault(r.get('pair',1),{})[r.get('recording_candidate',candidate_of(label))]=(label,r)
     pairs={}
     for index,group in sorted(groups.items()):
-        for candidate in ('whole-run',):
+        for base,candidate in [('baseline','whole-run'),('baseline','whole-run-quick'),('whole-run','whole-run-quick')]:
             if candidate not in group: continue
-            name=f'{candidate} pair {index}'
-            if 'baseline' not in group or not all(group[k][1]['valid_steady_state'] for k in ('baseline',candidate)):
+            name=f'{candidate} pair {index}' if base=='baseline' else f'quick-wins incremental pair {index}'
+            if base not in group or not all(group[k][1]['valid_steady_state'] for k in (base,candidate)):
                 pairs[name]=dict(performance_valid=False,reason='requires two warm, cooled, successful sessions');continue
-            a,b=group['baseline'][1],group[candidate][1]
+            a,b=group[base][1],group[candidate][1]
             if a.get('actual_tracking')!='mprotect' or b.get('actual_tracking')!='mprotect':
                 pairs[name]=dict(performance_valid=False,reason='recording A/B requires mprotect in both');continue
             phases={}
@@ -300,8 +308,8 @@ def recording_comparison(results):
                     self_ms_before=rows_before,self_ms_after=rows_after,
                     self_ms_delta={k:rows_after.get(k,0)-rows_before.get(k,0) for k in rows_before.keys()|rows_after.keys()},
                     frame_ms_before=old['frame_times'],frame_ms_after=new['frame_times'])
-            pairs[name]=dict(performance_valid=True,baseline=group['baseline'][0],candidate=group[candidate][0],phases=phases)
-    return dict(pairs=pairs,correctness_verified=False,note='Each isolated switch compared with its cooled baseline twice; PNG review required before enabling by default.')
+            pairs[name]=dict(performance_valid=True,baseline=group[base][0],candidate=group[candidate][0],phases=phases)
+    return dict(pairs=pairs,correctness_verified=False,note='Cooled A/B/C/A/B/C, including incremental B-to-C comparison; PNG review required before enabling by default.')
 
 
 def cooldown_report(path):
@@ -332,12 +340,16 @@ def summary(results, sessions=None):
         lines.append(f'  runtime exit: {r.get("exit_code")}; '+str(r.get('selfplay',[])))
         if 'whole_run' in r: lines.append('  whole-run coverage (session totals): '+str(r['whole_run']))
         for phase,p in r['phases'].items():
-            cost=p.get('fault_cost',{})
-            if cost.get('samples'):
-                lines.append(f'  {phase} direct-fault recovery estimate: {cost["estimated_cpu_ms_per_flip"]:.3f} CPU ms/flip, {cost["estimated_wall_ms_per_flip"]:.3f} summed wall ms/flip ({cost["samples"]} samples; EXCLUDES kernel signal entry/return).')
             if not p.get('thermal',{}).get('valid',False):
                 lines.append(f'{phase}: INVALID thermal pause/abort; raw timings retained in JSON only, excluded from performance comparison.')
                 continue
+            if r.get('warmup_only') or r.get('diagnostic') or not p.get('fully_warm',False):
+                state = 'UNMEASURED warm-up' if r.get('warmup_only') else ('DIAGNOSTIC (not performance)' if r.get('diagnostic') else 'INVALID compile-contaminated')
+                lines.append(f'{phase}: {state}; source counters {p.get("pipelines",{})}. Raw timings retained in JSON only.')
+                continue
+            cost=p.get('fault_cost',{})
+            if cost.get('samples'):
+                lines.append(f'  {phase} direct-fault recovery estimate: {cost["estimated_cpu_ms_per_flip"]:.3f} CPU ms/flip, {cost["estimated_wall_ms_per_flip"]:.3f} summed wall ms/flip ({cost["samples"]} samples; EXCLUDES kernel signal entry/return).')
             t=p['frame_times']; present=p['presentation'].get('wait_complete',{})
             lines.append(f'{phase}: {p["flips_per_second"]:.2f} flips/s; frame ms p50/p90/p99/max '+
                 '/'.join(f'{t.get(k,0):.2f}' for k in ('p50_ms','p90_ms','p99_ms','max_ms'))+
@@ -388,13 +400,39 @@ def whole_run_counts(text):
 
 
 def candidate_of(label):
-    return next((k for k in ('whole-run',) if '-'+k+'-' in label), 'baseline')
+    return next((k for k in ('whole-run-quick','whole-run') if '-'+k+'-' in label), 'baseline')
 
 
 def session_plan(variants, gpu_timing=True, sampling=False, candidate=None):
     if candidate:
-        return [f'steady-{arm}{pair}-{v}-mprotect' for pair in (1,2) for arm,v in [('a','baseline'),('b',candidate)]] + (['steady-diagnostic-mprotect'] if gpu_timing else [])
+        return [f'steady-{arm}{pair}-{v}-mprotect' for pair in (1,2) for arm,v in [('a','baseline'),('b','whole-run'),('c','whole-run-quick')]] + ['steady-validation-whole-run-quick-mprotect'] + (['steady-diagnostic-whole-run-quick-mprotect'] if gpu_timing else [])
     return [f'steady-{chr(97+i)}{pair}-{v}' for pair in (1,2) for i,v in enumerate(variants)] + (['steady-sample-mprotect'] if sampling else []) + (['steady-diagnostic-'+variants[0]] if gpu_timing else [])
+
+
+def warm_store(labels, limit, run_one, persist):
+    """A complete zero-source cycle proves this route/store for every variant. No timing
+    session starts with an unknown seed. Private store grows; caller's seed is read-only.
+    """
+    results, sessions, clean = {}, {}, set()
+    for i in range(limit):
+        label=labels[i % len(labels)]
+        name=f'warmup-{i+1}-'+label.removeprefix('steady-')
+        sessions[name]=dict(state='warming',attempts=[name]);persist(results,sessions)
+        try: result=run_one(label,0,name)
+        except Exception as e:
+            sessions[name]['state']='failed';persist(results,sessions)
+            raise ValueError(f'warm-up {name} failed; no performance sessions started: {e}') from e
+        result['warmup_only']=True;result['valid_steady_state']=False;results[name]=result
+        reasons=result['invalid_reasons']
+        failures=[r for r in reasons if not r.endswith('compiled pipelines inside measurement')]
+        if failures:
+            sessions[name]['state']='failed';persist(results,sessions)
+            raise ValueError(f'warm-up {name} failed; no performance sessions started: '+', '.join(failures))
+        if not reasons: clean.add(label)
+        else: clean.clear()
+        sessions[name]['state']='warm' if not reasons else 'compiled (unmeasured)';persist(results,sessions)
+        if len(clean)==len(labels): return results,sessions
+    raise ValueError(f'Warm store not established after {limit} dedicated route passes; no performance sessions started. Reuse prepared-shaders next time; inspect warm-up source calls.')
 
 
 def run_suite(labels, run_one, persist):
@@ -406,7 +444,7 @@ def run_suite(labels, run_one, persist):
     persist(results,sessions)
     try:
         for label in labels:
-            diagnostic=any(k in label for k in ('diagnostic','sample'))
+            diagnostic=any(k in label for k in ('diagnostic','sample','validation'))
             for attempt in range(1 if diagnostic else 2):
                 name=label if attempt==0 else label.replace('steady-','steady-warm-',1)
                 sessions[label]['state']='running'
@@ -419,8 +457,8 @@ def run_suite(labels, run_one, persist):
                     # without sacrificing the other independent measurements.
                     result=dict(valid_steady_state=False,diagnostic=diagnostic,recording_candidate=candidate_of(label),
                         invalid_reasons=[f'session launch/analysis failed: {type(e).__name__}: {e}'],
-                        exit_code=None,selfplay=[],phases={},waits=[],actual_tracking='unknown',pair=int(re.search(r'steady-[ab](\d+)-',label).group(1)) if re.search(r'steady-[ab](\d+)-',label) else 1,error_traceback=traceback.format_exc())
-                retry=not diagnostic and not re.match(r'steady-[ab]\d+-',label) and attempt==0 and needs_warm_retry(result)
+                        exit_code=None,selfplay=[],phases={},waits=[],actual_tracking='unknown',pair=int(re.search(r'steady-[abc](\d+)-',label).group(1)) if re.search(r'steady-[abc](\d+)-',label) else 1,error_traceback=traceback.format_exc())
+                retry=not diagnostic and not re.match(r'steady-[abc]\d+-',label) and attempt==0 and needs_warm_retry(result)
                 if retry:
                     result['warmup_only']=True
                     result['retry_reasons']=result['invalid_reasons']
@@ -445,13 +483,17 @@ def main():
     parser.add_argument('--app',default=os.environ.get('DS_GAME_DIR'))
     parser.add_argument('--save-seed',default=os.environ.get('DS_RELAY_SAVE_SEED'))
     parser.add_argument('--shader-seed',default=os.environ.get('DS_RELAY_SHADER_SEED'))
-    parser.add_argument('--record-candidate',choices=('whole-run',),help='cooled baseline/candidate/baseline/candidate, mprotect in all four; each change remains off in normal play')
-    parser.add_argument('--tracking',choices=('mprotect','uffd','both'),default='both')
+    parser.add_argument('--record-candidate',choices=('whole-run',),help='cooled A/B/C/A/B/C: baseline, whole-run, whole-run plus quick wins; all remain off in normal play')
+    parser.add_argument('--warmup-passes',type=int,default=9,help='bounded route passes to establish a common warm store before any measurement (default9)')
+    parser.add_argument('--quick-wins',default='tsc,static-bind',help='whole-run-quick switches: tsc,static-bind, or either alone')
+    parser.add_argument('--tracking',choices=('mprotect','uffd','both'),default='uffd')
     parser.add_argument('--perf-gpu-gfx',action='store_true',help='separate stationary gpu-gfx sampling run; requires perf; never included in clean FPS')
     parser.add_argument('--thermal-pause',action='store_true',help='use preparation-style SIGSTOP cooling instead of as-played measurement')
     parser.add_argument('--no-gpu-timing',action='store_true',help='omit the separate short diagnostic session')
     parser.add_argument('--dry-run',action='store_true')
     args=parser.parse_args()
+    if not 1 <= args.warmup_passes <= 12: parser.error('--warmup-passes must be 1..12')
+    if not set(args.quick_wins.split(',')) <= {'tsc','static-bind'}: parser.error('--quick-wins must be tsc,static-bind or either alone')
     if args.record_candidate and args.perf_gpu_gfx: parser.error('--perf-gpu-gfx is separate from recording A/B')
     if not args.app: parser.error('set DS_GAME_DIR or pass --app /path/to/PPSA01341-app0')
     repo=Path(__file__).resolve().parent.parent
@@ -471,7 +513,7 @@ def main():
         recording_candidate=args.record_candidate,
         visible=True,fullscreen=True,render_pixels=[3840,2160],audio='null',stationary_s=30,walking_s=60,
         timing='no capture/validation/probes during clean intervals; adjacent32-flip TSC self profiles always; optional separate20s perf sampling and sampled fault recovery; GPU diagnostic LAST: 5s/5s CPU profile, bucket census and32-flip GPU segment traces, never baseline FPS',
-        timeout_each_s=630,run_seconds=600,warm_retry='no inserted retry in A,B,A,B; second visit reuses its private warmed cache; contaminated pairs are reported invalid',cpu_lock='~/.cache/cpu-heavy.lock (DS_CPU_HEAVY_LOCK overrides); taken by this script, do not double-wrap with flock',cooldown='Before EACH launch, including repeats/diagnostics: <=70C (DS_RELAY_SESSION_TEMP), bounded600s (DS_RELAY_COOLDOWN_S). No session starts on cooldown failure.',cpu='DS_RELAY_CPUS or 8 logical CPUs; nice10; workers2; thermal observe per second, no SIGSTOP,105/60s abort; --thermal-pause restores preparation cooling')
+        timeout_each_s=630,run_seconds=600,warm_retry='Dedicated unmeasured same-route passes through all variants before A/B/C. Require a complete zero-compile cycle; stop loudly if not warm. Every timed session copies the same prepared store.',warmup_passes=args.warmup_passes,quick_wins=args.quick_wins,cpu_lock='~/.cache/cpu-heavy.lock (DS_CPU_HEAVY_LOCK overrides); taken by this script, do not double-wrap with flock',cooldown='Before EACH launch, including repeats/diagnostics: <=70C (DS_RELAY_SESSION_TEMP), bounded600s (DS_RELAY_COOLDOWN_S). No session starts on cooldown failure.',cpu='DS_RELAY_CPUS or 8 logical CPUs; nice10; workers2; thermal observe per second, no SIGSTOP,105/60s abort; --thermal-pause restores preparation cooling')
     if args.dry_run: print(json.dumps(plan,indent=2)); return 0
     if not (repo/'target/release/dsport').is_file(): parser.error('build release dsport first')
     output.mkdir(parents=True); print(f'Steady relay output: {output}',flush=True); (output/'plan.json').write_text(json.dumps(plan,indent=2)+'\n')
@@ -480,16 +522,19 @@ def main():
     (snapshot/'pcsettings.txt').write_text(settings((seed/'pcsettings.txt').read_text() if (seed/'pcsettings.txt').exists() else ''))
     os.environ.update(environment(),CARGO_HOME=str(repo/'.cargo-home'))
     caches={}
-    ready={}
+    master=output/'prepared-shaders'
+    master_driver=output/'prepared-driver'
+    os.environ['DS_RELAY_QUICK_WINS']=args.quick_wins
     def run_one(label,attempt,name):
-        diagnostic=any(k in label for k in ('diagnostic','sample'))
-        cache_key = label if diagnostic else (candidate_of(label), label.rsplit('-',1)[-1])
+        diagnostic=any(k in label for k in ('diagnostic','sample','validation'))
+        warming=name.startswith('warmup-')
+        cache_key = 'warmup' if warming else name
         if cache_key not in caches:
-            cache=output/(label+'-shaders')
-            linux_snapshot.copy_tree(ready.get('cache',shaders) if diagnostic else shaders,cache)
-            driver=output/(label+'-driver')
-            source_driver=ready.get('driver') if diagnostic and ready else (verified/'driver' if verified else None)
-            if source_driver and source_driver.is_dir(): linux_snapshot.copy_tree(source_driver,driver)
+            cache=master if warming else output/(name+'-shaders')
+            driver=master_driver if warming else output/(name+'-driver')
+            if not warming:
+                linux_snapshot.copy_tree(master,cache)
+                if master_driver.is_dir(): linux_snapshot.copy_tree(master_driver,driver)
             caches[cache_key]=(cache,driver)
         cache,driver=caches[cache_key]
         run=output/name
@@ -498,12 +543,14 @@ def main():
         result=report(run,metrics,diagnostic)
         if 'sample' in label:
             sample = run/'gpu-gfx-perf.json'
-            result['sampling'] = json.loads(sample.read_text()) if sample.exists() else dict(valid=False,error='stationary sampling never started')
+            result['sampling'] = linux_perf.finalize_phase(run) if sample.exists() else dict(valid=False,error='stationary sampling never started')
             if not result['sampling']['valid']:
                 result['invalid_reasons'].append('gpu-gfx sampling failed; see gpu-gfx-perf*.log/json')
                 result['valid_steady_state'] = False
+        if warming:
+            result['warmup_only']=True
+            result['valid_steady_state']=False
         (run/'steady-summary.json').write_text(json.dumps(result,indent=2)+'\n')
-        if result['valid_steady_state']: ready.update(cache=cache,driver=driver)
         return result
 
     def persist(results,sessions):
@@ -518,13 +565,26 @@ def main():
         with linux_guard.cpu_heavy_lock():
             if args.perf_gpu_gfx: linux_perf.preflight(output)
             started_suite = True
-            results,sessions=run_suite(plan['sessions'],run_one,persist)
+            linux_snapshot.copy_tree(shaders,master)
+            if verified and (verified/'driver').is_dir(): linux_snapshot.copy_tree(verified/'driver',master_driver)
+            warm_labels=plan['sessions'][:3] if args.record_candidate else plan['sessions'][:len(variants)]
+            warm_results,warm_sessions=warm_store(warm_labels,args.warmup_passes,run_one,
+                lambda r,ss: persist(r,{**ss,**{l:dict(state='not run (waiting for warm store)',attempts=[]) for l in plan['sessions']}}))
+            with (repo/'target/release/dsport').open('rb') as binary:
+                binary_hash=hashlib.file_digest(binary,'sha256').hexdigest()
+            (output/'warmup.json').write_text(json.dumps(dict(passed=True,sessions=list(warm_results),
+                shader_store=str(master),driver_store=str(master_driver),binary_sha256=binary_hash,translation_identity=next(reversed(warm_results.values())).get('translation_identity',[])),indent=2)+'\n')
+            results,sessions=run_suite(plan['sessions'],run_one,lambda r,ss: persist({**warm_results,**r},{**warm_sessions,**ss}))
+            results={**warm_results,**results};sessions={**warm_sessions,**sessions}
     except (OSError,ValueError,linux_guard.GuardError,KeyboardInterrupt) as e:
+        if not (output/'warmup.json').exists():
+            (output/'warmup.json').write_text(json.dumps(dict(passed=False,error=str(e)),indent=2)+'\n')
         if not started_suite:
             sessions={label:dict(state='not run (preflight/lock failure)',attempts=[]) for label in plan['sessions']}
             persist({},sessions)
             with (output/'summary.txt').open('a') as f: f.write(f'No game started: {e}\n')
             print(output,flush=True)
+        with (output/'summary.txt').open('a') as f: f.write(f'\nSUITE STOPPED: {e}\n')
         raise
 
     print(output)

@@ -503,7 +503,7 @@ pub fn tick() {
     }
     // (Not while the system text box is open over a menu: the character's name. The box takes
     // the keys; the pointer has nothing to point at there.)
-    let menu = uistate::menu_depth().unwrap_or(0) > 0 && !crate::hle::libs::ime_dialog::active();
+    let menu = uistate::menu_depth().unwrap_or(0) > 0 && !crate::hle::libs::ime_dialog::active() && !crate::hle::libs::savedata::list_active();
     // Only where there is something to point at: a menu with a list the index finds (not a
     // cutscene's skip prompt, a loading screen or a title card; `POINTABLE`, kept a moment over a
     // screen's change so the pointer does not blink between menus).

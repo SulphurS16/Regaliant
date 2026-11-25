@@ -464,6 +464,7 @@ pub fn read_archive_into(path: &str, a: &Archive, node: u32, buf: &mut [u8], off
     crate::platform::file_hooks::trace_writes(|| format!("archive read of '{path}' [{off:#x}]"), base, len);
     let what = || format!("read of '{path}' [{off:#x}] into {base:#x} (archive)");
     let r = crate::mem::kernel_io(&what, base, len, true, || a.read_at(node, off, &mut *buf));
+    crate::platform::file_hooks::note_kernel_read(base, len, off, &r, &what);
     if let Err(e) = &r {
         crate::warn!("read of '{path}' [{off:#x}+{len:#x}] from the archive failed: {e}");
     }
@@ -498,19 +499,13 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             let _w = crate::platform::file_hooks::host_write(buf.as_ptr() as u64, buf.len() as u64);
             crate::platform::file_hooks::trace_writes(|| format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
             let setup_us = t0.elapsed().as_micros();
-            let mut done = 0;
             let base = buf.as_ptr() as u64;
-            while done < buf.len() {
-                let what = || format!("read of '{}' [{:#x}] into {:#x}", f.path, off + done as u64, base + done as u64);
-                match crate::mem::kernel_io(&what, base + done as u64, (buf.len() - done) as u64, true, || file.seek_read(&mut buf[done..], off + done as u64)) {
-                    Ok(0) => break,
-                    Ok(n) => done += n,
-                    Err(e) => {
-                        crate::platform::file_hooks::note_since(t0, || format!("pread '{}' offset {off:#x}, requested {} bytes, completed {done}, failed: {e}", f.path, buf.len()));
-                        return Err(io_errno(&e));
-                    }
-                }
-            }
+            let what = |done| format!("read of '{}' [{:#x}] into {:#x}", f.path, off + done, base + done);
+            let done = crate::mem::kernel_read_at(&what, buf, off, |buf, at| file.seek_read(buf, at))
+                .map_err(|e| {
+                    crate::platform::file_hooks::note_since(t0, || format!("pread '{}' offset {off:#x}, requested {} bytes, failed: {e}", f.path, buf.len()));
+                    io_errno(&e)
+                })?;
             if crate::hle::iostat::note("kernel", &f.path, crate::hle::iostat::What::Read, done as u64) {
                 crate::info!("read '{}' [{off:#x}+{:#x}] -> {done:#x} bytes", f.path, buf.len());
             }
@@ -522,11 +517,12 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             let n = buf.len().min(d.len() - start);
             let what = || format!("read of '{}' [{off:#x}] (memory)", f.path);
             let _w = crate::platform::file_hooks::host_write(buf.as_ptr() as u64, n as u64);
-            crate::mem::kernel_io(&what, buf.as_ptr() as u64, n as u64, true, || {
+            let result = crate::mem::kernel_io(&what, buf.as_ptr() as u64, n as u64, true, || {
                 buf[..n].copy_from_slice(&d[start..start + n]);
                 Ok(n)
-            })
-            .map_err(|e| io_errno(&e))
+            });
+            crate::platform::file_hooks::note_kernel_read(buf.as_ptr() as u64, n as u64, off, &result, &what);
+            result.map_err(|e| io_errno(&e))
         }
         Kind::Zar { archive, node } => {
             let t0 = std::time::Instant::now();

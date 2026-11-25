@@ -118,11 +118,15 @@ impl State {
                     self.swallowed.clear();
                     self.input.keys.clear();
                     self.input.mouse_buttons.clear();
+                    MOUSE_SWALLOW.store(0, Ordering::Relaxed);
                 }
                 Event::Window {
                     win_event: WindowEvent::FocusGained,
                     ..
-                } => self.focused = true,
+                } => {
+                    self.focused = true;
+                    crate::hle::libs::savedata::note_activation();
+                }
                 Event::Window { win_event: WindowEvent::DisplayChanged(_), .. } => {
                     note_display(&self.window);
                     RESIZED.store(true, Ordering::Release);
@@ -154,6 +158,13 @@ impl State {
                         }
                         continue;
                     }
+                    if crate::hle::libs::savedata::list_key_down(vk, repeat) {
+                        crate::input::note_device(crate::input::DEVICE_KBM);
+                        if !crate::hle::libs::savedata::list_active() {
+                            self.swallowed.insert(k);
+                        }
+                        continue;
+                    }
                     if !repeat && (k == K::F11 || (k == K::Return && alt)) {
                         set_fullscreen(None);
                         let _ = crate::pcsettings::store::set_by_name(
@@ -173,7 +184,8 @@ impl State {
                         continue;
                     }
                     if !repeat && k == K::F10 {
-                        crate::hle::libs::videoout::burst_hotkey();
+                        if ctrl { crate::stacks_hotkey(); }
+                        else { crate::hle::libs::videoout::burst_hotkey(); }
                         continue;
                     }
                     let general = match vk {
@@ -236,6 +248,14 @@ impl State {
                         B::X2 => Some(4),
                         _ => None,
                     };
+                    if crate::hle::libs::savedata::list_active() {
+                        if let Some(bit @ 0..=1) = index {
+                            MOUSE_SWALLOW.fetch_or(1 << bit, Ordering::Relaxed);
+                            crate::input::note_device(crate::input::DEVICE_KBM);
+                            crate::hle::libs::savedata::list_click(bit == 0);
+                        }
+                        continue;
+                    }
                     if crate::pcsettings::bindings::mouse_down(index, 0) {
                         continue;
                     }
@@ -254,9 +274,20 @@ impl State {
                 Event::MouseButtonUp { mouse_btn, .. } => {
                     self.cursor.mouse();
                     self.input.mouse_buttons.remove(&mouse_btn);
+                    let bit = match mouse_btn {
+                        sdl3::mouse::MouseButton::Left => 1,
+                        sdl3::mouse::MouseButton::Right => 2,
+                        _ => 0,
+                    };
+                    MOUSE_SWALLOW.fetch_and(!bit, Ordering::Relaxed);
                 }
                 Event::MouseWheel { x, y, .. } => {
                     self.cursor.mouse();
+                    if crate::hle::libs::savedata::list_active() {
+                        crate::input::note_device(crate::input::DEVICE_KBM);
+                        crate::hle::libs::savedata::list_wheel((y * 120.0) as i32);
+                        continue;
+                    }
                     if crate::pcsettings::bindings::mouse_down(None, (y * 120.0) as i32) {
                         continue;
                     }
@@ -368,6 +399,7 @@ pub static MOUSE_DX: AtomicI64 = AtomicI64::new(0);
 pub static MOUSE_DY: AtomicI64 = AtomicI64::new(0);
 pub static MOUSE_WHEEL: AtomicI32 = AtomicI32::new(0);
 pub static MOUSE_BUTTONS: AtomicU32 = AtomicU32::new(0);
+pub static MOUSE_SWALLOW: AtomicU32 = AtomicU32::new(0);
 pub static CAPTURED: AtomicBool = AtomicBool::new(false);
 pub static CAPTURE_TEST: AtomicBool = AtomicBool::new(false);
 pub static FULLSCREEN: AtomicBool = AtomicBool::new(false);

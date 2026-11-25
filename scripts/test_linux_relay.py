@@ -35,7 +35,7 @@ class Accounting(unittest.TestCase):
 
     def test_short_suite_is_two_sessions_in_both_wrappers(self):
         for mode in ['offscreen', 'present']:
-            self.assertEqual(relay.suite_labels(mode, False), ['mprotect-1', 'present-fifo-cold'])
+            self.assertEqual(relay.suite_labels(mode, False), ['clean-1', 'present-fifo-cold'])
             self.assertGreater(len(relay.suite_labels(mode, True)), 2)
 
     def test_stat_comm_and_pid_reuse(self):
@@ -172,7 +172,7 @@ class Accounting(unittest.TestCase):
             self.assertNotIn('VK_INSTANCE_LAYERS', e)
             self.assertEqual(e['DS_PROFILE_GPU'], '0')
             self.assertEqual(e['DS_BATCH_STAMPS'], '0')
-            self.assertEqual(e['DS_LINUX_WRITE_WATCH'], 'mprotect')
+            self.assertEqual(e['DS_LINUX_WRITE_WATCH'], 'uffd')
         self.assertEqual(relay.session_environment({}, 'present-validation')['DS_VK_VALIDATION'], '1')
         old = relay.session_environment({}, 'sparse-original')
         new = relay.session_environment({}, 'mprotect-1')

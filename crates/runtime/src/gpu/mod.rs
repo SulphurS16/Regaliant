@@ -8,6 +8,7 @@
 //! are decoded but not rendered yet (docs/STATUS.md).
 
 pub mod cpu_profile;
+pub mod record_opts;
 pub mod capture;
 pub mod nan_probe;
 pub mod cp;
@@ -3827,3 +3828,7 @@ pub fn status_ex(with_stacks: bool) -> String {
     }
     s
 }
+
+#[cfg(target_os = "linux")]
+#[path = "../platform/linux/framegen.rs"]
+pub mod framegen;

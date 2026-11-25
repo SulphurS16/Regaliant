@@ -2,8 +2,8 @@
 //! observation, not a scanout timestamp. It is the relay pacing measure.
 use parking_lot::Mutex;
 use std::time::Instant;
-struct Row { kind: &'static str, id: u64, ns: u64, costs: [f64; 6] }
-struct State { begin: u64, rows: Vec<Row>, submitted: std::collections::HashSet<u64>, reuse: serde_json::Value }
+struct Row { kind: &'static str, id: u64, ns: u64, costs: [f64; 6], generated: bool, age: f64, compute: f64 }
+struct State { begin: u64, rows: Vec<Row>, submitted: std::collections::HashMap<u64,bool>, reuse: serde_json::Value }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 fn now() -> u64 {
     let mut t: libc::timespec = unsafe { std::mem::zeroed() };
@@ -12,7 +12,7 @@ fn now() -> u64 {
 }
 pub fn begin() {
     let reuse = crate::gpu::pcache::reuse_report();
-    *STATE.lock() = Some(State { begin: now(), rows: Vec::with_capacity(16000), submitted: std::collections::HashSet::with_capacity(4096), reuse });
+    *STATE.lock() = Some(State { begin: now(), rows: Vec::with_capacity(16000), submitted: std::collections::HashMap::with_capacity(4096), reuse });
 }
 fn record(kind: &'static str, id: u64, ns: u64, costs: [f64; 6]) {
     if let Some(s) = STATE.lock().as_mut() {
@@ -20,9 +20,10 @@ fn record(kind: &'static str, id: u64, ns: u64, costs: [f64; 6]) {
         // after a capture or swapchain wait. Submission is recorded before the waiter
         // receives its present ID. Both series use the same KHR ID when supported.
         if ns >= s.begin && s.rows.len() < 100000 {
-            if kind == "submit" { s.submitted.insert(id); }
-            else if !s.submitted.contains(&id) { return; }
-            s.rows.push(Row { kind, id, ns, costs });
+            let (generated, age, compute) = crate::gpu::framegen::timing();
+            if kind == "submit" { s.submitted.insert(id, generated); }
+            else if !s.submitted.contains_key(&id) { return; }
+            s.rows.push(Row { kind, id, ns, costs, generated: s.submitted[&id], age: if kind=="submit" {age}else{0.0}, compute: if kind=="submit" {compute}else{0.0} });
         }
     }
 }
@@ -41,9 +42,9 @@ pub fn end(phase: &str) {
     let path = dir.join(format!("{phase}-presentation.csv"));
     let result = (|| -> std::io::Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
-        writeln!(f, "kind,id,monotonic_ns,slot_ms,acquire_ms,record_submit_ms,gpu_ready_ms,capture_queue_ms,present_ms")?;
+        writeln!(f, "kind,id,monotonic_ns,slot_ms,acquire_ms,record_submit_ms,gpu_ready_ms,capture_queue_ms,present_ms,generated,fg_snapshot_age_ms,fg_compute_completion_ms")?;
         for r in s.rows {
-            writeln!(f, "{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}", r.kind, r.id, r.ns, r.costs[0], r.costs[1], r.costs[2], r.costs[3], r.costs[4], r.costs[5])?;
+            writeln!(f, "{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6}", r.kind, r.id, r.ns, r.costs[0], r.costs[1], r.costs[2], r.costs[3], r.costs[4], r.costs[5], r.generated, r.age, r.compute)?;
         }
         f.flush()
     })();

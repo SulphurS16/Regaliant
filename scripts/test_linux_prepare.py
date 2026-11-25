@@ -1,5 +1,8 @@
 import importlib.util
 import tempfile
+import subprocess
+import sys
+import json
 import unittest
 from pathlib import Path
 
@@ -16,6 +19,16 @@ class Preparation(unittest.TestCase):
         self.assertEqual(env, original)
         self.assertEqual(cmd[:4], ['timeout', '-k', '10s', '630'])
         self.assertEqual(cmd[-4:], ['--prepare-shaders', '2', '--prepare-seconds', '600'])
+
+    def test_tracking_and_history_are_visible_in_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, str(Path(prepare.__file__)), '--app', tmp,
+                                     '--write-watch', 'uffd', '--io-history', '--dry-run'],
+                                    text=True, capture_output=True, check=True)
+            plan = json.loads(result.stdout)
+            self.assertEqual(plan['write_watch'], 'uffd')
+            self.assertEqual(plan['io_history'], '1')
+            self.assertIn('--prepare-shaders', plan['command'])
 
     def test_guard_logs_cannot_touch_game_or_link_targets(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -155,6 +155,31 @@ pub fn job_processes() -> Vec<u32> {
     buf[1..1 + n].iter().map(|&p| p as u32).collect()
 }
 
+/// Ends every process in the launcher's job now and waits up to `wait_ms` for them to end; the
+/// ids they had.
+pub fn end_job(wait_ms: u32) -> Vec<u32> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    let pids = job_processes();
+    let Some(j) = job() else { return pids };
+    if pids.is_empty() {
+        return pids;
+    }
+    unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(j, 1) };
+    let t = std::time::Instant::now();
+    for &pid in &pids {
+        let left = (wait_ms as u128).saturating_sub(t.elapsed().as_millis()) as u32;
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if !h.is_null() {
+                WaitForSingleObject(h, left);
+                CloseHandle(h);
+            }
+        }
+    }
+    pids
+}
+
 /// Starts `cmd` (its creation flags given, `CREATE_SUSPENDED` added here) in the launcher's job,
 /// then lets it run: its own processes (the hosted game) are in the job from their start.
 pub fn spawn_in_job(cmd: &mut std::process::Command, flags: u32) -> std::io::Result<std::process::Child> {

@@ -575,9 +575,70 @@ pub fn install() {
 /// code (one deep inside a driver) that no handler took.
 static UNHANDLED: AtomicBool = AtomicBool::new(false);
 
+/// The sites (rip) of access violations inside NVIDIA's modules logged at first chance
+/// (`veh_body`): each once, eight at most, so a site the driver's own handlers take again and
+/// again (a probe of memory, say) does not use up the lines a later fatal one needs.
+static DRIVER_FAULT_SITES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Whether `rip` is a driver fault site not logged yet (then it counts as logged).
+fn new_driver_fault_site(rip: u64) -> bool {
+    for s in &DRIVER_FAULT_SITES {
+        match s.compare_exchange(0, rip, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(v) if v == rip => return false,
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+/// A fault's frames for its log line, unwound with the registered tables only while the stack
+/// pointer stays inside the faulting stack's committed region (one VirtualQuery: a corrupt chain
+/// must not fault inside the handler, whose own fault would end a process the driver's handlers
+/// may have saved), up to the first guest frame.
+unsafe fn stack_bounded_frames(ctx: &CONTEXT, out: &mut [u64]) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(ctx.Rsp as *const std::ffi::c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return 0;
+    }
+    let (lo, hi) = (ctx.Rsp, mbi.BaseAddress as u64 + mbi.RegionSize as u64);
+    let mut c: AlignedContext = unsafe { std::mem::zeroed() };
+    c.0 = *ctx;
+    let mut n = 0;
+    while n < out.len() {
+        let pc = c.0.Rip;
+        if pc == 0 || in_guest(pc) {
+            break;
+        }
+        out[n] = pc;
+        n += 1;
+        if c.0.Rsp < lo || c.0.Rsp + 8 > hi {
+            break;
+        }
+        let mut base = 0u64;
+        let fe = unsafe { RtlLookupFunctionEntry(pc, &mut base, std::ptr::null_mut()) };
+        if fe.is_null() {
+            c.0.Rip = unsafe { *(c.0.Rsp as *const u64) };
+            c.0.Rsp += 8;
+        } else {
+            let mut handler_data = std::ptr::null_mut();
+            let mut establisher = 0u64;
+            unsafe { RtlVirtualUnwind(0, base, pc, fe, &mut c.0, &mut handler_data, &mut establisher, std::ptr::null_mut()) };
+        }
+        if c.0.Rsp < lo || c.0.Rsp >= hi {
+            break;
+        }
+    }
+    n
+}
+
 /// The last chance for a fault no handler took (the first sessions' access
 /// violations inside nvoglv64.dll ended the process with no report of
-/// ours): the fatal report, with the host frames down to our code.
+/// ours): the fatal report, with the host frames down to our code. (Under the port's host, a
+/// debugger, Windows does not call it: `veh_body` logs a driver's access violation at first
+/// chance instead.)
 unsafe extern "system" fn unhandled(info: *const EXCEPTION_POINTERS) -> i32 {
     UNHANDLED.store(true, Ordering::SeqCst);
     unsafe { veh_body(info as *mut EXCEPTION_POINTERS) };
@@ -1217,16 +1278,65 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
             // an access violation is: a 2026-11-15 review.)
             if !matches!(code, 0xC0000005 | 0xC0000094) || !called_from_our_code(ctx, 3) {
                 // (A fault inside the driver while it compiles one of our pipelines: which one,
-                // logged at first chance; its handlers, or none, decide the rest.)
-                if matches!(code, 0xC0000005 | 0xC0000094 | 0xC000001D) {
+                // logged at first chance; its handlers, or none, decide the rest. A breakpoint
+                // too since 2026-11-24 night: NVIDIA's 621.40 compiler stops on one (status
+                // 0x80000003, a player's compute step twice, issue #5's silent ends): unhandled,
+                // the process ended with nothing in its log and nothing on the crash list, so
+                // the launcher's step met it again in every attempt.)
+                if matches!(code, 0xC0000005 | 0xC0000094 | 0xC000001D | 0x80000003) {
                     if let Some(what) = crate::gpu::pcache::crumb_report() {
                         let module = module_offset(rip).map_or_else(|| format!("{rip:#x}"), |(m, o)| format!("{m}+{o:#x}"));
+                        // (Under the port's host the game has a debugger attached, so code that
+                        // breaks only for a debugger breaks here, and the host passes every such
+                        // exception on: the process ended with 0x80000003 where a game without a
+                        // debugger goes on (the first review of 2026-11-25). Stepped over, as
+                        // without a debugger: a one-byte int3 (Windows reports a breakpoint at
+                        // the int3's own byte), not one in a run of 0xCC padding (a stray jump),
+                        // the first in the compile only, the compile's binaries then not kept;
+                        // no suspect line for it, the compile's in-flight record covers a death
+                        // after it (the second review).)
+                        if code == 0x80000003 && crate::hosted::on() {
+                            let at = rip as *const u8;
+                            let padding = rip & 0xFFF != 0xFFF && *at.add(1) == 0xCC;
+                            if *at == 0xCC && !padding && crate::gpu::pcache::note_stepped_break() {
+                                (*(*info).ContextRecord).Rip += 1;
+                                crate::warn!("driver debug break at {module} while compiling {what}: stepped over, as a game without a debugger goes on (the port's host is one)");
+                                crate::log::try_flush();
+                                return -1; // EXCEPTION_CONTINUE_EXECUTION
+                            }
+                        }
                         crate::warn!("driver fault {code:#010x} at {module} while compiling {what}");
                         crate::log::try_flush();
                         // (A suspect: the driver's own handlers may still take it. The fatal
                         // report confirms it, `pcache::note_crash_suspect`.)
                         crate::gpu::pcache::note_crash_suspect();
                     }
+                }
+                // (An access violation deep inside NVIDIA's driver, left to its handlers: under
+                // the port's host, a debugger, no unhandled-exception filter runs, so when none
+                // takes it the game ends with no report of ours (DLSS's sessions of 2026-11-25:
+                // only Streamline's minidump). Logged at first chance with our frames, each site
+                // once, eight at most.)
+                if code == 0xC0000005
+                    && let Some((m, o)) = module_offset(rip).filter(|(m, _)| m.to_ascii_lowercase().starts_with("nv"))
+                    && new_driver_fault_site(rip)
+                {
+                    let (access, target) = if rec.NumberParameters >= 2 {
+                        let a = match rec.ExceptionInformation[0] {
+                            0 => "read",
+                            1 => "write",
+                            8 => "execute",
+                            _ => "access",
+                        };
+                        (a, rec.ExceptionInformation[1] as u64)
+                    } else {
+                        ("access", 0)
+                    };
+                    let mut host = [0u64; 24];
+                    let nh = stack_bounded_frames(ctx, &mut host);
+                    let frames: Vec<String> = host[..nh].iter().map(|&a| module_offset(a).map_or_else(|| format!("{a:#x}"), |(m, o)| format!("{m}+{o:#x}"))).collect();
+                    crate::warn!("access violation inside {m}+{o:#x} ({access} of {target:#x}), first chance, left to its handlers; frames: {}", frames.join(" <- "));
+                    crate::log::try_flush();
                 }
                 return EXCEPTION_CONTINUE_SEARCH;
             }

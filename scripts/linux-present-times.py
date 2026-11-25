@@ -64,6 +64,18 @@ def analyze(run):
         result['intervals_over_25ms'] = len(slow)
         result['slow_frame_stages'] = {k: percentiles([r[k] for r in slow if k in r])
             for k in ('enqueue_interval_ms', 'outside_current_present_ms', 'slot_ms', 'acquire_ms', 'record_submit_ms', 'gpu_ready_ms', 'present_ms')}
+        if any('generated' in r for r in rows):
+            completed = [r for r in rows if r['kind']=='wait_complete']
+            enqueues = [r for r in rows if r['kind']=='submit']
+            result['frame_generation'] = dict(
+                generated_completions=sum(r.get('generated')=='true' for r in completed),
+                real_completions=sum(r.get('generated')!='true' for r in completed),
+                compute_and_completion=percentiles([float(r['fg_compute_completion_ms']) for r in enqueues if r.get('generated')=='true']),
+                snapshot_to_generated_enqueue=percentiles([float(r['fg_snapshot_age_ms']) for r in enqueues if r.get('generated')=='true']),
+                snapshot_to_real_enqueue=percentiles([float(r['fg_snapshot_age_ms']) for r in enqueues if r.get('generated')!='true' and float(r.get('fg_snapshot_age_ms',0))>0]),
+                note='Snapshot age includes deferred recording, generation, and pacing. It is not input-to-photon latency.')
+        pacing = result['wait_complete']
+        if pacing.get('samples'): pacing['presented_fps'] = 1000/pacing['mean_ms']
         result['pacing'] = result['wait_complete']
         result['target'] = pacing_target(result['pacing'])
         result['stages'] = {name: percentiles([float(r[name]) for r in rows if r['kind'] == 'submit'])

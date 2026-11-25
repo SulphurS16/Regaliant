@@ -74,41 +74,143 @@ fn cstr_or(p: *const u8) -> String {
 /// pre-order gifts; it reads nothing else of an entry.)
 const ADDCONT_ENTRY: usize = 28;
 
-/// The player's own add-on packages: the entitlement labels in the names of the files and folders
-/// under "Add-ons" in the settings folder (the .pkg files or folders unpacked from them, at most
-/// three levels down; `addon_label`), scanned once. Without them the title hears of no add-ons, as
-/// on a console that has none installed.
-fn addon_labels() -> &'static (Vec<String>, std::path::PathBuf) {
-    static L: std::sync::OnceLock<(Vec<String>, std::path::PathBuf)> = std::sync::OnceLock::new();
+/// The add-on labels the title asks for (its caller's own two, 2026-11-24: the pre-order and the
+/// Digital Deluxe content), named in the scan's log line.
+const TITLE_ADDONS: [&str; 2] = ["DEMONSSOULSGIFT1", "DEMONSSOULSGIFT2"];
+/// The add-on scan reads at most this many files' first `ADDON_READ_BYTES` (`labels_in`).
+const ADDON_READS: usize = 32;
+const ADDON_READ_BYTES: u64 = 1 << 20;
+
+/// Where the player's add-on packages are looked for: a folder named "Add-ons" in the settings
+/// folder (%APPDATA%\Regaliant, under AppData\Roaming), in the data folder (%LOCALAPPDATA%\
+/// Regaliant, under AppData\Local) and beside the program. (A player put the packages under Local
+/// as well as Roaming on 2026-11-24, unsure which the notes meant; a checkout's or a portable
+/// install's one folder holds the first two.)
+fn addon_dirs() -> Vec<std::path::PathBuf> {
+    let p = crate::paths();
+    let mut v: Vec<std::path::PathBuf> = Vec::new();
+    for d in [p.user.join("Add-ons"), p.cache.join("Add-ons"), p.exe_dir.join("Add-ons")] {
+        if !v.contains(&d) {
+            v.push(d);
+        }
+    }
+    v
+}
+
+/// One folder's add-on scan (`scan_addons`).
+#[derive(Default)]
+struct AddonScan {
+    /// Each label found, with where (a name, or inside a file).
+    labels: Vec<(String, String)>,
+    /// Files and folders seen.
+    entries: usize,
+    /// The first files that gave no label.
+    others: Vec<String>,
+}
+
+/// The player's own add-on packages: the entitlement labels of the .pkg files, or of the folders
+/// unpacked from them, under the folders `addon_dirs` names, at most three levels down: from the
+/// content ID in a file's or folder's name (`addon_label`), else inside a file's first bytes
+/// (`labels_in`: a package's header, an unpacked folder's param.json), whatever the names. Scanned
+/// once, with one log line saying what was found where, or what each folder held. Without them
+/// the title hears of no add-ons, as on a console that has none installed.
+fn addon_labels() -> &'static Vec<String> {
+    static L: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     L.get_or_init(|| {
-        // (The settings folder this run uses, `--root` and portable ones too; the shader
-        // preparation's self-play has its own, without add-ons.)
-        let dir = crate::paths().user.join("Add-ons");
-        let mut found = Vec::new();
-        scan_addons(&dir, 3, &mut found);
+        let mut budget = ADDON_READS;
+        let mut found: Vec<String> = Vec::new();
+        let mut places = Vec::new();
+        for dir in addon_dirs() {
+            if !dir.is_dir() {
+                places.push(format!("{} (no such folder)", dir.display()));
+                continue;
+            }
+            let mut s = AddonScan::default();
+            scan_addons(&dir, &dir, 3, &mut s, &mut budget);
+            places.push(if s.labels.is_empty() {
+                let more = if s.others.len() < s.entries { ", ..." } else { "" };
+                let some = if s.others.is_empty() { String::new() } else { format!(": {}{more}", s.others.join(", ")) };
+                format!("{} ({} files and folders, no add-on among them{some})", dir.display(), s.entries)
+            } else {
+                format!("{} ({})", dir.display(), s.labels.iter().map(|(l, w)| format!("{l} from {w}")).collect::<Vec<_>>().join(", "))
+            });
+            found.extend(s.labels.into_iter().map(|(l, _)| l));
+        }
         found.sort();
         found.dedup();
-        if !found.is_empty() {
-            crate::info!("add-ons: {} found in {}: {}", found.len(), dir.display(), found.join(", "));
-        }
-        (found, dir)
+        let asked = TITLE_ADDONS.join(" and ");
+        let unknown = !found.is_empty() && !found.iter().any(|l| TITLE_ADDONS.contains(&l.as_str()));
+        crate::info!(
+            "add-ons: {} (the game asks for {asked}{}); looked in {}",
+            if found.is_empty() { "none found".to_string() } else { format!("owned: {}", found.join(", ")) },
+            if unknown { ", none of which was found" } else { "" },
+            places.join("; ")
+        );
+        found
     })
 }
 
-fn scan_addons(dir: &std::path::Path, depth: u32, out: &mut Vec<String>) {
+fn scan_addons(top: &std::path::Path, dir: &std::path::Path, depth: u32, s: &mut AddonScan, budget: &mut usize) {
     if !crate::platform::files::import_file_type(dir).is_some_and(|t| t.is_dir()) { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let Some(ty) = crate::platform::files::import_file_type(&e.path()) else { continue };
-        if !ty.is_dir() && !ty.is_file() { continue; }
-        if let Some(l) = addon_label(&e.file_name().to_string_lossy()) {
-            out.push(l);
-        }
+    let mut entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        s.entries += 1;
+        let path = e.path();
+        let rel = path.strip_prefix(top).unwrap_or(&path).display().to_string();
         // (Not into junctions or links: `file_type` does not follow them.)
-        if depth > 0 && ty.is_dir() {
-            scan_addons(&e.path(), depth - 1, out);
+        let kind = crate::platform::files::import_file_type(&path);
+        if !kind.is_some_and(|t| t.is_file() || t.is_dir()) { continue; }
+        if let Some(l) = addon_label(&e.file_name().to_string_lossy()) {
+            s.labels.push((l, format!("the name {rel}")));
+        } else if kind.is_some_and(|t| t.is_file()) {
+            let inside = if *budget > 0 {
+                *budget -= 1;
+                labels_in(&path)
+            } else {
+                Vec::new()
+            };
+            if inside.is_empty() && s.others.len() < 8 {
+                s.others.push(rel.clone());
+            }
+            s.labels.extend(inside.into_iter().map(|l| (l, format!("inside {rel}"))));
+        }
+        if depth > 0 && kind.is_some_and(|t| t.is_dir()) {
+            scan_addons(top, &path, depth - 1, s, budget);
         }
     }
+}
+
+/// The add-on labels in a file's first `ADDON_READ_BYTES`.
+fn labels_in(path: &std::path::Path) -> Vec<String> {
+    use std::io::Read;
+    let mut b = Vec::new();
+    let Ok(f) = std::fs::File::open(path) else { return Vec::new() };
+    if f.take(ADDON_READ_BYTES).read_to_end(&mut b).is_err() {
+        return Vec::new();
+    }
+    labels_in_bytes(&b)
+}
+
+/// Each content ID of the game's in `b` (`addon_label`), as a package's header or an unpacked
+/// folder's param.json holds it.
+fn labels_in_bytes(b: &[u8]) -> Vec<String> {
+    const PAT: &[u8] = b"PPSA0134";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(k) = b[i..].windows(PAT.len()).position(|w| w == PAT) {
+        let at = i + k;
+        // ("PPSA0134" + digit + "_00-" + the 16-character label.)
+        let end = (at + PAT.len() + 1 + 4 + 16).min(b.len());
+        if let Some(l) = std::str::from_utf8(&b[at..end]).ok().and_then(addon_label)
+            && !out.contains(&l)
+        {
+            out.push(l);
+        }
+        i = at + 1;
+    }
+    out
 }
 
 /// The entitlement label in a package's content ID as a file or folder name has it: the 16
@@ -243,7 +345,7 @@ sysv! {
     }
     fn sceNpEntitlementAccessGetAddcontEntitlementInfoList(label: u32, list: *mut u8, num: u32, hit: *mut u32) -> i32 {
         if hit.is_null() || (list.is_null() && num != 0) { return 0x817D_0002u32 as i32; }
-        let (owned, dir) = addon_labels();
+        let owned = addon_labels();
         // (A count with no list; else the entries that fit.)
         let n = if list.is_null() { owned.len() } else { owned.len().min(num as usize) };
         if !list.is_null() {
@@ -256,7 +358,7 @@ sysv! {
         *hit = n as u32;
         static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
-            let what = if owned.is_empty() { format!("none (no package under {})", dir.display()) } else { owned.join(", ") };
+            let what = if owned.is_empty() { "none (the add-ons line says where they were looked for)".to_string() } else { owned.join(", ") };
             crate::info!("sceNpEntitlementAccessGetAddcontEntitlementInfoList ({}, {num} asked): {n} add-on(s) reported as owned: {what}", if list.is_null() { "the count" } else { "the list" });
         }
         0
@@ -474,7 +576,7 @@ pub fn register(r: &mut Registry) {
 
 #[cfg(test)]
 mod tests {
-    use super::addon_label;
+    use super::{addon_label, labels_in_bytes};
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -489,12 +591,13 @@ mod tests {
         std::fs::write(dir.join("DEMONSSOULSGIFT1.pkg"), b"fixture").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("linked-folder")).unwrap();
         std::os::unix::fs::symlink(outside.join("DEMONSSOULSGIFT2.pkg"), dir.join("DEMONSSOULSGIFT2.pkg")).unwrap();
-        let mut got = Vec::new();
-        super::scan_addons(&dir, 3, &mut got);
-        assert_eq!(got, ["DEMONSSOULSGIFT1"]);
-        got.clear();
-        super::scan_addons(&dir.join("linked-folder"), 3, &mut got);
-        assert!(got.is_empty());
+        let mut got = super::AddonScan::default();
+        let mut budget = super::ADDON_READS;
+        super::scan_addons(&dir, &dir, 3, &mut got, &mut budget);
+        assert_eq!(got.labels.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["DEMONSSOULSGIFT1"]);
+        got.labels.clear();
+        super::scan_addons(&dir, &dir.join("linked-folder"), 3, &mut got, &mut budget);
+        assert!(got.labels.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -515,5 +618,19 @@ mod tests {
         assert_eq!(addon_label("DEMONSSOULSGIFT1").as_deref(), Some("DEMONSSOULSGIFT1"));
         assert_eq!(addon_label("PS5 SAVES BACKUP.pkg"), None);
         assert_eq!(addon_label("DEMONSSOULSGIFT12.pkg"), None);
+    }
+
+    /// Add-on labels inside files of any name (2026-11-24: a package renamed, an unpacked
+    /// folder's param.json).
+    #[test]
+    fn addon_labels_inside_files() {
+        let json = br#"{"contentId":"EP9000-PPSA01341_00-DEMONSSOULSGIFT2","titleId":"PPSA01341"}"#;
+        assert_eq!(labels_in_bytes(json), vec!["DEMONSSOULSGIFT2".to_string()]);
+        let mut header = vec![0u8; 64];
+        header.extend_from_slice(b"UP9000-PPSA01342_00-DEMONSSOULSGIFT1\0\0\0EP9000-PPSA01342_00-DEMONSSOULSGIFT1");
+        assert_eq!(labels_in_bytes(&header), vec!["DEMONSSOULSGIFT1".to_string()]);
+        assert!(labels_in_bytes(b"PPSA01341 PPSA0134").is_empty());
+        assert!(labels_in_bytes(b"EP9000-PPSA01341_00-DEMONSSOULSGIF").is_empty());
+        assert!(labels_in_bytes(b"").is_empty());
     }
 }

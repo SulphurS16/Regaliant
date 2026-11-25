@@ -50,7 +50,7 @@ class Steady(unittest.TestCase):
         self.assertEqual(steady.whole_run_counts('whole-run recording: enabled true, runs 6, commands 4000'),dict(runs=6,commands=4000))
         self.assertEqual(steady.whole_run_counts(''),dict(runs=0,commands=0))
         self.assertEqual(steady.session_plan(['mprotect'],False,False,'whole-run'),
-                         ['steady-a1-baseline-mprotect','steady-b1-whole-run-mprotect','steady-a2-baseline-mprotect','steady-b2-whole-run-mprotect'])
+                         ['steady-a1-baseline-mprotect','steady-b1-whole-run-mprotect','steady-c1-whole-run-quick-mprotect','steady-a2-baseline-mprotect','steady-b2-whole-run-mprotect','steady-c2-whole-run-quick-mprotect','steady-validation-whole-run-quick-mprotect'])
         env={'DS_PAR_WHOLE_RUN':'1','DS_PIPELINE_CRUMBS':'1'}
         for label, expected in [('steady-a1-baseline-mprotect','0'),('steady-b1-whole-run-mprotect','1')]:
             e=steady.relay.session_environment(env,label)
@@ -60,6 +60,54 @@ class Steady(unittest.TestCase):
         invalid={'steady-a1-baseline-mprotect':dict(diagnostic=False,valid_steady_state=False,pair=1),
                  'steady-b1-whole-run-mprotect':dict(diagnostic=False,valid_steady_state=True,pair=1)}
         self.assertFalse(steady.recording_comparison(invalid)['pairs']['whole-run pair 1']['performance_valid'])
+
+    def test_quick_wins_are_independent_and_validation_is_separate(self):
+        for selected in ('tsc','static-bind','tsc,static-bind'):
+            env={'DS_RELAY_QUICK_WINS':selected,'DS_RECORD_TSC':'1','DS_RECORD_STATIC_BIND':'1'}
+            for label in ('steady-a1-baseline-mprotect','steady-b1-whole-run-mprotect','steady-c1-whole-run-quick-mprotect'):
+                e=steady.relay.session_environment(env,label)
+                for key,choice in [('DS_RECORD_TSC','tsc'),('DS_RECORD_STATIC_BIND','static-bind')]:
+                    self.assertEqual(e[key],str(int('quick' in label and choice in selected.split(','))))
+            e=steady.relay.session_environment(env,'steady-validation-whole-run-quick-mprotect')
+            self.assertEqual(e['DS_VK_VALIDATION'],'1')
+            self.assertEqual(e['DS_PROFILE_GPU'],'0')
+            self.assertEqual(e['DS_RELAY_STEADY_DIAGNOSTIC'],'1')
+            self.assertNotIn('VK_LOADER_LAYERS_DISABLE',e)
+
+    def test_warm_store_requires_complete_clean_cycle_after_last_compile(self):
+        calls=[]
+        def run(label,attempt,name):
+            calls.append(label)
+            return dict(invalid_reasons=['walking compiled pipelines inside measurement'] if len(calls) in (1,3) else [])
+        results,sessions=steady.warm_store(['A','B','C'],9,run,lambda *args:None)
+        self.assertEqual(calls,['A','B','C','A','B','C'])
+        self.assertTrue(all(r['warmup_only'] and not r['valid_steady_state'] for r in results.values()))
+        self.assertEqual(len(sessions),6)
+
+    def test_warm_store_fails_loudly_for_bad_seed_or_missing_evidence(self):
+        for reason,limit in [('walking compiled pipelines inside measurement',3),('route incomplete',1)]:
+            calls=[]
+            def run(label,attempt,name):
+                calls.append(label)
+                return dict(invalid_reasons=[reason])
+            with self.assertRaisesRegex(ValueError,'no performance sessions started'):
+                steady.warm_store(['A','B','C'],3,run,lambda *args:None)
+            self.assertEqual(len(calls),limit)
+
+    def test_compile_invalid_summary_never_prints_fps(self):
+        result=dict(diagnostic=False,valid_steady_state=False,invalid_reasons=['walking compiled pipelines inside measurement'],
+            phases={'walking':dict(thermal=dict(valid=True),fully_warm=False,flips_per_second=999)},waits=[],exit_code=0)
+        text=steady.summary({'candidate':result})
+        self.assertIn('INVALID compile-contaminated',text)
+        self.assertNotIn('999',text)
+
+    def test_inflight_or_new_source_compile_invalidates_phase(self):
+        data=dict(seconds=2,counters=dict(flips=100),intervals_us_and_flip=[],threads=[],job_workers={},upscaler='Off')
+        counters=dict(source_create_calls=0,source_create_ms=0,source_create_started=0,source_create_active=0)
+        self.assertTrue(steady.phase_report(data,dict(begin=counters,end=counters))['fully_warm'])
+        for key in ('source_create_started','source_create_active'):
+            self.assertFalse(steady.phase_report(data,dict(begin=counters,end=dict(counters,**{key:1})))['fully_warm'])
+        self.assertFalse(steady.phase_report(data,dict(begin=dict(counters,source_create_active=1),end=counters))['fully_warm'])
 
     def test_fault_cost_uses_observed_sample_count_and_direct_faults_only(self):
         self.assertIsNone(steady.fault_cost({},10)['estimated_cpu_ms_per_flip'])
@@ -127,7 +175,7 @@ class Steady(unittest.TestCase):
             for label,seconds in [('stationary',30),('walking',60)]:
                 (user/(label+'-steady.json')).write_text(json.dumps(dict(phase=label,seconds=seconds,counters=dict(flips=100),intervals_us_and_flip=[[16667,100 if label=='stationary' else 300]],threads=[],job_workers={},upscaler='Off')))
                 (user/(label+'-cpu-self.json')).write_text(json.dumps(dict(valid=True,flips=32,top10=[dict(name='packet loop',self_ms_per_flip=1,calls=200)])))
-                (user/(label+'-pipeline-reuse.json')).write_text(json.dumps(dict(begin=dict(source_create_calls=0,source_create_ms=0),end=dict(source_create_calls=0,source_create_ms=0))))
+                (user/(label+'-pipeline-reuse.json')).write_text(json.dumps(dict(begin=dict(source_create_calls=0,source_create_ms=0,source_create_started=0,source_create_active=0),end=dict(source_create_calls=0,source_create_ms=0,source_create_started=0,source_create_active=0))))
                 for edge in ['before','after']: (user/f'steady-{label}-{edge}.png').write_bytes(b'fixture')
             metrics=dict(exit_code=0,validation_errors=0,crash_bytes=0,thermal=dict(measurement_valid=True),effective_validation=False,
                          write_watch_requested='mprotect',write_watch='mprotect',timelines=[dict(source_file='timeline-132.json',frames=31,gpu_timestamp_spans=0),dict(source_file='timeline-332.json',frames=31,gpu_timestamp_spans=0)],presentation={p:dict(wait_complete=dict(samples=50)) for p in ('stationary','walking')})
