@@ -227,6 +227,7 @@ fn kind_code(k: BindingKind) -> (u8, usize) {
         BindingKind::LodStats => (13, 0),
         BindingKind::Address(i) => (14, i),
         BindingKind::Marks => (15, 0),
+        BindingKind::CubeFaces(i) => (16, i),
     }
 }
 
@@ -248,6 +249,7 @@ fn kind_of(tag: u8, i: usize) -> Option<BindingKind> {
         13 => BindingKind::LodStats,
         14 => BindingKind::Address(i),
         15 => BindingKind::Marks,
+        16 => BindingKind::CubeFaces(i),
         _ => return None,
     })
 }
@@ -423,7 +425,7 @@ mod tests {
     fn round_trip() {
         let o = Output {
             spirv: vec![0x0723_0203, 1, 2, 3, 0xFFFF_FFFF],
-            bindings: vec![Binding { binding: 0, kind: BindingKind::SgprData }, Binding { binding: 3, kind: BindingKind::Buffer(7) }, Binding { binding: 9, kind: BindingKind::CompareSampler(2) }],
+            bindings: vec![Binding { binding: 0, kind: BindingKind::SgprData }, Binding { binding: 3, kind: BindingKind::Buffer(7) }, Binding { binding: 9, kind: BindingKind::CompareSampler(2) }, Binding { binding: 10, kind: BindingKind::CubeFaces(4) }],
             params: 4,
             mrt_mask: 0b101,
             param_mask: 0xF0,

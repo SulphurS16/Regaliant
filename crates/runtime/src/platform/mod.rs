@@ -110,3 +110,7 @@ pub mod stalls;
 #[cfg(target_os = "linux")]
 #[path = "linux/sparse.rs"]
 pub mod sparse;
+
+#[cfg(target_os = "linux")]
+#[path = "linux/steady.rs"]
+pub mod steady;

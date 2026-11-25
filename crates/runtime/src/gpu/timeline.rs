@@ -23,6 +23,14 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// Spans kept at most (a courtyard frame makes a few thousand).
 const MAX_SPANS: usize = 1 << 20;
 
+// Relay phase boundaries wait for the writer too: formatting a detailed trace
+// must not spill CPU work into the following clean measurement.
+static WRITERS: AtomicU32 = AtomicU32::new(0);
+struct Writer;
+impl Drop for Writer { fn drop(&mut self) { WRITERS.fetch_sub(1, Ordering::Release); } }
+#[cfg(target_os = "linux")]
+pub fn busy() -> bool { on() || WRITERS.load(Ordering::Acquire) != 0 }
+
 struct Span {
     track: String,
     name: String,
@@ -32,6 +40,7 @@ struct Span {
 
 struct State {
     spans: Vec<Span>,
+    details: Vec<(String, Vec<DetailSpan>)>,
     /// A GPU timestamp and the performance counter read together,
     /// refreshed at every flip.
     cal: Option<(u64, i64)>,
@@ -63,13 +72,52 @@ pub fn mark() -> Option<i64> {
     on().then(now)
 }
 
+/// Short, explicitly armed CPU recording detail trace. Normal gameplay and the
+/// ordinary wait trace keep this off (per-packet/lap events can be numerous).
+static CPU_DETAILS: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+pub struct CpuDetails;
+#[cfg(target_os = "linux")]
+pub fn cpu_details() -> CpuDetails { CPU_DETAILS.store(true, Ordering::Relaxed); CpuDetails }
+#[cfg(target_os = "linux")]
+impl Drop for CpuDetails { fn drop(&mut self) { CPU_DETAILS.store(false, Ordering::Relaxed); } }
+pub fn detail_mark() -> Option<i64> { if CPU_DETAILS.load(Ordering::Relaxed) { mark() } else { None } }
+pub fn detail(name: &'static str) -> Section { Section { t0: detail_mark(), name, detailed: true } }
+
+// Detailed packet/lap spans used to allocate two Strings and contend on STATE on
+// every mark. Their cost fell outside the lap, into record_packet. Buffer fixed-size
+// records per thread; expand names only on the trace writer after the last flip.
+struct DetailSpan { name: &'static str, lap: bool, t0: i64, t1: i64 }
+struct DetailBuffer { track: String, spans: Mutex<Vec<DetailSpan>> }
+static DETAILS: Mutex<Vec<std::sync::Arc<DetailBuffer>>> = Mutex::new(Vec::new());
+static DETAIL_START: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+thread_local! {
+    static DETAIL_BUFFER: std::sync::Arc<DetailBuffer> = {
+        let b = std::sync::Arc::new(DetailBuffer { track: crate::log::thread_name(), spans: Mutex::new(Vec::with_capacity(16384)) });
+        DETAILS.lock().push(b.clone());
+        b
+    };
+}
+fn detail_end(t0: Option<i64>, name: &'static str, lap: bool) {
+    let Some(t0) = t0 else { return };
+    let t1 = now();
+    DETAIL_BUFFER.with(|b| {
+        let mut spans = b.spans.lock();
+        if on() && t0 >= DETAIL_START.load(Ordering::Relaxed) && spans.len() < MAX_SPANS / 4 {
+            spans.push(DetailSpan { name, lap, t0, t1 });
+        }
+    });
+}
+pub fn detail_lap(t0: Option<i64>, name: &'static str) { detail_end(t0, name, true); }
+
 /// CPU-only phase on the current thread, including early returns. No clock or allocation
 /// while the timeline is off; this never requests a GPU query or queue flush.
-pub struct Section { t0: Option<i64>, name: &'static str }
-pub fn section(name: &'static str) -> Section { Section { t0: mark(), name } }
+pub struct Section { t0: Option<i64>, name: &'static str, detailed: bool }
+pub fn section(name: &'static str) -> Section { Section { t0: mark(), name, detailed: false } }
 impl Drop for Section {
     fn drop(&mut self) {
-        if self.t0.is_some() { end(&crate::log::thread_name(), self.t0, || self.name.into()); }
+        if self.detailed { detail_end(self.t0, self.name, false); }
+        else if self.t0.is_some() { end(&crate::log::thread_name(), self.t0, || self.name.into()); }
     }
 }
 
@@ -86,12 +134,13 @@ pub fn waited_ns() -> u64 {
 /// A wait of the calling thread: always timed (`waited_ns`), a span when the
 /// timeline records.
 pub struct Wait {
+    _cpu: super::cpu_profile::Scope,
     t0: std::time::Instant,
     tl: Option<i64>,
 }
 
 pub fn wait_start() -> Wait {
-    Wait { t0: std::time::Instant::now(), tl: mark() }
+    Wait { _cpu: super::cpu_profile::scope(super::cpu_profile::Part::Wait), t0: std::time::Instant::now(), tl: mark() }
 }
 
 impl Wait {
@@ -177,7 +226,10 @@ pub fn start(flips: u32) -> Result<(), String> {
     if super::exec::batch_stamps() && cal.is_none() {
         crate::warn!("timeline: no calibrated timestamps (VK_EXT_calibrated_timestamps): GPU spans are left out");
     }
-    *STATE.lock() = Some(State { spans: Vec::with_capacity(1 << 16), cal, started: now() });
+    let started = now();
+    DETAIL_START.store(started, Ordering::Relaxed);
+    for b in DETAILS.lock().iter() { b.spans.lock().clear(); }
+    *STATE.lock() = Some(State { spans: Vec::with_capacity(1 << 16), details: Vec::new(), cal, started });
     FLIPS_LEFT.store(flips.max(1), Ordering::SeqCst);
     ON.store(true, Ordering::SeqCst);
     Ok(())
@@ -224,14 +276,25 @@ pub fn flipped(n: u64) {
         }
     }
     if FLIPS_LEFT.fetch_sub(1, Ordering::SeqCst) == 1 {
+        WRITERS.fetch_add(1, Ordering::Release);
+        let writer = Writer;
         ON.store(false, Ordering::SeqCst);
-        if let Some(st) = STATE.lock().take() {
-            std::thread::spawn(move || write(st, n));
+        if let Some(mut st) = STATE.lock().take() {
+            for b in DETAILS.lock().iter() {
+                st.details.push((b.track.clone(), std::mem::take(&mut *b.spans.lock())));
+            }
+            std::thread::spawn(move || { let _writer = writer; write(st, n); });
         }
     }
 }
 
-fn write(st: State, flip: u64) {
+fn write(mut st: State, flip: u64) {
+    for (track, spans) in std::mem::take(&mut st.details) {
+        for d in spans {
+            if st.spans.len() >= MAX_SPANS { break; }
+            st.spans.push(Span { track: track.clone(), name: if d.lap { format!("record step: {}", d.name) } else { d.name.into() }, t0: d.t0, t1: d.t1 });
+        }
+    }
     let Some(dir) = crate::run_dir() else { return };
     let path = dir.join(format!("timeline-{flip}.json"));
     let us = |t: i64| (t - st.started) as f64 * 1e6 / freq() as f64;
@@ -261,5 +324,19 @@ fn write(st: State, flip: u64) {
     match std::fs::write(&path, out) {
         Ok(()) => crate::info!("timeline: {} spans on {} tracks written to {}", st.spans.len(), tracks.len(), path.display()),
         Err(e) => crate::warn!("timeline: writing {}: {e}", path.display()),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod writer_tests {
+    use super::*;
+    #[test]
+    fn writer_work_remains_busy_after_capture_stops() {
+        assert!(!on());
+        let before = WRITERS.fetch_add(1, Ordering::Release);
+        let writer = Writer;
+        assert!(busy());
+        drop(writer);
+        assert_eq!(WRITERS.load(Ordering::Acquire), before);
     }
 }

@@ -260,6 +260,7 @@ impl<T> std::ops::Deref for Local<T> {
 
 #[derive(Clone)]
 pub struct Translated {
+    pub program_hash: u64,
     pub out: Output,
     pub plan: Arc<Plan>,
     /// Cache key (program hash ^ specialization hash).
@@ -3771,7 +3772,8 @@ fn translated(insts: &[rdna::Inst], out: Output, plan: &Arc<Plan>, plan_key: u64
         .collect();
     atomic_res.sort_unstable();
     atomic_res.dedup();
-    Translated { out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
+    let program_hash = plan_key ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
+    Translated { program_hash, out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
 }
 
 /// `translate_code_for_spec` keeping neither the translation nor its plan,
@@ -4494,6 +4496,7 @@ impl Drop for PlanRecGuard {
 /// `tmpl`: R2's number of the stage template `spec` comes from (0: none),
 /// which the plan's latest translation is checked against (`PlanRec`).
 fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec, tmpl: u64) -> Result<Prepared, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ShaderPrepare);
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
     // the profile reports): the inputs that would key a cached preparation.

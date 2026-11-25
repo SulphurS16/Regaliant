@@ -4,6 +4,8 @@ No sensors or a stalled/cold-down-failing sensor means no workload, not unguarde
 Monitor records are flushed and fsynced individually, including transitions.
 """
 import json
+import contextlib
+import fcntl
 import math
 import os
 import signal
@@ -16,6 +18,24 @@ from pathlib import Path
 
 class GuardError(RuntimeError):
     pass
+
+
+@contextlib.contextmanager
+def cpu_heavy_lock(path=None):
+    """Hold the shared advisory lock for a whole suite (including cooldowns).
+    Existing files are opened read-only: leave another workload's note untouched.
+    Do not additionally wrap the relay in flock; it takes this lock itself.
+    """
+    path = Path(path or os.environ.get('DS_CPU_HEAVY_LOCK', Path.home()/'.cache/cpu-heavy.lock'))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try: stream = path.open('r')
+    except FileNotFoundError: stream = path.open('a+')
+    with stream:
+        try: fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise GuardError(f'CPU-heavy lock is held: {path}; no workload started. Wait for the other workload (do not double-wrap with flock).') from e
+        try: yield
+        finally: fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 def cpu_list(value):
@@ -74,6 +94,21 @@ def temperature(paths):
     return max(values)
 
 
+def cpu_telemetry(cpus, root=Path('/sys/devices/system/cpu')):
+    """Sysfs frequency samples and cumulative throttle counters, not inferred throttling.
+    Unsupported/unreadable fields remain null; scaling_cur_freq may be requested rather
+    than effective frequency, so keep cpuinfo_avg_freq separately when the driver has it.
+    """
+    def read(path):
+        try: return int(path.read_text())
+        except (OSError, ValueError): return None
+    return {str(cpu): {name: read(root/f'cpu{cpu}'/path) for name, path in (
+        ('scaling_khz', 'cpufreq/scaling_cur_freq'), ('average_khz', 'cpufreq/cpuinfo_avg_freq'),
+        ('core_throttle_count', 'thermal_throttle/core_throttle_count'),
+        ('package_throttle_count', 'thermal_throttle/package_throttle_count'),
+        ('package_throttle_ms', 'thermal_throttle/package_throttle_total_time_ms'))} for cpu in cpus}
+
+
 def record(f, **row):
     row.update(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), monotonic_s=time.monotonic(), load=os.getloadavg())
     f.write(json.dumps(row)+'\n')
@@ -84,6 +119,9 @@ def record(f, **row):
 class Policy:
     def __init__(self, env=None):
         env = os.environ if env is None else env
+        self.pause_enabled = env.get('DS_RELAY_THERMAL_MODE', 'pause') == 'pause'
+        if env.get('DS_RELAY_THERMAL_MODE', 'pause') not in ('pause', 'observe'):
+            raise GuardError('DS_RELAY_THERMAL_MODE must be pause or observe')
         self.cpus = select_cpus(env.get('DS_RELAY_CPUS'))
         self.workers = int(env.get('DS_COMPILE_WORKERS', '2'))
         self.pause = float(env.get('DS_RELAY_TEMP_PAUSE', '103'))
@@ -92,6 +130,9 @@ class Policy:
         self.abort_temp = float(env.get('DS_RELAY_TEMP_ABORT', '105'))
         self.abort = float(env.get('DS_RELAY_TEMP_ABORT_S', '60'))
         self.cooldown = float(env.get('DS_RELAY_COOLDOWN_S', '120'))
+        self.session_temp = float(env['DS_RELAY_SESSION_TEMP']) if 'DS_RELAY_SESSION_TEMP' in env else None
+        if self.session_temp is not None and not 0 < self.session_temp <= 70:
+            raise GuardError('DS_RELAY_SESSION_TEMP must be in (0,70] Celsius')
         if not (1 <= self.workers <= 16 and 0 < self.resume < self.pause <= 110
                 and 0 <= self.hold <= 600 and self.pause <= self.abort_temp <= 120
                 and 0 < self.abort <= 600 and 0 < self.cooldown <= 600):
@@ -113,17 +154,20 @@ class Policy:
         with output.open('a') as f:
             while True:
                 temp = temperature(self.paths)
-                record(f, event='cooldown', temperature_c=temp, cpus=self.cpus, sensors=list(map(str, self.paths)))
-                if temp < self.resume: return
+                record(f, event='cooldown', temperature_c=temp, target_c=self.session_temp if self.session_temp is not None else self.resume, cpus=self.cpus, sensors=list(map(str, self.paths)))
+                if self.session_temp is not None:
+                    if temp <= self.session_temp: return
+                elif temp < self.resume or not self.pause_enabled: return
                 if time.monotonic()-started >= self.cooldown:
                     record(f, event='cooldown-abort', temperature_c=temp)
-                    raise GuardError('CPU did not cool below resume threshold; no next session started')
+                    raise GuardError('CPU did not reach session/resume cooling threshold within the bounded wait; no next session started')
                 time.sleep(2)
 
 
 class ThermalState:
     """Pure hysteresis state machine, tested with a fake clock and sensor values."""
-    def __init__(self, pause, resume, abort, hold=10, abort_temp=105):
+    def __init__(self, pause, resume, abort, hold=10, abort_temp=105, pause_enabled=True):
+        self.pause_enabled = pause_enabled
         self.pause, self.resume, self.abort = pause, resume, abort
         self.since = None
         self.warm_since = None
@@ -136,6 +180,7 @@ class ThermalState:
         self.hot_since = (now if self.hot_since is None else self.hot_since) if temp >= self.abort_temp else None
         if self.hot_since is not None and now-self.hot_since >= self.abort:
             return 'abort'
+        if not self.pause_enabled: return 'sample'
         if self.since is None:
             self.warm_since = (now if self.warm_since is None else self.warm_since) if temp >= self.pause else None
             if self.warm_since is not None and now-self.warm_since >= self.hold:
@@ -195,13 +240,13 @@ def timeout_seconds(command):
 
 
 class Process:
-    """Popen interface with an independent 2s monitor; monitors never share game affinity."""
+    """Popen interface with an independent 1s monitor; monitors never share game affinity."""
     def __init__(self, command, *, output, env=None, **kwargs):
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.policy = Policy(env)
         self.policy.wait_cool(self.output/'monitor.jsonl')
-        self.state = ThermalState(self.policy.pause, self.policy.resume, self.policy.abort, self.policy.hold, self.policy.abort_temp)
+        self.state = ThermalState(self.policy.pause, self.policy.resume, self.policy.abort, self.policy.hold, self.policy.abort_temp, self.policy.pause_enabled)
         self.aborted = None
         self.finished = threading.Event()
         self.groups = set()
@@ -255,11 +300,12 @@ class Process:
                     if action == 'pause': self.send(signal.SIGSTOP)
                     elif action == 'resume': self.send(signal.SIGCONT)
                     record(f, event=action, temperature_c=temp, pid=self.pid, cpus=self.policy.cpus,
-                           paused=self.state.since is not None, owned_groups=group_activity(self.groups))
+                           paused=self.state.since is not None, owned_groups=group_activity(self.groups),
+                           cpu_telemetry=cpu_telemetry(self.policy.cpus))
                     if action == 'abort':
                         self.aborted = f'CPU stayed at or above {self.policy.abort_temp} C for {self.policy.abort} seconds'
                         break
-                    if self.finished.wait(2): break
+                    if self.finished.wait(1): break
             except Exception as e:
                 self.aborted = str(e)
                 record(f, event='guard-error', error=self.aborted)
@@ -267,6 +313,7 @@ class Process:
                 if self.aborted: self.stop()
                 paused = self.state.paused_s + (time.monotonic()-self.state.since if self.state.since is not None else 0)
                 report = dict(pauses=self.state.pauses, paused_s=paused, aborted=self.aborted,
+                              thermal_mode='pause' if self.policy.pause_enabled else 'observe',
                               measurement_valid=self.state.pauses == 0 and not self.aborted,
                               cpus=self.policy.cpus, nice=10, compile_workers=self.policy.workers,
                               elapsed_s=time.monotonic()-self.started)

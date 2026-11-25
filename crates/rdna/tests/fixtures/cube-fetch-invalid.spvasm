@@ -1,0 +1,38 @@
+; Authored negative reproducer. Not game code. OpImageFetch cannot use Dim Cube.
+; Replace Cube with 2D to describe an exact texel fetch through the cube-face array view.
+OpCapability Shader
+OpCapability SampledCubeArray
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %tex %out
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %tex DescriptorSet 0
+OpDecorate %tex Binding 0
+OpDecorate %out DescriptorSet 0
+OpDecorate %out Binding 1
+OpDecorate %Block Block
+OpMemberDecorate %Block 0 Offset 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%i32 = OpTypeInt 32 1
+%f32 = OpTypeFloat 32
+%v3i = OpTypeVector %i32 3
+%v4f = OpTypeVector %f32 4
+%image = OpTypeImage %f32 Cube 0 1 0 1 Unknown
+%pimage = OpTypePointer UniformConstant %image
+%tex = OpVariable %pimage UniformConstant
+%Block = OpTypeStruct %v4f
+%pblock = OpTypePointer StorageBuffer %Block
+%pv4f = OpTypePointer StorageBuffer %v4f
+%out = OpVariable %pblock StorageBuffer
+%zero = OpConstant %i32 0
+%one = OpConstant %i32 1
+%two = OpConstant %i32 2
+%coord = OpConstantComposite %v3i %one %two %zero
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%img = OpLoad %image %tex
+%value = OpImageFetch %v4f %img %coord Lod %zero
+%dst = OpAccessChain %pv4f %out %zero
+OpStore %dst %value
+OpReturn
+OpFunctionEnd

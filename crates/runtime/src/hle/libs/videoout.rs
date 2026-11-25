@@ -812,6 +812,16 @@ fn crop_rgba(rgba: &[u8], w: u32, h: u32, c: (u32, u32, u32, u32)) -> (Vec<u8>, 
 /// (`maybe_screenshot`); `wait_shots` waits for them at shutdown.
 static SHOTS_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Covers GPU readback as well as conversion/encoding. Transfer this guard to the
+// writer; all error paths (including failure to spawn it) release the count.
+struct PendingShot;
+impl PendingShot {
+    fn new() -> Self { SHOTS_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel); Self }
+}
+impl Drop for PendingShot {
+    fn drop(&mut self) { SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
+
 #[cfg(target_os = "linux")]
 pub fn shots_idle() -> bool {
     SHOT_REQUEST.lock().is_none() && SHOTS_PENDING.load(std::sync::atomic::Ordering::Acquire) == 0
@@ -847,7 +857,12 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
             crate::info!("probe flip {flip}: {} image(s)\n    {}", lines.len(), lines.join("\n    "));
         }
     }
-    let mut requested = SHOT_REQUEST.lock().take();
+    let (mut requested, pending) = {
+        let mut request = SHOT_REQUEST.lock();
+        let taken = request.take();
+        let pending = taken.as_ref().map(|_| PendingShot::new());
+        (taken, pending)
+    };
     let mut crop = None;
     let mut half = false;
     if requested.is_none() {
@@ -867,6 +882,7 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     if requested.is_none() && !listed {
         return;
     }
+    let pending = pending.unwrap_or_else(PendingShot::new);
     // The buffer is read back here (as flipped); its conversion, PNG encoding
     // and write run on a thread of their own: on this thread they held the
     // flips ~0.5 s per 4K shot (the boss fights' worst frames, 2026-11-01
@@ -889,8 +905,8 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let addr = b.addr;
     match read() {
         Ok((raw, format, w, h, path)) => {
-            SHOTS_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let write = move || {
+                let _pending = pending;
                 let r = crate::gpu::images::to_rgba8(format, &raw).ok_or_else(|| format!("no RGBA8 conversion for {format:?}")).and_then(|rgba| {
                     let (rgba, w, h) = match crop {
                         Some(c) => crop_rgba(&rgba, w, h, c),
@@ -903,13 +919,25 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
                     Ok(()) => crate::info!("screenshot of flip {flip} (buffer {addr:#x}): {}", path.display()),
                     Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
                 }
-                SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             };
             if let Err(e) = std::thread::Builder::new().name("shot-write".into()).spawn(write) {
-                SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: no writer thread ({e})");
             }
         }
         Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod shot_lifetime_tests {
+    #[test]
+    fn readback_and_failed_writer_remain_pending_until_drop() {
+        let pending = super::PendingShot::new();
+        assert!(!super::shots_idle()); // request already consumed, still reading GPU data
+        let writer = move || { let _guard = pending; };
+        assert!(!super::shots_idle()); // writer queued but has not started
+        drop(writer); // spawn failure also drops its closure
+        assert!(super::shots_idle());
     }
 }

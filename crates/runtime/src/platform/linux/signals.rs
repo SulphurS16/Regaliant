@@ -3,6 +3,9 @@
 //! when the fault happened in a host allocator. Recoverable page faults rendezvous with a
 //! service thread through a pipe and futex; shared renderer recovery runs outside the handler.
 use super::vm;
+#[path = "signal_report.rs"]
+mod report;
+pub use report::{CompileNote, compiler_crash_file};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -197,6 +200,7 @@ unsafe extern "C" fn handler(signal: i32, info: *mut libc::siginfo_t, context: *
         if fd >= 0 {
             line.write(fd);
         }
+        report::fatal(rip, g[libc::REG_RSI as usize] as u64, &words[..n.max(0) as usize / 8], fd);
         libc::_exit(128 + signal);
     }
 }

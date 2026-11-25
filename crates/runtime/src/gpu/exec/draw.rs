@@ -67,6 +67,7 @@ fn reads_nothing(p: &Prepared) -> bool {
 
 /// Whether two preparations of a stage are the same (`tune buffer_delta` 2).
 fn same_prepared(a: &Prepared, b: &Prepared) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::StateChange);
     a.addr == b.addr && std::sync::Arc::ptr_eq(&a.found.tr, &b.found.tr) && a.sgpr_data == b.sgpr_data && a.user == b.user && a.code_hash == b.code_hash && reads_nothing(b)
 }
 
@@ -1780,6 +1781,7 @@ impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
     pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> std::borrow::Cow<'static, str> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
         if super::ballast_progs().is_empty() {
             super::ballast_cp(self.ballast_kind, cp.ballast_part());
         }
@@ -1892,6 +1894,8 @@ impl Exec {
     /// index size, the others its arguments. Its indices must lie in the
     /// home the draw before bound (bound again at their offset).
     pub fn draw_repeat_cpu(&mut self, index: (u64, u32), count: u32, instances: u32, base_vertex: i32, first_instance: u32) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
+        let _detail = crate::gpu::timeline::detail("record: repeat draw");
         let Some(mut r) = self.repeat.take() else { return false };
         if DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || index.1 != r.index.1 || sync_mode() {
             return false;
@@ -3953,6 +3957,8 @@ impl Exec {
     /// run, before any preparation: no stage is resolved, synced or bound on
     /// the CPU. None: the full path records it (a new run).
     pub(super) fn draw_gpu_append(&mut self, cp: &Cp, a: &DrawArgs, vs_addr: u64, ps_addr: u64) -> Result<Option<bool>, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
+        let _detail = crate::gpu::timeline::detail("record: GPU draw append");
         let Some(mut run) = self.draw_run.take() else { return Ok(None) };
         let r = self.draw_gpu_append_to(&mut run, cp, a, vs_addr, ps_addr);
         self.draw_run = Some(run);

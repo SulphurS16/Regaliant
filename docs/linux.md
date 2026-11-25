@@ -3,8 +3,8 @@
 Regaliant runs the decrypted PS5 executable natively on Linux x86-64, with Vulkan graphics
 and SDL3 windowing, input and audio. Tutorial gameplay, save resumption and window-close
 checks have passed automated tests. Players have confirmed keyboard/controller gameplay and
-in-game audio. Movie audio, fractional-scale presentation and the full shader tour still need
-verification after the latest fixes. Performance varies by scene; steady 60 fps is not yet established.
+in-game audio and sharp fractional-scale fullscreen output. Movie audio and the full shader
+tour still need verification after the latest fixes. Performance varies by scene; steady 60 fps is not yet established.
 
 ## Build and play
 
@@ -50,8 +50,7 @@ and borderless modes follow compositor scaling. On a 3840×2160 screen, use **PC
 100%** for native 4K rendering; **Visual Mode** keeps the title's usual 2560×1440 render size.
 The separate Resolution/Refresh Rate controls do not change Linux desktop modes; choose the
 monitor mode in your compositor. A 4K swapchain alone does not mean the game renders at 4K.
-Logs report logical and drawable sizes after resize/scale changes. Fractional-scale presentation
-still needs a physical-display check after this change.
+Logs report logical and drawable sizes after resize/scale changes.
 
 ## Files and diagnostics
 
@@ -135,6 +134,12 @@ inspect `pipeline-reuse.json` for actual binary hits and refusals.
 FIFO presentation is the default. `DS_LINUX_PRESENT_MODE=mailbox` selects MAILBOX where
 supported; `immediate` is a tearing diagnostic override. Guest timing remains 59.94 Hz.
 Presentation timing uses KHR present-wait completion, not a physical scanout timestamp.
+MAILBOX can replace queued frames without tearing, but cannot turn 27 ms of rendering into
+60 new frames per second. FIFO does not inherently force every renderer below 60 fps to 30:
+queue depth and compositor scheduling matter too. FIFO_RELAXED can tear when a frame is late,
+so it is not a tear-free alternative and is not enabled here. See the
+[Vulkan present-mode definitions](https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentModeKHR.html).
+The present-wait observer runs on a separate thread; it is not a per-frame game-thread wait.
 Compositor VRR control and display-mode switching are not implemented.
 
 Exact `mprotect` dirty tracking is the default. `DS_LINUX_WRITE_WATCH=uffd` enables async
@@ -174,14 +179,15 @@ cache, diagnostic, FIFO/MAILBOX and audio checks. It can take over an hour; use 
 `DS_SCATTER_FIXTURE=/path/to/scatter-fixture` optionally enables the full suite's isolated fog
 regression. Fixtures come from your own captures and are never shipped.
 
-Every workload, including builds and preparation children, has these limits:
+General relays, builds and preparation children have these limits. The native-4K steady
+measurement below uses the as-played thermal exception:
 
 - Eight allowed logical CPUs, preferring performance cores using sysfs core type/capacity/
   frequency and sibling topology. Override with `DS_RELAY_CPUS=0-3,8-11`. Runs use `nice 10`.
 - `DS_COMPILE_WORKERS=2` by default. Shader pools are capped and a shared driver-compilation
   permit prevents foreground/background pools from each using the whole budget. Cargo uses
   the same job limit. Drivers may still create their own internal threads within the CPU set.
-- CPU package temperature is sampled every two seconds. At or above `DS_RELAY_TEMP_PAUSE=103` °C
+- CPU package temperature is sampled every second. At or above `DS_RELAY_TEMP_PAUSE=103` °C
   for `DS_RELAY_TEMP_HOLD_S=10` continuous seconds, the owned process groups stop; below
   `DS_RELAY_TEMP_RESUME=97` °C, they resume. At or above `DS_RELAY_TEMP_ABORT=105` °C for
   `DS_RELAY_TEMP_ABORT_S=60` continuous seconds, the run aborts with a graceful-stop request
@@ -194,8 +200,8 @@ Every workload, including builds and preparation children, has these limits:
   Performance measurements have no extra relay cap.
 
 `monitor.jsonl` records temperatures, system load and pause/resume events with an fsync after
-**every line**. `thermal.json` records the outcome. Any pause invalidates the whole session's
-performance measurements; those numbers are excluded from comparisons. GNU timeout remains
+**every line**. `thermal.json` records the outcome. These general relays invalidate performance measurements after any pause; those numbers are
+excluded from comparisons. The native 4K relay below uses exact phase boundaries instead. GNU timeout remains
 an independent wall bound. Thermal shutdown flushes completed saves where possible, but a
 hard-kill fallback cannot guarantee completion of an in-progress save. No desktop power or
 fan settings are changed.
@@ -366,3 +372,220 @@ format-dependent; the text records the bound descriptors and depth, clipping and
 Readback can stall the game, so use this only to capture the problem, not to measure performance.
 F9 keeps its ordinary input behavior without `DS_SCENE_PROBE=1`. Do not publish captures containing
 game assets with a source-code patch.
+
+## Native 4K performance measurement
+
+Build the release runtime, export `DS_GAME_DIR`, and run:
+
+```sh
+python3 scripts/linux-steady.py
+```
+
+This uses `local-data/linux-port/save-seed` and automatically selects the newest pipeline-reuse
+run with verified binary hits. `--save-seed` / `DS_RELAY_SAVE_SEED` and `--shader-seed` /
+`DS_RELAY_SHADER_SEED` override those sources. It copies them into a new private directory;
+neither player saves nor the seed caches are modified. When selecting a reuse run automatically,
+its driver cache is copied too. A thermal pause in that old run does not invalidate its binary
+replay evidence, but does invalidate its FPS measurements.
+
+The test opens a visible borderless fullscreen window on SDL's selected display, uses native
+3840×2160 scene rendering and output, TAA, no upscaler, FIFO presentation and an uncapped game.
+A 60 Hz display still limits FIFO to its refresh rate. It checks the actual swapchain and guest
+render-size logs, so a different display resolution cannot silently pass as a 4K measurement.
+Offscreen rendering is not equivalent: it omits the compositor and swapchain waits.
+
+The saved-load path retries a missed Continue Offline confirmation at most six times, eight
+seconds apart, using two-frame presses. Retries require the same observed menu and boot HUD;
+a change permanently stops retries, so unknown dialogs receive no input. It waits at most five
+minutes for gameplay HUD state with no menu and advancing frames, then requires the existing
+five-second/120-frame settling check. A load timeout logs UI state and requests a screenshot.
+This avoids treating a lingering dialog or the loading HUD as gameplay.
+
+After resuming and settling, it records 30 seconds stationary, then 60 seconds of scripted
+walking: alternate forward/backward every five seconds, with a short neutral gap. There is no
+physical input, mouse grab or audible audio. Collision and combat may change the pose; compare
+the before/after PNGs as well as the numbers. Screenshots finish outside the timed intervals. The boundary barrier tracks GPU readback through
+PNG completion, including error paths, and waits up to 90 seconds; it does not assume that two
+flips or a ten-second encoder wait are enough.
+Validation, capture probes and GPU timestamps are off throughout the clean session. After each
+timed phase and its boundary PNG, a separate 32-flip CPU-only trace records waits with normal
+batching. A separate 32-flip TSC profile attributes nested recording self time, as described
+below. The old four-flip event detail is opt-in only. All profiles are excluded from the
+FPS intervals. The relay
+uses eight CPUs, nice 10, two compiler workers, the as-played thermal policy below and a 630-second wall timeout per process (600-second runtime
+limit); successful routes finish early and every process is reaped. The player's settings are untouched.
+
+Clean measurement processes run **first**, followed by a separate diagnostic process. It measures
+five seconds stationary and five seconds walking, with 32-flip GPU segment traces, CPU recording profiles and write-back counts by engine allocation. Its write-back census
+keeps the normal split-line store pattern; it does not skip any writes. Profiling and readback
+alter timing: these are **diagnostic timings**, not baseline FPS. Segment duration includes its
+barriers and waits and does not measure shader-core occupancy. An optional five-second `perf`
+sample is attempted when the tool and permissions allow it; `perf-console.log` reports failures.
+Use `--no-gpu-timing` to omit this diagnostic process.
+
+`--tracking both` compares mprotect and uffd from the same original save and cache snapshots.
+`tracking-comparison.json` reports FPS changes, faults and CPU work only when both runs have
+valid, fully warm measurements. Missing CPU wait traces fail the measurement check.
+The default suite interleaves four clean sessions, then runs the GPU diagnostic. Allow
+roughly 15–25 minutes plus cooling; every launch may wait up to ten minutes to reach 70 °C.
+A failed launch, load, measurement or analysis does not cancel the other sessions. Even after a
+guard abort, the next process must independently pass sensor checks before it can start.
+Every launch must pass the bounded cooldown, including in observe mode. Explicit user cancellation stops the suite. `sessions.json` and the top of
+`summary.txt` list every planned session as pending, running, completed, failed or cancelled,
+with its attempts; results retain exit codes, self-play failures and analysis exceptions. Exact
+monotonic phase clocks determine whether a pause overlaps a measurement. Pauses are never
+subtracted from FPS: an overlapping phase is invalid, while a pause during loading alone does
+not invalidate a later phase. There are no inserted warm retries: the next planned visit
+uses that backend's warmed cache, preserving the A,B,A,B sequence. Paused FPS and trace timings are
+omitted from the text summary, with raw evidence retained in JSON. Trace clocks are matched
+against the guard too. Older outputs without clocks remain conservatively invalid.
+
+For a route already measured, use its updated shader directory as `--shader-seed`; it includes
+pipelines compiled during walking. Always use a new writable copy, leaving the original seed
+unchanged. For example:
+
+```sh
+python3 scripts/linux-steady.py --shader-seed /path/to/walking-shader-seed --tracking both
+```
+
+The normal tracking default remains mprotect. Earlier same-scene measurements did not establish
+an uffd speed advantage. Changing that default requires comparable gameplay and correct frames.
+
+Read `local-data/linux-port/steady/run-*/summary.txt` first. Per-run `steady-summary.json` has:
+
+- Frame-time and FPS percentiles, KHR presentation-completion percentiles and present-stage costs.
+- Faults/second, upload and write-back bytes/flip, uffd scan time, job-worker activity, and pipeline
+  creation counts/time within each interval. Source pipeline creation disqualifies a fully warm
+  result. The interleaved suite reports that pair as invalid; the next planned visit reuses
+  the private warmed cache. Runtime or guard failures do not prevent independent sessions.
+- CPU work and runnable delay per thread and per flip. Threads present at both boundaries are
+  counted; residual non-running time includes sleep and unclassified waits. It is not CPU work.
+- Sampled device-wide GPU clocks, utilization and power, and per-flip wait coverage for recording,
+  submission, fences, labels, batch slots and videoout. Clean-adjacent CPU traces use normal batching;
+  GPU segment traces separately identify write-back, draw, compute and barrier time.
+- `stationary/walking-cpu-profile.txt`, `*-gpu-status.txt` and `*-writeback.txt` in the diagnostic
+  session's log folder. The write-back census reports allocation owners and CPU-write/renderer-read
+  activity. An “untouched” bucket does **not** prove the guest CPU never reads it; it cannot justify
+  skipping write-back without a coherent read-fault mechanism.
+
+Concurrent CPU and GPU lanes overlap: do not add their milliseconds into one frame budget.
+KHR completion is a CPU observation rather than a physical scanout timestamp. Thermal pauses overlapping a timed phase,
+missing evidence, wrong resolution, failed runs or tracking fallback invalidate the comparison.
+The earlier approximately 56 fps tutorial result rendered the scene at 2560×1440; native 4K has
+2.25 times as many scene pixels, even though both modes use 4K output targets. That old number
+is not a native-4K performance baseline. No 60 fps claim is made until this relay returns.
+
+
+Linux now returns from an explicit address wake even when the label word is unchanged.
+A submitted batch can publish a future label write before the write executes; the
+renderer rechecks that promise and installs the same GPU dependencies. This is enabled
+by default after successful frame and wait-time comparisons. `DS_LINUX_ADDRESS_WAKE=0`
+restores the old behavior for diagnosis. Windows keeps its native wait implementation.
+
+For a controlled native-4K comparison, use a warm shader store and an existing save:
+
+```sh
+python3 scripts/linux-steady.py --shader-seed /path/to/warm-shader-store --tracking both --no-gpu-timing
+```
+
+Keep `DS_GAME_DIR` exported as above; optionally pass `--save-seed`. The default comparison
+is **mprotect, uffd, mprotect, uffd**, with the wake fix in every run. Each session cools
+before launch to **70 °C or less**, with a bounded 600-second wait. Set
+`DS_RELAY_SESSION_TEMP` to a lower temperature if desired and `DS_RELAY_COOLDOWN_S` to
+change the wait bound (at most 600 seconds). If cooling fails, that session does not
+launch and is reported as failed. Cooling and temperatures are fsynced to `monitor.jsonl`.
+Startup can heat the CPU again: compare the actual phase temperatures too.
+
+Each backend reuses its private warmed cache for its second visit. The script preserves
+A,B,A,B order: it reports any interval with new pipeline compilation as invalid instead
+of inserting a warm retry. `tracking-comparison.json` and `summary.txt` give each pair's
+FPS difference, temperatures and kernel/user CPU costs. A failed first pair is never
+silently replaced by results from the second pair. No original save or cache seed is
+modified. Normal play still defaults to mprotect; uffd has not established an advantage.
+
+The script takes `~/.cache/cpu-heavy.lock` for the entire suite, including cooling, or
+uses the path in `DS_CPU_HEAVY_LOCK`. It refuses an existing holder. Do not also wrap it
+in `flock`. Normal player launches do not take this relay lock.
+
+Profiling needs no `perf` permissions. After each clean phase, a separate 32-flip sample
+accumulates nested TSC scopes on gpu-gfx. Fixed-size thread-local counters retain every
+call, rather than dropping events at the old detailed trace's buffer limit. They cover
+the packet loop, packet dispatch, registers/state checks, draw/dispatch emission,
+shader/resource preparation, descriptors, barriers, image/buffer lookups and FE2
+placement/version checks. There are no per-scope allocations or shared recording locks.
+Read `stationary-cpu-self.json` and `walking-cpu-self.json` in the session's runtime log
+folder, or their top ten entries in `summary.txt`.
+
+Self time excludes nested scopes and instrumented waits. TSC measures elapsed time,
+including preemption and profiling overhead; the report separately gives boundary-sampled
+thread CPU time. These adjacent profiles do not supply clean FPS. Stack overflow or
+non-nested guards invalidate a profile rather than silently dropping samples. Ordinary
+wait traces remain, including `label-waits.json` with per-producer wait distributions.
+The older, event-heavy detail trace is optional via `DS_CPU_EVENT_DETAIL=1`; its event
+cap makes it unsuitable as the source of complete recording attribution.
+
+`--perf-gpu-gfx` remains an optional separate sampling run when host permissions allow it.
+It preflights permissions before launching the suite, never changes kernel settings,
+and is unnecessary for the default TSC profile. That optional run also samples direct
+write-fault recovery; its estimate excludes kernel signal entry/return. Use the clean
+mprotect/uffd comparison and per-thread user/kernel CPU deltas for the broader cost.
+
+Steady measurements run **as played**: no temperature-triggered SIGSTOP. The guard samples
+package temperature, per-CPU frequency and available kernel throttle counters every second,
+fsyncs each `monitor.jsonl` record, and aborts after 105 °C continuously for 60 seconds.
+Clock and throttle fields unavailable from sysfs remain unknown, not zero. Each phase's
+`cpu_environment` in `steady-summary.json` summarizes the matching samples. Package
+throttle counters replicated across CPUs must not be added together. These are hardware
+samples alongside frame times, not estimates of lost performance. Existing timeout and
+sensor-failure checks remain active. `--thermal-pause` restores preparation-style cooling;
+long shader preparation retains that pause policy by default. Temperature thresholds remain
+overridable with the documented environment variables.
+
+Legacy detailed events use per-thread buffers and format their names after capture, avoiding a
+shared trace lock and string allocation per packet/lap. Phase boundaries also wait for
+the trace writer to finish, so serialization cannot spill into the next timed phase. The detailed four-flip trace still
+has instrumentation overhead: do not substitute
+its frame time for clean FPS. `record_packet` previously included uninstrumented draw and
+compute work, not just decoding. Separate categories now cover repeat draws, GPU append,
+indirect arguments, draw/dispatch residual work, memory writes/copies and releases. Compare
+these spans between variants together with ordinary wait traces and clean phase CPU times.
+
+## Startup crashes and recording experiments
+
+Linux fatal reports include the faulting thread, bytes at the instruction pointer, and current
+host mappings with file offsets for the instruction and stack words. A compiler fault also
+lists active pipeline keys. `DS_PIPELINE_CRUMBS=1` saves the input SPIR-V before driver calls;
+use it for diagnosis, not performance measurements. Only a fault inside NVIDIA's compiler on
+the thread compiling a named pipeline adds that pipeline to the existing driver-specific
+`pipelines/crashed.txt` quarantine. Other in-flight pipelines are not blamed. This avoids
+recompiling a known crashing pipeline at every launch, but its draw/dispatch may be omitted;
+it is a containment measure, not a rendering fix. Linux also writes a durable intent before
+source compilation, under `pipelines/compile-pending/`, and clears it only after success.
+An unfinished compile is skipped on the next launch, even if no signal report was written.
+A first unknown compiler fault can still terminate the process. Keep reports and markers
+for diagnosis. Corrected translator code gets a new quarantine identity.
+
+The invalid cube texel fetch implicated in NVIDIA's startup compiler abort has been replaced
+with an exact fetch through a cube-face array view. See the [design and offline regression
+checks](linux-cube-fetch.md). Existing translations regenerate once; pipeline binaries whose
+SPIR-V and creation contract are unchanged remain reusable.
+
+To reproduce startup failures without changing player data:
+
+```sh
+export DS_GAME_DIR=/path/to/PPSA01341-app0
+python3 scripts/linux-startup-test.py --shader-seed /path/to/suspect/shaders \
+  --save-seed /path/to/save-seed
+```
+
+This runs ten hidden, silent, capped 30-second starts with timeouts and thermal supervision.
+It leaves the game at its initial menu without scripted gameplay. Persistent private stores
+alternate with fresh copies of the suspect store; the source seed stays untouched. Results
+are under `local-data/linux-port/startup/`. A failure does not cancel the other starts unless
+the thermal guard or launch fails. `--dry-run` prints the plan without starting the game.
+Use `--seconds 60` for a colder store, and repeat `--expect-pipeline c<hex-key>` for previously
+crashing keys to require successful creation, not just a quarantined skip.
+
+The preparation-reuse and FE2-leaf experiments were removed after they showed no gameplay
+benefit. The next experiment, `DS_PAR_WHOLE_RUN=1`, remains off by default; see the
+[parallel recording design and A/B command](linux-parallel-recording.md).

@@ -732,6 +732,12 @@ pub unsafe fn WaitOnAddress(
     size: usize,
     ms: u32,
 ) -> i32 {
+    static RETURN_ON_WAKE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let return_on_wake = *RETURN_ON_WAKE.get_or_init(|| std::env::var("DS_LINUX_ADDRESS_WAKE").ok().as_deref() != Some("0"));
+    unsafe { wait_on_address(address, compare, size, ms, return_on_wake) }
+}
+
+unsafe fn wait_on_address(address: *const c_void, compare: *const c_void, size: usize, ms: u32, return_on_wake: bool) -> i32 {
     if !matches!(size, 1 | 2 | 4 | 8) {
         return 0;
     }
@@ -752,15 +758,23 @@ pub unsafe fn WaitOnAddress(
             tv_nsec: timeout.as_nanos() as _,
         };
         if size >= 4 && address as usize % 4 == 0 {
-            let seen = unsafe { std::ptr::read_volatile(address as *const u32) };
-            unsafe {
+            // Compare against the caller's snapshot, not a newly loaded word that could
+            // have changed since memcmp. EAGAIN is a valid early wake too.
+            let seen = unsafe { if return_on_wake { std::ptr::read_unaligned(compare as *const u32) } else { std::ptr::read_volatile(address as *const u32) } };
+            let result = unsafe {
                 libc::syscall(
                     libc::SYS_futex,
                     address,
                     libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
                     seen,
                     &ts,
-                );
+                )
+            };
+            // A wake can publish a GPU label promise without writing the guest word.
+            // The caller rechecks both conditions. Hiding that wake here forced a full
+            // 1ms timeout per cross-queue wait. Do not weaken any renderer dependency.
+            if return_on_wake && (result == 0 || unsafe { *libc::__errno_location() } == libc::EAGAIN) {
+                return 1;
             }
         } else {
             std::thread::sleep(timeout);
@@ -1155,6 +1169,43 @@ pub fn prepare_kernel_write(base: u64, len: u64) {
 
 #[cfg(test)]
 mod tests {
+    // Use a kernel-confirmed wake, not a scheduler-sensitive sleep before waking.
+    fn wake_unchanged_word(return_on_wake: bool) -> i32 {
+        use std::sync::{Arc, atomic::AtomicU64};
+        let word = Arc::new(AtomicU64::new(7));
+        let other = word.clone();
+        let waiter = std::thread::spawn(move || {
+            let expected = 7u64;
+            unsafe { super::wait_on_address(other.as_ptr() as _, &expected as *const _ as _, 8, 250, return_on_wake) }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let woken = unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG, i32::MAX) };
+            if woken > 0 { break; }
+            assert!(!waiter.is_finished() && std::time::Instant::now() < deadline, "waiter never slept");
+            std::thread::yield_now();
+        }
+        waiter.join().unwrap()
+    }
+
+    #[test]
+    fn address_wake_returns_to_check_external_predicate() {
+        // The old shim consumes the wake and eventually times out with unchanged memory.
+        assert_eq!(wake_unchanged_word(false), 0);
+        assert_eq!(wake_unchanged_word(true), 1);
+    }
+
+    #[test]
+    fn address_wait_preserves_changed_value_and_timeout() {
+        let word = 7u64;
+        let changed = 6u64;
+        unsafe {
+            assert_eq!(super::wait_on_address(&word as *const _ as _, &changed as *const _ as _, 8, 0, true), 1);
+            assert_eq!(super::wait_on_address(&word as *const _ as _, &word as *const _ as _, 8, 0, true), 0);
+            assert_eq!(super::wait_on_address(&word as *const _ as _, &word as *const _ as _, 3, 0, true), 0);
+        }
+    }
+
     use super::*;
 
     #[test]

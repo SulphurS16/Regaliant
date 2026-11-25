@@ -15,6 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import linux_guard
+import linux_perf
 import linux_waits
 import linux_nan_summary
 import importlib.util
@@ -156,6 +157,7 @@ def log_metrics(text):
 
 
 def profile_kind(profile):
+    if profile.startswith('steady-'): return 'steady'
     if profile == 'present-validation': return 'present-validation'
     if profile == 'present-fifo-gpu-timing': return 'gpu-timing'
     if profile in ('sparse-original', 'round9-route'): return 'clean'
@@ -195,6 +197,24 @@ def session_environment(inherited, profile):
         env.update(DS_NAN_EARLY='1', DS_CAPTURE_CODE='1', DS_RECORD_PROFILE='1')
     elif profile == 'host-profile':
         env.update(DS_RELAY_GAMEPLAY_SECONDS='30', DS_VK_VALIDATION='0', DS_STEP_LAPS='1', DS_OP_CENSUS='1', DS_WW_CENSUS='1', DS_RELAY_CPU_PROFILE='1')
+    elif profile == 'steady':
+        env.update(DS_VK_VALIDATION='0', DS_RELAY_STEADY='1', DS_RELAY_IDLE_COMPARE='0',
+                   DS_RELAY_CLOSE_WINDOW='1', DS_LINUX_PRESENT_MODE='fifo', DS_RELAY_UI_PROBE='0',
+                   DS_SCENE_PROBE='0', DS_TRACE_CLEARS='0', DS_PB_VERIFY_CAPTURE='0', DS_CAPTURE='',
+                   DS_CP_CLASSES='0', DS_WB_BUCKETS='0', DS_WB_BUCKETS_SPLIT='0', DS_WB_SAME='0', DS_FE2_HOLD='0', DS_RECORD_PROFILE='0')
+        env['DS_LINUX_WRITE_WATCH'] = 'uffd' if label.endswith('-uffd') else 'mprotect'
+        env.pop('DS_SYNC_INPUT_BATCH', None)  # Removed after a device-lost relay.
+        env['DS_LINUX_ADDRESS_WAKE'] = '1'  # Verified promise wake-return semantics; normal play default too.
+        env.pop('DS_RECORD_FAST', None)  # Removed after a no-gain A/B.
+        env['DS_PAR_WHOLE_RUN'] = '1' if '-whole-run-' in label else '0'
+        env['DS_PIPELINE_CRUMBS'] = '0'  # Filesystem diagnostics belong in startup relay only.
+        if 'sample' in label: env['DS_LINUX_FAULT_TIMING'] = '1'
+        if 'diagnostic' in label:
+            env.update(DS_PROFILE_GPU='1', DS_PROFILE_GPU_STAMPS='seg', DS_BATCH_STAMPS='1', DS_RELAY_STEADY_DIAGNOSTIC='1',
+                       DS_CP_CLASSES='1', DS_WB_BUCKETS='1', DS_WB_BUCKETS_SPLIT='1', DS_STEP_LAPS='1', DS_OP_CENSUS='1', DS_WW_CENSUS='1', DS_RECORD_PROFILE='1')
+        else: env['DS_RELAY_STEADY_DIAGNOSTIC'] = '0'
+    elif profile == 'startup':
+        env.update(DS_VK_VALIDATION='0', DS_PIPELINE_CRUMBS='1', DS_FRAME_CAP='30', DS_UNCAPPED='0', DS_RELAY_IDLE_COMPARE='0')
     elif profile == 'cache-reuse':
         env.update(DS_VK_VALIDATION='0', DS_RELAY_GAMEPLAY_SECONDS='30')
     elif profile not in ('present', 'present-validation', 'resume'):
@@ -253,6 +273,11 @@ def session_failed(metrics, profile):
     return False
 
 
+def session_input(profile, saved_user):
+    # Startup reproduction leaves the title at its first menu; no gameplay or capture route.
+    return [] if profile == 'startup' else ['--relay-continue' if saved_user is not None else '--relay-newgame']
+
+
 def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", saved_user=None, driver_cache=None):
     run.mkdir()
     env = session_environment(os.environ, profile)
@@ -267,6 +292,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     if gentle:
         env.update(DS_RELAY_GAMEPLAY_SECONDS='30', DS_RELAY_SHORT='1')
         if mode == 'offscreen': env['DS_RELAY_IDLE_COMPARE'] = '1'
+    if profile_kind(profile) == 'steady': env.update(DS_RELAY_IDLE_COMPARE='0', DS_RELAY_FPS_LIMIT='0', DS_RELAY_SHORT='1')
     if profile == 'cache-reuse': env.update(DS_RELAY_IDLE_COMPARE='0', DS_RELAY_FPS_LIMIT='30')
     if env.get('DS_RELAY_UI_PROBE') == '1':
         env.update(DS_RELAY_GAMEPLAY_SECONDS='0', DS_RELAY_IDLE_COMPARE='0', DS_RELAY_FPS_LIMIT='30')
@@ -290,7 +316,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     linux_snapshot.check_writable(run/'user'/'saves')
     (run/'saves-before.json').write_text(json.dumps(save_inventory(run/'user'), indent=2)+'\n')
     command = ['timeout', '-k', '5s', hard+'s', str(repo/'target/release/dsport'), '--app', str(game),
-               '--relay-continue' if saved_user is not None else '--relay-newgame', '--run-seconds', seconds] + (['--offscreen'] if mode == 'offscreen' else [])
+               *session_input(profile, saved_user), '--run-seconds', seconds] + (['--offscreen'] if mode == 'offscreen' else [])
     (run/'command.json').write_text(json.dumps({'argv': command, 'DSPORT_HOME': env['DSPORT_HOME'],
         'shader_cache': str(cache), 'environment': {k: v for k, v in env.items() if k.startswith(('DS_', 'XDG_', 'SDL_', '__GL_', 'MESA_'))}}, indent=2)+'\n')
     (run/'cache-before.txt').write_text(cache_inventory(cache))
@@ -298,11 +324,13 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     code = 125
     log_offset, phase = 0, 'startup/menu'
     perf = None
+    gfx_sample = None
+    gfx_attempted = False
     perf_attempted = False
     perf_log = None
     with (run/'console.log').open('wb') as console, (run/'thread-times.csv').open('w') as cpu, (run/'gpu-clocks.csv').open('w') as clocks:
         sampler = ThreadSampler(cpu)
-        clocks.write('elapsed_s,index,pstate,graphics_MHz,memory_MHz,gpu_util_pct,memory_util_pct,power_W\n')
+        clocks.write('elapsed_s,index,pstate,graphics_MHz,memory_MHz,gpu_util_pct,memory_util_pct,power_W,phase\n')
         started = time.monotonic()
         process = linux_guard.Process(command, output=run, stdout=console, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         try:
@@ -320,7 +348,10 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
                         new = log.read()
                         log_offset = log.tell()
                     for line in new.splitlines():
-                        if 'relay step: gameplay-target-capture-begin' in line: phase = 'capture'
+                        if 'relay step: steady-' in line:
+                            match = re.search(r'relay step: steady-(stationary|walking)-(begin|end);', line)
+                            if match: phase = 'steady-'+match[1] if match[2] == 'begin' else 'settle'
+                        elif 'relay step: gameplay-target-capture-begin' in line: phase = 'capture'
                         elif 'relay step: gameplay-target-capture-end' in line: phase = 'settle'
                         elif 'relay step: gameplay-measure-begin' in line: phase = 'gameplay-measure'
                         elif 'relay step: gameplay-measure-end' in line: phase = 'movement/menu'
@@ -331,12 +362,21 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
                     pid = int((run/'user'/'active-pid').read_text().strip())
                     if os.getpgid(pid) == process.pid:
                         proc = Path('/proc')/str(pid)
-                        if profile == 'host-profile' and phase == 'gameplay-measure' and not perf_attempted:
+                        if 'sample' in profile and phase == 'steady-stationary' and not gfx_attempted:
+                            gfx_attempted = True
+                            try: gfx_sample = linux_perf.GfxSample(pid, run)
+                            except (OSError, ValueError) as e:
+                                (run/'gpu-gfx-perf.json').write_text(json.dumps(dict(valid=False,error=str(e)))+'\n')
+                        if gfx_sample is not None and (gfx_sample.process.poll() is not None or phase != 'steady-stationary'):
+                            gfx_sample.finish(interrupted=phase != 'steady-stationary')
+                            gfx_sample = None
+                        if not perf_attempted and ((profile == 'host-profile' and phase == 'gameplay-measure') or (profile.startswith('steady-diagnostic') and phase == 'steady-stationary')):
                             perf_attempted = True
                             if shutil.which('perf'):
                                 perf_log = (run/'perf-console.log').open('wb')
-                                argv = ['timeout', '-k', '5s', '25s', 'perf', 'record', '-e', 'cpu-clock:u', '-F', '99',
-                                        '--call-graph', 'dwarf,8192', '-p', str(pid), '-o', str(run/'perf.data'), '--', 'sleep', '20']
+                                perf_seconds = 5 if profile.startswith('steady-diagnostic') else 20
+                                argv = ['timeout', '-k', '5s', str(perf_seconds+5)+'s', 'perf', 'record', '-e', 'cpu-clock:u', '-F', '99',
+                                        '--call-graph', 'dwarf,8192', '-p', str(pid), '-o', str(run/'perf.data'), '--', 'sleep', str(perf_seconds)]
                                 (run/'perf-command.json').write_text(json.dumps(argv)+'\n')
                                 perf = subprocess.Popen(argv, stdout=perf_log, stderr=subprocess.STDOUT, start_new_session=True)
                             else: (run/'perf-console.log').write_text('perf unavailable; no host stack samples collected\n')
@@ -352,7 +392,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
                 if shutil.which('nvidia-smi'):
                     try:
                         query = subprocess.run(['nvidia-smi', '--query-gpu=index,pstate,clocks.current.graphics,clocks.current.memory,utilization.gpu,utilization.memory,power.draw', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=2)
-                        for line in query.stdout.splitlines(): clocks.write(f'{elapsed:.3f},'+line+'\n')
+                        for line in query.stdout.splitlines(): clocks.write(f'{elapsed:.3f},'+line+','+phase+'\n')
                         if query.returncode: (run/'gpu-clocks-error.txt').write_text(query.stderr)
                         clocks.flush()
                         os.fsync(clocks.fileno())
@@ -365,6 +405,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
             process.stop()
             process.wait()
             sampler.report(run/'thread-summary.txt')
+            if gfx_sample is not None: gfx_sample.finish(interrupted=True)
             if perf is not None:
                 try: os.killpg(perf.pid, signal.SIGINT)
                 except ProcessLookupError: pass
@@ -399,7 +440,7 @@ def run_session(repo, game, run, mode, seconds, hard, cache, profile="clean", sa
     if metrics['idle_comparison']:
         (run/'job-idle-summary.json').write_text(json.dumps(dict(valid=metrics['idle_comparison_valid'], samples=metrics['idle_comparison'], note='Stationary legacy then bounded-sleep; thermal pauses invalidate all samples. Warm-up/order can affect results.'), indent=2)+'\n')
     metrics['profile'] = profile
-    metrics['resume_requested'] = saved_user is not None
+    metrics['resume_requested'] = saved_user is not None and profile != 'startup'
     metrics['write_watch'] = 'uffd' if 'Linux write watch: uffd async WP' in text else 'mprotect'
     metrics['write_watch_requested'] = env['DS_LINUX_WRITE_WATCH']
     metrics['uffd_errors_total'] = max([int(n) for n in re.findall(r'uffd_errors=(\d+)', text)] or [0])

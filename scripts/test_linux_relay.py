@@ -24,6 +24,15 @@ def stat(user, kernel, start):
 
 
 class Accounting(unittest.TestCase):
+    def test_startup_is_silent_bounded_menu_without_gameplay_input(self):
+        e=relay.session_environment({'DS_PROFILE_GPU':'1','DS_FRAME_CAP':'0'},'startup')
+        self.assertEqual(e['DS_FRAME_CAP'],'30')
+        self.assertEqual(e['DS_PIPELINE_CRUMBS'],'1')
+        self.assertEqual(e['DS_PROFILE_GPU'],'0')
+        self.assertEqual(e['DS_VK_VALIDATION'],'0')
+        self.assertEqual(relay.session_input('startup',Path('/saved-seed')),[])
+        self.assertEqual(relay.session_input('clean',Path('/saved-seed')),['--relay-continue'])
+
     def test_short_suite_is_two_sessions_in_both_wrappers(self):
         for mode in ['offscreen', 'present']:
             self.assertEqual(relay.suite_labels(mode, False), ['mprotect-1', 'present-fifo-cold'])
@@ -247,6 +256,25 @@ class TraceAccounting(unittest.TestCase):
         coverage = linux_waits.partition([(0, 100, 'gpu_batch_span'), (0, 70, 'gpu_upload_prologue')], 0, 100)
         self.assertEqual(dict(coverage), {'gpu_upload_prologue': 70, 'gpu_batch_span': 30})
 
+    def test_named_record_steps_keep_waits_exclusive(self):
+        self.assertEqual(linux_waits.classify('gpu-gfx','record step: pipeline'),'record_pipeline')
+        self.assertEqual(linux_waits.classify('gpu-gfx','record step: set write'),'record_descriptors')
+        self.assertEqual(linux_waits.classify('gpu-gfx','record: packet decode and scheduling'),'record_decode')
+        c=linux_waits.partition([(0,100,'record_packet'),(0,80,'record_resource_lookup_sync'),(10,60,'gpu_completion')],0,100)
+        self.assertEqual(c['gpu_completion'],50)
+        self.assertEqual(c['record_resource_lookup_sync'],30)
+        self.assertEqual(c['record_packet'],20)
+
+    def test_binding_substeps_and_packet_residuals_stay_exclusive(self):
+        self.assertEqual(linux_waits.classify('gpu-gfx','record: draw'),'record_draw_residual')
+        self.assertEqual(linux_waits.classify('gpu-gfx','record step: prepare/resources'),'record_prepare_resources')
+        bind=linux_waits.classify('gpu-gfx','record step: bind/mapping span')
+        c=linux_waits.partition([(0,100,'record_resource_lookup_sync'),(0,80,bind),(10,60,'gpu_completion')],0,100)
+        self.assertEqual(c['gpu_completion'],50)
+        self.assertEqual(c[bind],30)
+        self.assertEqual(c['record_resource_lookup_sync'],20)
+        self.assertEqual(sum(c.values()),100)
+
     def test_slot_wait_initial_state_and_releaser_phases(self):
         for state in ('submit', 'gpu', 'release'):
             self.assertEqual(linux_waits.classify('gpu-gfx', f'wait: batch slot (#12, initial {state}, 2 slots, compute false)'), 'batch_slot_'+state)
@@ -272,8 +300,11 @@ class TraceAccounting(unittest.TestCase):
                       {'ph': 'i', 'name': 'flip 1', 'ts': 0}, {'ph': 'i', 'name': 'flip 2', 'ts': 1000},
                       {'ph': 'X', 'name': 'wait: batch #1', 'tid': 1, 'ts': 0, 'dur': 1000},
                       {'ph': 'X', 'name': 'gpu-gfx #1', 'tid': 2, 'ts': 0, 'dur': 1000}]
-            trace.write_text(json.dumps({'traceEvents': events}))
-            self.assertEqual(linux_waits.analyze(trace, root/'out')['mean_frame_ms'], 1)
+            trace.write_text(json.dumps({'traceEvents': events,'otherData':{'qpc_start':1_000_000_000,'qpc_freq':1_000_000_000}}))
+            result=linux_waits.analyze(trace, root/'out')
+            self.assertEqual(result['mean_frame_ms'],1)
+            self.assertEqual(result['begin_monotonic_ns'],1_000_000_000)
+            self.assertEqual(result['end_monotonic_ns'],1_001_000_000)
             self.assertEqual(len((root/'out/frame-waits.csv').read_text().splitlines()), 3)
             trace.write_text(json.dumps({'traceEvents': []}))
             self.assertEqual(linux_waits.analyze(trace, root/'out')['frames'], 0)
@@ -335,6 +366,17 @@ class PublicConfiguration(unittest.TestCase):
             result = subprocess.run([str(script)], env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('Unsafe relay output', result.stderr)
+
+
+class LabelWaits(unittest.TestCase):
+    def test_only_whole_gfx_waits_and_producer_millisecond_floor(self):
+        event=dict(ph='X',tid=1,ts=100,dur=1060,name='wait: label 0x1000 (written by gpu-acb0x38)')
+        events=[event,dict(event,ts=1500,dur=200),dict(event,ts=2900),dict(event,tid=2)]
+        r=linux_waits.label_waits(events,{1:'gpu-gfx',2:'gpu-acb0x50'},[(0,'flip 1'),(3000,'flip 2')])
+        self.assertEqual(r['gpu-acb0x38']['count'],2)
+        self.assertEqual(r['gpu-acb0x38']['near_1ms'],1)
+        self.assertAlmostEqual(r['gpu-acb0x38']['total_ms_per_flip'],1.26)
+        self.assertEqual(linux_waits.label_waits(events,{1:'gpu-gfx'},[]),{})
 
 
 if __name__ == '__main__': unittest.main()

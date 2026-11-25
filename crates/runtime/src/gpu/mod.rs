@@ -7,6 +7,7 @@
 //! on the console. Dispatches run on Vulkan with `DS_GPU=1` (`exec`); draws
 //! are decoded but not rendered yet (docs/STATUS.md).
 
+pub mod cpu_profile;
 pub mod capture;
 pub mod nan_probe;
 pub mod cp;

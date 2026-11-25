@@ -360,6 +360,7 @@ fn snapshot(lo: u64, hi: u64) -> Option<([u32; FINE_CHUNKS], [u64; FINE_LEAVES])
 /// changed there since.
 #[inline]
 fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Fe2Versions);
     // The exact range first.
     let mut exact_why = None;
     if exact_on() {
@@ -433,6 +434,7 @@ fn range_fine(lo: u64, hi: u64, want: u32, marked: bool) -> bool {
 /// was found fine, compared as read (None: nothing).
 #[inline]
 fn changed(f: &Fine) -> Option<usize> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Fe2Versions);
     let (c0, c1) = (((f.lo - MIRROR_BASE) >> CHUNK_SHIFT) as usize, ((f.hi - 1 - MIRROR_BASE) >> CHUNK_SHIFT) as usize);
     for (k, &g) in (c0..=c1).zip(f.gens.iter()) {
         let p = TABLE[k].load(Ordering::Acquire);
@@ -512,6 +514,7 @@ pub fn wrote_flip(a: u64) -> u32 {
 /// `ensure` runs (pages its caller's batch uploaded are current too, which only it knows).
 #[inline]
 pub fn quick_fine(lo: u64, hi: u64, want: u32) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Fe2Versions);
     let mut a = lo;
     while a < hi {
         let e = word_end(a, hi);
@@ -1704,6 +1707,7 @@ thread_local! {
 /// any take (what takes stamp their pages with).
 #[allow(clippy::too_many_arguments)]
 pub fn ensure(lo: u64, hi: u64, want: u32, ep: u32, gpu_writes: bool, mine: &dyn Fn(u64) -> bool, mine_any: bool, upload: &mut dyn FnMut(u64, u64) -> bool, armable: &Armable) -> Result<(), &'static str> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Fe2Ensure);
     if !callers_on() {
         return ensure_inner(lo, hi, want, ep, gpu_writes, mine, mine_any, upload, armable);
     }
@@ -4444,7 +4448,10 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
                 Err(e) => crate::warn!("fe2: hold census off: {e}"),
             }
         }
-        let code = if wb_buckets() {
+        let split_census = wb_buckets() && std::env::var("DS_WB_BUCKETS_SPLIT").ok().as_deref() == Some("1");
+        let code = if split_census {
+            rdna::kernels::mirror_scatter_split_counting()
+        } else if wb_buckets() {
             rdna::kernels::mirror_scatter_counting()
         } else if wb_same_mode() == 1 {
             rdna::kernels::mirror_scatter_same_census()
@@ -4473,7 +4480,7 @@ fn make_scatter(marks: vk::Buffer, marks_c: Option<vk::Buffer>) -> Result<Scatte
             c.device.destroy_shader_module(module, None);
             Ok(pipeline?[0])
         };
-        let pipeline = make(&code, if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if c4_wanted() && HELD_MAP.get().is_some() { 44 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
+        let pipeline = make(&code, if split_census { 0xfe210001 } else if wb_buckets() { 27 } else if wb_same_mode() == 1 { 34 } else if c4_wanted() && HELD_MAP.get().is_some() { 44 } else if HELD_MAP.get().is_some() { 28 } else if std::env::var("DS_WB_OLD").ok().as_deref() == Some("1") { 20 } else { 42 })?;
         if wb_same_mode() == 2 && SAME_SKIP.get().is_none() {
             // (The tables first: zeroed, and the buffer of zeros.)
             let mut tables = Vec::new();
@@ -5165,7 +5172,7 @@ pub fn note_wb_reads(reads: &[(u64, u64)]) {
 /// class (the counts read back from both written-bit maps' aux regions,
 /// which are cleared; a write-back racing the read-back may be lost to it),
 /// the largest buckets nothing else touched by mapping.
-fn wb_buckets_line() -> String {
+pub fn wb_buckets_line() -> String {
     if !wb_buckets() {
         return String::new();
     }

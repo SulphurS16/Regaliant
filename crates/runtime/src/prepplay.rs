@@ -1287,6 +1287,8 @@ impl Play {
             return Err(End::Failed("no offline notice".into()));
         }
         self.sleep(2.0)?;
+        #[cfg(target_os = "linux")]
+        if self.relay { return self.relay_load_save(); }
         let m = self.w.mark();
         self.press("cross", 300);
         if !self.wait_in_game(m, "Crescent Moon Grass", 180.0)? {
@@ -1296,11 +1298,53 @@ impl Play {
     }
 
     #[cfg(target_os = "linux")]
+    fn relay_load_save(&mut self) -> Result<(), End> {
+        use crate::platform::steady::{ResumeAction, ResumeWait};
+        // Continue Offline was just observed. Only retry this same menu with the boot HUD;
+        // a wall-timed press during its fade-in can be consumed before the button is active.
+        let dialog = if crate::uistate::menu_depth() == Some(1) && crate::uistate::hud_count() == Some(288) {
+            crate::uistate::top_menu().map(|p| (p, 288))
+        } else { None };
+        let mut wait = ResumeWait::new(dialog);
+        let start = Instant::now();
+        let mut shown = 0;
+        let mut previous = None;
+        loop {
+            self.check_stop()?;
+            let seconds = start.elapsed().as_secs_f64();
+            let state = (crate::uistate::menu_depth(), crate::uistate::hud_count(), crate::uistate::top_menu());
+            if previous != Some(state) || seconds as u64 >= shown {
+                crate::info!("relay saved-load wait: {:.1}s, flip {}, {}; dialog {:?}", seconds, crate::gpu::FRAMES.load(Relaxed), crate::uistate::report(), dialog);
+                previous = Some(state);
+                shown = seconds as u64 + 15;
+            }
+            match wait.poll(seconds, crate::gpu::FRAMES.load(Relaxed), state.0, state.1, state.2) {
+                ResumeAction::Confirm => {
+                    crate::info!("relay saved-load: confirming the same Continue Offline dialog");
+                    self.press_flips("cross", 2);
+                }
+                ResumeAction::Ready => { self.step("saved-load gameplay observed"); return Ok(()); }
+                ResumeAction::Wait => {}
+            }
+            if seconds >= 300.0 {
+                self.shot("saved-load-timeout");
+                // A diagnostic screenshot must drain before selfplay-result requests another.
+                let _ = self.relay_capture_barrier();
+                return Err(End::Failed(format!("no gameplay after 300s saved-load wait: {}", crate::uistate::report())));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn relay_continue(&mut self) -> Result<(), End> {
         self.continue_save()?;
         self.relay_settle()?;
         self.step("saved game resumed in gameplay");
         self.relay_capture_barrier()?;
+        if std::env::var("DS_RELAY_STEADY").ok().as_deref() == Some("1") {
+            return self.relay_steady();
+        }
         self.measure_gameplay()?;
         // Same route on cold/warm runs. Both passes stay capture-free, even when
         // pressing a button; boundary PNGs are requested and drained outside them.
@@ -1350,6 +1394,107 @@ impl Play {
         self.sleep(1.0)
     }
 
+    /// Native-resolution benchmark. Wall-clock input slots keep the timed route bounded;
+    /// collisions/combat may change pose, so always compare the boundary screenshots too.
+    #[cfg(target_os = "linux")]
+    fn relay_steady(&mut self) -> Result<(), End> {
+        let diagnostic = std::env::var("DS_RELAY_STEADY_DIAGNOSTIC").ok().as_deref() == Some("1");
+        crate::pcsettings::state_report();
+        for (label, seconds, walking) in [("stationary", if diagnostic { 5 } else { 30 }, false),
+                                         ("walking", if diagnostic { 5 } else { 60 }, true)] {
+            self.shot(&format!("steady-{label}-before"));
+            self.relay_capture_barrier()?;
+            // Settle after readback. This sleep is wall time, never game flips.
+            let settle = Instant::now();
+            while settle.elapsed() < Duration::from_secs(3) {
+                self.check_stop()?;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if diagnostic {
+                // Boundary readback drains the previous bucket window; never in clean timing.
+                let _ = crate::gpu::fe2::wb_buckets_line();
+                crate::gpu::reset_profile();
+            }
+            self.measuring = true;
+            self.shot(&format!("steady-{label}-begin"));
+            if diagnostic { let _ = crate::gpu::timeline::start(32); }
+            let phase = crate::platform::steady::Phase::begin();
+            let start = Instant::now();
+            let mut slot = u64::MAX;
+            while start.elapsed() < Duration::from_secs(seconds) {
+                self.check_stop()?;
+                let next = start.elapsed().as_secs() / 5;
+                if walking && slot != next {
+                    slot = next;
+                    self.press(if slot % 2 == 0 { "ls_up" } else { "ls_down" }, 4900);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            phase.end(label);
+            self.shot(&format!("steady-{label}-end"));
+            // A diagnostic timeline must finish before the next boundary capture/phase.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while crate::gpu::timeline::busy() && Instant::now() < deadline {
+                self.check_stop()?;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if crate::gpu::timeline::busy() { return Err(End::Failed("steady timeline did not complete".into())); }
+            if diagnostic {
+                if let Some(dir) = crate::run_dir() {
+                    let _ = std::fs::write(dir.join(format!("{label}-cpu-profile.txt")), crate::gpu::profile_report());
+                    let _ = std::fs::write(dir.join(format!("{label}-writeback.txt")), crate::gpu::fe2::wb_buckets_line());
+                    let _ = std::fs::write(dir.join(format!("{label}-gpu-status.txt")), crate::gpu::status_ex(false));
+                }
+            }
+            self.measuring = false;
+            self.shot(&format!("steady-{label}-after"));
+            self.relay_capture_barrier()?;
+            if !diagnostic {
+                // Adjacent CPU-only wait trace with normal batching/recording, excluded from
+                // both timed intervals and their PNGs. GPU queries/profiling remain off.
+                self.measuring = true;
+                self.shot(&format!("steady-{label}-cpu-trace-begin"));
+                if walking { self.press_flips("ls_down", 32); }
+                crate::gpu::timeline::start(32).map_err(End::Failed)?;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while crate::gpu::timeline::busy() && Instant::now() < deadline {
+                    self.check_stop()?;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if crate::gpu::timeline::busy() { return Err(End::Failed("steady CPU timeline did not complete".into())); }
+                self.shot(&format!("steady-{label}-cpu-trace-end"));
+                // Aggregate nested TSC scopes instead of emitting per-packet events.
+                // The previous four-frame trace silently reached its event cap on gpu-gfx.
+                crate::gpu::cpu_profile::start().map_err(End::Failed)?;
+                let first = crate::gpu::FRAMES.load(Relaxed);
+                let measured = self.relay_flips(32);
+                crate::gpu::cpu_profile::stop();
+                let flips = crate::gpu::FRAMES.load(Relaxed).saturating_sub(first);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while crate::gpu::cpu_profile::pending() && Instant::now() < deadline {
+                    self.check_stop()?;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if crate::gpu::cpu_profile::pending() { return Err(End::Failed("CPU self profile did not drain".into())); }
+                measured?;
+                crate::gpu::cpu_profile::write(label, flips).map_err(End::Failed)?;
+                if std::env::var("DS_CPU_EVENT_DETAIL").ok().as_deref() == Some("1") {
+                    let _details = crate::gpu::timeline::cpu_details();
+                    crate::gpu::timeline::start(4).map_err(End::Failed)?;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while crate::gpu::timeline::busy() && Instant::now() < deadline {
+                        self.check_stop()?;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if crate::gpu::timeline::busy() { return Err(End::Failed("CPU event trace did not complete".into())); }
+                }
+                self.measuring = false;
+            }
+        }
+        crate::info!("steady route complete: stationary then walking");
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     fn relay_flips(&self, count: u64) -> Result<(), End> {
         let start = crate::gpu::FRAMES.load(Relaxed);
@@ -1364,11 +1509,15 @@ impl Play {
 
     #[cfg(target_os = "linux")]
     fn relay_capture_barrier(&self) -> Result<(), End> {
-        // Two flips let an outstanding request finish its readback and enqueue its writer.
-        self.relay_flips(2)?;
-        crate::hle::libs::videoout::wait_shots();
-        if !crate::hle::libs::videoout::shots_idle() {
-            return Err(End::Failed("relay capture request did not drain".into()));
+        // A flip only starts readback. Wait for the complete request/readback/PNG
+        // lifetime, outside the timed phase. A thermal pause can exceed ten seconds.
+        let start = Instant::now();
+        while !crate::hle::libs::videoout::shots_idle() {
+            self.check_stop()?;
+            if start.elapsed() >= Duration::from_secs(90) {
+                return Err(End::Failed("relay capture did not drain within 90s (outside measurement)".into()));
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
         Ok(())
     }

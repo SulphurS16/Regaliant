@@ -227,6 +227,7 @@ fn run() -> Result<(), String> {
     gpu::trcache::set_dir(shaders.join("translations"));
     gpu::precompile::set_store(shaders.join("shader-specs.txt"));
     gpu::capture::init_from_env();
+    info!("Linux whole-run recording: {}", gpu::par::whole_run());
     if offscreen { gpu::tune::set("headless_present", 0); }
     if !headless && !load_only {
         // SDL instance extensions and surfaces must be obtained on this thread, before HLE

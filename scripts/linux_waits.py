@@ -2,9 +2,19 @@
 """Per-flip wall-time coverage from runtime Chrome traces; never sum concurrent lanes."""
 import csv
 import json
+import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+
+DETAIL_PARTS = {
+    'bind/'+name: 'record_bind_'+name.replace(' ', '_').replace('-', '_') for name in (
+        'unbounded size', 'homes and mirrors', 'resident shadows', 'snapshot', 'mirror',
+        'batch-start copy', 'mapping span', 'host binding', 'written-buffer shadows',
+        'descriptor and rest', 'images and samplers')}
+DETAIL_PARTS.update({'prepare/'+name: 'record_prepare_'+name.replace(' ', '_') for name in (
+    'plan and reader', 'resources', 'depth and translation', 'scalar loads', 'result')})
 
 
 def classify(track, name):
@@ -16,6 +26,29 @@ def classify(track, name):
         if 'draws ' in n: return 'gpu_draw_segment'
         if 'cs ' in n: return 'gpu_compute_segment'
         return 'gpu_barrier_or_other'
+    if n.startswith('record step:'):
+        step=n.split(':',1)[1].strip()
+        if step in DETAIL_PARTS: return DETAIL_PARTS[step]
+        if step in ('pipeline',): return 'record_pipeline'
+        if step in ('set write',): return 'record_descriptors'
+        if step in ('set alloc','reserve','sgpr data'): return 'record_allocations'
+        if step in ('vs prepare','ps prepare','prepare'): return 'record_shader_prepare'
+        if step in ('shader-read sync','texture sync','indices','bind vs','bind ps','bind','color targets','depth target','image notes'): return 'record_resource_lookup_sync'
+        if step in ('image hazards','indirect barrier','rendering instance'): return 'record_barriers'
+        if step in ('dynamic state','index and draw','dispatch'): return 'record_command_calls'
+        return 'record_tracking_other'
+    if n.startswith('record: parallel planning'): return 'record_planning'
+    if n.startswith('record: state tracking'): return 'record_state'
+    if n.startswith('record: packet decode'): return 'record_decode'
+    if n in ('record: draw', 'record: draw wrapper'): return 'record_draw_residual'
+    if n in ('record: dispatch', 'record: dispatch wrapper'): return 'record_dispatch_residual'
+    if n == 'record: repeat draw': return 'record_repeat_draw'
+    if n == 'record: gpu draw append': return 'record_gpu_append'
+    if n == 'record: indirect draw arguments': return 'record_indirect_args'
+    if n == 'record: write data': return 'record_write_data'
+    if n in ('record: copy data', 'record: dma data'): return 'record_copy_data'
+    if n == 'record: release memory': return 'record_release_memory'
+    if n.startswith('record:'): return 'record_packet'
     if name == 'replay commands': return 'driver_recording'
     if name == 'submit uploads': return 'texture_upload_submission'
     if name == 'submit pagetable': return 'pagetable_submission'
@@ -47,7 +80,7 @@ def classify(track, name):
     return 'record_or_other'
 
 
-PRIORITY = {name: i for i, name in enumerate(['untraced', 'record_or_other', 'videoout_work',
+PRIORITY = {name: i for i, name in enumerate(['untraced', 'record_or_other', 'record_packet', 'record_indirect_args', 'record_draw_residual', 'record_dispatch_residual', 'record_repeat_draw', 'record_gpu_append', 'record_write_data', 'record_copy_data', 'record_release_memory', 'record_decode', 'record_state', 'record_planning', 'record_tracking_other', 'record_pipeline', 'record_descriptors', 'record_allocations', 'record_shader_prepare', 'record_resource_lookup_sync', *DETAIL_PARTS.values(), 'record_barriers', 'record_command_calls', 'videoout_work',
     'completion_effects', 'memory_work', 'no_submission', 'other_wait', 'gpu_completion',
     'memory_lock', 'parallel', 'label', 'batch_slot', 'batch_slot_submit', 'batch_slot_gpu', 'batch_slot_release', 'submission_wait', 'release_diagnostics', 'release_reset', 'no_ready_frame', 'ready_frame_pacing',
     'submit_jobs', 'submit_preparation', 'submit_specs', 'driver_recording', 'texture_upload_submission', 'pagetable_submission', 'vulkan_queue_lock', 'vulkan_call_and_preparation', 'gpu_batch_span', 'gpu_upload_prologue', 'gpu_barrier_or_other', 'gpu_compute_segment', 'gpu_draw_segment', 'gpu_writeback'])}
@@ -71,6 +104,20 @@ def partition(spans, start, end):
     return result
 
 
+def label_waits(events, tracks, flips):
+    if len(flips) < 2: return {}
+    begin,end = flips[0][0],flips[-1][0]
+    groups = defaultdict(list)
+    for e in events:
+        if e.get('ph') != 'X' or tracks.get(e.get('tid')) != 'gpu-gfx': continue
+        if not e.get('name','').startswith('wait: label') or 'written by ' not in e['name']: continue
+        # Whole waits only, avoiding artificial short samples at the trace boundaries.
+        if begin <= e['ts'] and e['ts']+e.get('dur',0) <= end:
+            groups[e['name'].split('written by ',1)[1].rstrip(')')].append(e['dur']/1000)
+    return {by:dict(count=len(v),median_ms=statistics.median(v),total_ms_per_flip=sum(v)/(len(flips)-1),
+                    near_1ms=sum(.95 <= t <= 1.15 for t in v)) for by,v in groups.items()}
+
+
 def analyze(path, output):
     data = json.loads(path.read_text())
     events = data['traceEvents']
@@ -91,6 +138,8 @@ def analyze(path, output):
             details[track, e['name']].append((a, b, cat))
     gpu_timestamp_spans = sum(len(v) for k, v in spans.items() if k == 'GPU' or k.startswith('GPU segments /'))
     output.mkdir(parents=True, exist_ok=True)
+    labels = label_waits(events, tracks, flips)
+    (output/'label-waits.json').write_text(json.dumps(labels,indent=2)+'\n')
     totals = defaultdict(lambda: defaultdict(float))
     with (output/'frame-waits.csv').open('w') as f:
         writer = csv.writer(f)
@@ -130,7 +179,14 @@ def analyze(path, output):
         for ms, (track, name) in sorted(ranked, reverse=True)[:40]: lines.append(f'{ms:.3f} ms {track}: {name}')
     else: lines.append('INSUFFICIENT EVIDENCE: fewer than two flip markers.')
     (output/'wait-summary.txt').write_text('\n'.join(lines)+'\n')
-    return {'frames': frames, 'mean_frame_ms': wall/max(frames, 1), 'tracks': len(totals), 'gpu_timestamp_spans': gpu_timestamp_spans,
+    # Linux QPC is CLOCK_MONOTONIC nanoseconds. Keep exact trace boundaries for
+    # matching SIGSTOP intervals; never attribute a thermal pause to a packet.
+    clock=data.get('otherData',{})
+    boundary={}
+    if frames and clock.get('qpc_freq')==1_000_000_000:
+        origin=clock['qpc_start']
+        boundary=dict(begin_monotonic_ns=origin+int(flips[0][0]*1000),end_monotonic_ns=origin+int(flips[-1][0]*1000))
+    return {**boundary, 'label_waits': labels, 'cpu_detail_spans': sum(e.get('ph')=='X' and e.get('name','').startswith('record') for e in events), 'source_file': path.name, 'frames': frames, 'mean_frame_ms': wall/max(frames, 1), 'tracks': len(totals), 'gpu_timestamp_spans': gpu_timestamp_spans,
             'mean_ms_by_track': {track: {c: t/max(frames, 1) for c, t in values.items()} for track, values in totals.items()}}
 
 

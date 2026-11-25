@@ -695,6 +695,7 @@ pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
 
 /// `Images::target`, from this thread's memo when it holds.
 pub fn target(s: &Surface) -> Result<Target, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ImageLookup);
     let k = surface_key(s);
     if let Some(t) = tls(|m| m.targets.get(&k).copied()) {
         t.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
@@ -6512,6 +6513,7 @@ impl Images {
 
     /// Attachment for a color or depth/stencil surface (one mip level, one layer).
     pub fn target(&mut self, s: &Surface) -> Result<Target, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ImageLookup);
         let k = self.surface_image(s)?;
         let img = self.map.get_mut(&k).unwrap();
         img.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
@@ -7464,6 +7466,7 @@ impl Images {
     }
 
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ImageLookup);
         self.view_as(t, storage, frame, None)
     }
 
@@ -7569,6 +7572,10 @@ impl Images {
         let _ = levels;
         let (vt, base_layer, layer_count) = if key.ty3d {
             (vk::ImageViewType::TYPE_3D, 0, 1)
+        } else if t.ty == 11 && want == Some(vk::ImageViewType::TYPE_2D_ARRAY) {
+            // Exact cube texel loads: the same image, format, mip range and swizzle, with
+            // one array layer per face. Integer coordinates are relative to BASE_ARRAY.
+            (vk::ImageViewType::TYPE_2D_ARRAY, t.base_array, t.depth.saturating_sub(t.base_array).max(1))
         } else if t.ty == 9 && want == Some(vk::ImageViewType::TYPE_2D_ARRAY) {
             (vk::ImageViewType::TYPE_2D_ARRAY, 0, 1)
         } else if t.ty == 13 && want == Some(vk::ImageViewType::TYPE_2D) {

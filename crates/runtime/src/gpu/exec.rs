@@ -3959,7 +3959,7 @@ fn compute_pipe_with(tr: &super::shaders::Translated, addr: u64, created: &std::
 fn compute_pipe_create(tr: &super::shaders::Translated, addr: u64, push_mode: bool, key: u64, created: &std::cell::Cell<bool>) -> Result<Pipe, String> {
     created.set(true);
     let t0 = std::time::Instant::now();
-    let pipe = compute_pipeline(&tr.out, push_mode, Some(key))?;
+    let pipe = compute_pipeline(&tr.out, push_mode, Some(key), Some(tr.program_hash))?;
     super::compile::note_program(addr);
     super::precompile::note_compute_pipeline(addr, tr);
     PIPES_CREATED[0].fetch_add(1, Ordering::Relaxed);
@@ -4145,7 +4145,7 @@ pub(super) static FORCE_NONCE: std::sync::atomic::AtomicBool = std::sync::atomic
 /// pipeline cache (`--compile-bench`): how long its creation took.
 pub(super) fn bench_compute_pipeline(tr: &super::shaders::Translated) -> Result<std::time::Duration, String> {
     let t = std::time::Instant::now();
-    let pipe = compute_pipeline(&tr.out, push_fits_tr(tr), None)?;
+    let pipe = compute_pipeline(&tr.out, push_fits_tr(tr), None, Some(tr.program_hash))?;
     let d = t.elapsed();
     super::pstats::report(pipe.pipeline, &format!("compile bench {:#018x}", tr.key));
     unsafe {
@@ -4162,7 +4162,7 @@ pub(super) fn bench_compute_pipeline(tr: &super::shaders::Translated) -> Result<
 /// `DS_CB_MEMTEST`): pipeline, layout and set layout.
 pub(super) fn store_compute_pipeline_parts(tr: &super::shaders::Translated) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout), String> {
     let push_mode = push_fits_tr(tr);
-    let pipe = compute_pipeline(&tr.out, push_mode, Some(push_key(tr.key, push_mode)))?;
+    let pipe = compute_pipeline(&tr.out, push_mode, Some(push_key(tr.key, push_mode)), Some(tr.program_hash))?;
     Ok((pipe.pipeline, pipe.layout, pipe.set_layout))
 }
 
@@ -4183,7 +4183,7 @@ pub(super) fn destroy_pipeline_parts(p: (vk::Pipeline, vk::PipelineLayout, vk::D
 pub(super) fn store_compute_pipeline(tr: &super::shaders::Translated) -> Result<std::time::Duration, String> {
     let push_mode = push_fits_tr(tr);
     let t = std::time::Instant::now();
-    let pipe = compute_pipeline(&tr.out, push_mode, Some(push_key(tr.key, push_mode)))?;
+    let pipe = compute_pipeline(&tr.out, push_mode, Some(push_key(tr.key, push_mode)), Some(tr.program_hash))?;
     let d = t.elapsed();
     unsafe {
         let dev = &ctx().device;
@@ -4201,7 +4201,7 @@ static EXTRA_PIPE_FLAGS: AtomicU64 = AtomicU64::new(0);
 /// Creates a compute pipeline (and its layouts) for a translated shader
 /// (`push_mode`: a push descriptor layout if it fits, `push_layout`; with
 /// `cache_key`, through that key's pipeline cache file).
-fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: Option<u64>) -> Result<Pipe, String> {
+fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: Option<u64>, program_hash: Option<u64>) -> Result<Pipe, String> {
     let c = ctx();
     // (A pipeline whose compile crashed this driver: refused before its layouts and module are
     // made, which a refusal inside `pcache::create_with` made and leaked at every use.)
@@ -4250,7 +4250,7 @@ fn compute_pipeline(out: &rdna::translate::Output, push_mode: bool, cache_key: O
                 c.device.create_compute_pipelines(via.cache, &[ci], None).map(|v| v[0]).map_err(|(_, e)| format!("compute pipeline: {e}"))
             };
             // (The module as the driver gets it: `module_code`'s declaration included.)
-            let _crumb = super::pcache::Crumb::set(|| format!("compute pipeline c{:016x}", cache_key.unwrap_or(0)), || vec![("cs", module_code(&out.spirv).into_owned())]);
+            let _crumb = super::pcache::Crumb::set(|| format!("compute pipeline c{:016x} program={:016x}", cache_key.unwrap_or(0), program_hash.unwrap_or(0)), || vec![("cs", module_code(&out.spirv).into_owned())]);
             let pipeline = match cache_key {
                 Some(k) => super::pcache::create_with('c', k, super::pcache::creation_fingerprint(super::pcache::translated_fingerprint(&[&code]), &bindings, &ranges, flags, ci.flags, c.subgroup32 & vk::ShaderStageFlags::COMPUTE), make),
                 None => make(super::pcache::Via { cache: vk::PipelineCache::null(), capture: false, binaries: None }),
@@ -4348,7 +4348,7 @@ pub fn pipeline_test(capture: &str) -> i32 {
         };
         let t0 = std::time::Instant::now();
         // Sets of its own pool (no pushed descriptors).
-        let p = match compute_pipeline(out, false, None) {
+        let p = match compute_pipeline(out, false, None, None) {
             Ok(p) => p,
             Err(e) => {
                 failed += 1;
@@ -4450,7 +4450,7 @@ pub fn record_bench(capture: &str, shader: Option<u64>) -> i32 {
     let c = ctx();
     let dummy = fixed().dummy;
     let n = out.bindings.len();
-    let (push, set_pipe) = match (compute_pipeline(out, true, None), compute_pipeline(out, false, None)) {
+    let (push, set_pipe) = match (compute_pipeline(out, true, None, None), compute_pipeline(out, false, None, None)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
             crate::error!("record bench: cs {addr:#x}: {e}");
@@ -4548,7 +4548,7 @@ fn descriptor_type(k: BindingKind) -> vk::DescriptorType {
     match k {
         BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Address(_) | BindingKind::Gds | BindingKind::Debug | BindingKind::Watchdog | BindingKind::LodStats | BindingKind::Marks => vk::DescriptorType::STORAGE_BUFFER,
         BindingKind::SgprUniform => vk::DescriptorType::UNIFORM_BUFFER,
-        BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
+        BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::CubeFaces(_) | BindingKind::ImageArray(_) => vk::DescriptorType::SAMPLED_IMAGE,
         BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) => vk::DescriptorType::STORAGE_IMAGE,
         BindingKind::Sampler(_) | BindingKind::CompareSampler(_) => vk::DescriptorType::SAMPLER,
     }
@@ -4566,6 +4566,7 @@ fn binding_count(k: BindingKind) -> u32 {
 
 /// The descriptor writes of a command's stages (`set`: ignored when pushed).
 fn descriptor_writes(set: vk::DescriptorSet, bounds: &[Bound]) -> Vec<vk::WriteDescriptorSet<'_>> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Descriptors);
     let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(bounds.iter().map(|b| b.bufs.len() + b.imgs.len() + b.img_arrays.len()).sum());
     for b in bounds {
         for (binding, info) in &b.bufs {
@@ -4719,6 +4720,7 @@ pub(super) fn cpw_lazy_line() -> String {
 /// this bind point holds; `rebound`: a pipeline was bound for this command
 /// (the push then writes every binding).
 fn bind_descriptors(cmd: vk::CommandBuffer, at: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: Option<vk::DescriptorSet>, bounds: &[Bound], state: &mut PushedSet, rebound: bool) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Descriptors);
     let c = ctx();
     match set {
         Some(set) => {
@@ -10238,20 +10240,31 @@ thread_local! {
 /// Dropped at the end of the stage: the time since its last mark counts as
 /// images and samplers.
 struct BindClock {
+    trace: Option<i64>,
+    measured: bool,
     last: u64,
     acc: [u64; 13],
 }
 
 impl BindClock {
     fn start() -> Option<BindClock> {
-        laps().then(|| BindClock { last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 13] })
+        let trace = super::timeline::detail_mark();
+        let measured = laps();
+        (measured || trace.is_some()).then(|| BindClock { trace, measured, last: unsafe { core::arch::x86_64::_rdtsc() }, acc: [0; 13] })
     }
 
     fn mark(c: &mut Option<BindClock>, k: usize) {
         if let Some(c) = c {
-            let now = unsafe { core::arch::x86_64::_rdtsc() };
-            c.acc[k] += now.wrapping_sub(c.last);
-            c.last = now;
+            if c.trace.is_some() {
+                const NAMES: [&str; 10] = ["bind/unbounded size", "bind/homes and mirrors", "bind/resident shadows", "bind/snapshot", "bind/mirror", "bind/batch-start copy", "bind/mapping span", "bind/host binding", "bind/written-buffer shadows", "bind/descriptor and rest"];
+                super::timeline::detail_lap(c.trace, NAMES[k]);
+                c.trace = super::timeline::detail_mark();
+            }
+            if c.measured {
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                c.acc[k] += now.wrapping_sub(c.last);
+                c.last = now;
+            }
         }
     }
 
@@ -10264,6 +10277,8 @@ impl BindClock {
 
 impl Drop for BindClock {
     fn drop(&mut self) {
+        super::timeline::detail_lap(self.trace, "bind/images and samplers");
+        if !self.measured { return; }
         let now = unsafe { core::arch::x86_64::_rdtsc() };
         self.acc[10] += now.wrapping_sub(self.last);
         self.acc[12] += 1;
@@ -11059,6 +11074,7 @@ pub(super) fn ballast_cp(kind: u8, part: u8) {
 
 /// Lap timer of a command's steps (profiling only).
 pub(super) struct Laps {
+    trace: Option<i64>,
     last: Option<std::time::Instant>,
     steps: &'static [AtomicU64],
     /// This command's own step times (ns) and the steps' names, for the log
@@ -11082,13 +11098,17 @@ static SLOW_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 impl Laps {
     pub(super) fn for_draw(kind: usize, first: bool) -> Laps {
-        Laps { last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[kind][..18] } else { &DRAW_STEPS[kind][..18] }, local: [0; 24], names: &DRAW_STEP_NAMES }
+        Laps { trace: (kind <= 1).then(super::timeline::detail_mark).flatten(), last: laps().then(std::time::Instant::now), steps: if first { &DRAW_STEPS_FIRST[kind][..18] } else { &DRAW_STEPS[kind][..18] }, local: [0; 24], names: &DRAW_STEP_NAMES }
     }
     fn for_dispatch(kind: usize, first: bool) -> Laps {
-        Laps { last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[kind][..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] }, local: [0; 24], names: &CS_STEP_NAMES }
+        Laps { trace: (kind <= 1).then(super::timeline::detail_mark).flatten(), last: laps().then(std::time::Instant::now), steps: if first { &CS_STEPS_FIRST[kind][..CS_STEP_COUNT] } else { &CS_STEPS[kind][..CS_STEP_COUNT] }, local: [0; 24], names: &CS_STEP_NAMES }
     }
     /// Adds the time since the last mark to step `k`.
     pub(super) fn mark(&mut self, k: usize) {
+        if self.trace.is_some() {
+            super::timeline::detail_lap(self.trace, self.names[k]);
+            self.trace = super::timeline::detail_mark();
+        }
         if let Some(t) = self.last {
             let now = std::time::Instant::now();
             let ns = (now - t).as_nanos() as u64;
@@ -13262,6 +13282,7 @@ fn same_descs(bound: &Bound, sig: &[u64]) -> bool {
 /// A command's descriptors as plain words (batched dispatches append only
 /// commands whose descriptors equal the run's).
 fn desc_signature(bound: &Bound) -> Vec<u64> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Descriptors);
     use ash::vk::Handle;
     let mut v = Vec::with_capacity(4 * (bound.bufs.len() + bound.imgs.len()));
     for (b, i) in &bound.bufs {
@@ -14717,6 +14738,7 @@ impl Exec {
     /// must keep it for its work: returned only while no batch is being
     /// recorded, else the batch keeps it).
     pub(super) fn home_bind(&mut self, base: u64, size: u64, written: bool, kind: HomeUse) -> Option<(vk::Buffer, u64, u64, Option<std::sync::Arc<super::homes::HomeBuf>>)> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::BufferLookup);
         if size == 0 {
             return None;
         }
@@ -15130,6 +15152,7 @@ impl Exec {
     /// reaching past the end of its mapping is placed up to there (the rest
     /// reads 0). None: nothing of it is mapped, or no video memory.
     fn fe2_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Fe2Placement);
         if place_census_on() && !self.stopped && !self.past_grow && !super::fe2::callers_on() && super::fe2::slow_place_us() == 0 {
             return self.fe2_place_census(base, size, written);
         }
@@ -15305,6 +15328,7 @@ impl Exec {
     }
 
     fn fe2_place_memo(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Fe2Memo);
         // A repeat of a placement of this batch at the same epoch, view and
         // mappings: its result. Its checks found the range current for every
         // CPU write before that epoch began (what the batch's work needs) and
@@ -16126,6 +16150,7 @@ impl Exec {
     }
 
     fn mirror_place(&mut self, base: u64, size: u64, written: bool) -> Option<(vk::Buffer, u64, u64)> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::BufferLookup);
         use super::resident as res;
         let (mbuf, _) = res::mirror()?;
         let end = base.checked_add(size)?;
@@ -17278,7 +17303,7 @@ impl Exec {
         let tw = super::timeline::wait_start();
         let t = std::time::Instant::now();
         wait_done(self.last_seq);
-        tw.end(&self.name, || format!("wait: own batches (#{})", self.last_seq));
+        tw.end(&self.name, || format!("wait: own batches (#{}, reason {}, stages {:x?})", self.last_seq, self.flush_why, self.sync_readers));
         super::hitch::note_since(super::hitch::Kind::GpuWait, t, || format!("own batches for a CPU-side read ({})", self.flush_why));
         self.inflight.clear();
         if let Some(t0) = t0 {
@@ -17668,6 +17693,7 @@ impl Exec {
     }
 
     pub fn sync_for(&mut self, reads: &[(u64, u64)], why: usize) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ResourceSync);
         if self.sync_quick(reads) {
             if laps() {
                 sync_quick_count();
@@ -18743,6 +18769,7 @@ impl Exec {
     /// A full barrier in the batch being recorded (see `global_barrier`).
     #[track_caller]
     fn barrier(&mut self) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Barrier);
         if profiling() {
             let class = if self.deferred { 3 } else if self.name == "gpu-acb0x50" { 2 } else if self.compute_cp { 1 } else { 0 };
             let l = std::panic::Location::caller();
@@ -18765,6 +18792,7 @@ impl Exec {
     /// otherwise that order all earlier work before all later work (front
     /// end 2's write-back).
     fn barrier_noted(&mut self) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Barrier);
         self.cpw_open.clear();
         self.barrier_wanted = false;
         self.dispatched = false;
@@ -18789,6 +18817,7 @@ impl Exec {
     /// over SINCE_MAX), 2 it reads or writes a range written, 3 it writes a
     /// range read, 4 images or the global data share (`TITLE_BARRIERS`).
     fn dispatch_hazard(&self, bound: &Bound, args: Option<u64>) -> usize {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Barrier);
         let (Some(w), Some(r)) = (self.since_barrier.as_ref(), self.since_reads.as_ref()) else { return 1 };
         if self.since_draws {
             return 1;
@@ -19816,6 +19845,7 @@ impl Exec {
     /// Buffer, image and sampler bindings of a stage; fills the resource
     /// info blocks of its SGPR data.
     fn bind_stage(&mut self, p: &mut Prepared, allow_shadow: bool) -> Result<Bound, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::BindStage);
         if replay_census_on() {
             replay_census(p, self.deferred);
         }
@@ -20391,7 +20421,7 @@ impl Exec {
                             break;
                         }
                     },
-                    (BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_), _) => {
+                    (BindingKind::CubeFaces(_) | BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_), _) => {
                         all = false;
                         break;
                     }
@@ -20424,15 +20454,15 @@ impl Exec {
                     (BindingKind::Image(i) | BindingKind::ImageAlt(i), Some(Resolved::Image(t))) if !d3or2d_bound(&found.tr.spec, b.kind, i, t) => {
                         bound.imgs.push((b.binding, vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: vk::ImageView::null(), image_layout: vk::ImageLayout::GENERAL }));
                     }
-                    (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
+                    (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::CubeFaces(_) | BindingKind::StorageImage(_), Some(Resolved::Image(t))) => {
                         let storage = matches!(b.kind, BindingKind::StorageImage(_));
                         // (A translation keyed by its instructions' dimension, `shaders::d2_resources`:
                         // the view its variable takes.)
-                        let want = match b.kind_resource().and_then(|i| found.tr.spec.resources.get(i)) {
+                        let want = if matches!(b.kind, BindingKind::CubeFaces(_)) { Some(vk::ImageViewType::TYPE_2D_ARRAY) } else { match b.kind_resource().and_then(|i| found.tr.spec.resources.get(i)) {
                             Some(rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D2Array, .. }) if t.ty == 9 => Some(vk::ImageViewType::TYPE_2D_ARRAY),
                             Some(rdna::translate::ResSpec::Image { dim: rdna::translate::ImageDim::D2, .. }) if t.ty == 13 => Some(vk::ImageViewType::TYPE_2D),
                             _ => None,
-                        };
+                        } };
                         let (view, image) = im.view_as(t, storage, frame, want)?;
                         let ty = if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE };
                         bound.imgs.push((b.binding, ty, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }));
@@ -20502,7 +20532,7 @@ impl Exec {
                         bound.stored.push(image);
                         bound.img_arrays.push((b.binding, vk::DescriptorType::STORAGE_IMAGE, infos));
                     }
-                    (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
+                    (BindingKind::Image(_) | BindingKind::ImageAlt(_) | BindingKind::CubeFaces(_) | BindingKind::StorageImage(_) | BindingKind::StorageImageMips(_) | BindingKind::ImageArray(_) | BindingKind::Sampler(_) | BindingKind::CompareSampler(_), _) => return Err("binding/resource mismatch".into()),
                     _ => {}
                 }
             }

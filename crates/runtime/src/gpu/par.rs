@@ -34,6 +34,15 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Whole synchronization-free graphics runs on workers, including their first chunk.
+/// Experimental: keep off until cooled A/B and boundary images establish a benefit.
+pub fn whole_run() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PAR_WHOLE_RUN").ok().as_deref() == Some("1"))
+}
+pub static WHOLE_RUNS: AtomicU64 = AtomicU64::new(0);
+pub static WHOLE_COMMANDS: AtomicU64 = AtomicU64::new(0);
+
 /// Chunk workers wanted (`tune par`; 0: runs are recorded by the command
 /// processor alone). By default half the logical CPUs, 2 to 8: on 24 logical
 /// CPUs 6, 7 and 8 workers recorded +2.0%, +2.2% and +2.4% against 5
@@ -864,7 +873,9 @@ pub fn status() -> String {
     } else {
         String::new()
     };
-    past + &format!(
+    let whole = format!("    whole-run recording: enabled {}, runs {}, commands {} (first chunk handed to workers; ordered primary batches)\n",
+        whole_run(), WHOLE_RUNS.load(Ordering::Relaxed), WHOLE_COMMANDS.load(Ordering::Relaxed));
+    past + &whole + &format!(
         "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}{}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),

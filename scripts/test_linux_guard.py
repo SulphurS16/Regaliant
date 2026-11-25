@@ -32,6 +32,27 @@ class ThermalTests(unittest.TestCase):
         self.assertEqual(s.step(149, 105), 'sample')
         self.assertEqual(s.step(150, 105), 'abort')
 
+    def test_as_played_never_pauses_but_still_aborts_sustained_critical(self):
+        s=guard.ThermalState(103,97,60,pause_enabled=False)
+        for t in range(100): self.assertEqual(s.step(t,104),'sample')
+        self.assertEqual(s.pauses,0)
+        self.assertEqual(s.step(100,105),'sample')
+        self.assertEqual(s.step(159,105),'sample')
+        self.assertEqual(s.step(160,104),'sample') # Reset continuous critical timer.
+        self.assertEqual(s.step(170,105),'sample')
+        self.assertEqual(s.step(230,105),'abort')
+        self.assertFalse(guard.Policy({'DS_RELAY_THERMAL_MODE':'observe'}).pause_enabled)
+        self.assertTrue(guard.Policy({}).pause_enabled)
+
+    def test_frequency_and_throttle_telemetry_missing_is_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); p=root/'cpu0/cpufreq';p.mkdir(parents=True)
+            (p/'scaling_cur_freq').write_text('5000000')
+            r=guard.cpu_telemetry([0],root)['0']
+            self.assertEqual(r['scaling_khz'],5000000)
+            self.assertIsNone(r['average_khz'])
+            self.assertIsNone(r['package_throttle_count'])
+
     def test_thermal_defaults_and_overrides(self):
         p = guard.Policy({})
         self.assertEqual((p.pause,p.resume,p.hold,p.abort_temp,p.abort),(103,97,10,105,60))
@@ -73,6 +94,17 @@ class ThermalTests(unittest.TestCase):
             self.assertEqual(sync.call_count, 2)
             f.seek(0)
             self.assertEqual([json.loads(l)['event'] for l in f], ['pause', 'resume'])
+
+    def test_observe_mode_still_cools_each_session_to_seventy(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(guard.time,'sleep') as sleep:
+            p=guard.Policy({'DS_RELAY_THERMAL_MODE':'observe','DS_RELAY_SESSION_TEMP':'70'})
+            with patch.object(guard,'temperature',side_effect=[103,80,70]):
+                p.wait_cool(Path(tmp)/'cooldown.jsonl')
+            self.assertEqual(sleep.call_count,2)
+            with patch.object(guard,'temperature',side_effect=[90,69]):
+                p.wait_cool(Path(tmp)/'cooldown.jsonl')
+            self.assertEqual(sleep.call_count,3) # a new session must cool too
+            with self.assertRaises(guard.GuardError): guard.Policy({'DS_RELAY_SESSION_TEMP':'71'})
 
     def test_cooldown_times_out_without_launch(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(guard.time, 'sleep'), patch.object(guard.time, 'monotonic', side_effect=[0, 1, 2, 3, 4, 5, 6]):

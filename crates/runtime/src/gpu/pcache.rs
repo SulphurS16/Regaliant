@@ -29,6 +29,10 @@
 //! alone did not spare a compile once the driver's cache was reset
 //! (FINDINGS.md 2026-11-08 evening).
 
+#[cfg(target_os = "linux")]
+#[path = "compile_journal.rs"]
+mod compile_journal;
+
 use super::vk::ctx;
 use ash::vk;
 use std::path::{Path, PathBuf};
@@ -660,19 +664,51 @@ thread_local! {
 }
 
 /// A pipeline compile's note (`CRUMB`) for as long as it lives.
-pub struct Crumb;
+pub struct Crumb {
+    #[cfg(target_os = "linux")]
+    _signal: crate::platform::signals::CompileNote,
+}
 
 impl Crumb {
     pub fn set(what: impl FnOnce() -> String, code: impl FnOnce() -> Vec<(&'static str, Vec<u32>)>) -> Crumb {
         static KEEP: OnceLock<bool> = OnceLock::new();
         let keep = *KEEP.get_or_init(|| std::env::var("DS_PIPELINE_CRUMBS").ok().as_deref() == Some("1"));
         let code = if keep { code() } else { Vec::new() };
+        let what = what();
+        // Opt-in capture is written before entering the driver, never by a signal handler.
+        #[cfg(target_os = "linux")]
+        let signal = {
+            if keep {
+                if let Some(dir) = crate::run_dir() {
+                    for (stage, words) in &code {
+                        let path = dir.join(format!("fault-{stage}-{:016x}.spv", fingerprint(&[words])));
+                        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                        if std::fs::write(&path, bytes).is_ok() {
+                            crate::info!("pipeline compile input: {what}; {stage}={}", path.display());
+                        }
+                    }
+                }
+            }
+            let mut line = match (crumb_key(&what), crash_identity()) {
+                (Some((kind, key)), Some(id)) => format!("{kind}{key:016x} {id} {}", what.replace(['\n', '\r'], " ")),
+                _ => what.clone(),
+            };
+            if keep {
+                for (stage, words) in &code {
+                    line.push_str(&format!(" {stage}=fault-{stage}-{:016x}.spv", fingerprint(&[words])));
+                }
+            }
+            crate::platform::signals::CompileNote::new(&line)
+        };
         CRUMB.with(|c| {
             if let Ok(mut g) = c.try_borrow_mut() {
-                *g = Some((what(), code));
+                *g = Some((what, code));
             }
         });
-        Crumb
+        Crumb {
+            #[cfg(target_os = "linux")]
+            _signal: signal,
+        }
     }
 }
 
@@ -774,8 +810,19 @@ fn crashed_file() -> Option<PathBuf> {
     DIR.get().map(|d| d.join("crashed.txt"))
 }
 
-fn crashed_set() -> Option<&'static parking_lot::RwLock<Crashed>> {
+fn crash_identity() -> Option<&'static str> {
     let (_, id) = IDENTITY.get()?;
+    #[cfg(target_os = "linux")]
+    {
+        static SCOPE: OnceLock<String> = OnceLock::new();
+        Some(SCOPE.get_or_init(|| format!("{id}/{}", rdna::SOURCE_HASH)).as_str())
+    }
+    #[cfg(windows)]
+    Some(id.as_str())
+}
+
+fn crashed_set() -> Option<&'static parking_lot::RwLock<Crashed>> {
+    let id = crash_identity()?;
     Some(CRASHED.get_or_init(|| {
         confirm_left_suspects();
         let mut s = Crashed::default();
@@ -980,7 +1027,18 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     let create = |via: Via<'_>| {
         let source = via.binaries.is_none();
         let t = std::time::Instant::now();
+        #[cfg(target_os = "linux")]
+        let pending = if source && !READ_ONLY.load(Ordering::Relaxed) {
+            match (DIR.get(), crash_identity()) {
+                (Some(dir), Some(id)) => Some(compile_journal::Pending::begin(dir, id, kind, key, fp)?),
+                _ => None,
+            }
+        } else { None };
         let result = create(via);
+        #[cfg(target_os = "linux")]
+        if let Some(pending) = pending {
+            if let Err(e) = pending.finish(result.is_ok()) { crate::warn!("{e}"); }
+        }
         if source {
             reuse_record(kind, key, fp, if result.is_ok() { "source" } else { "source_failed" }, t.elapsed().as_secs_f64() * 1000.0);
             SOURCE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1548,6 +1606,10 @@ static IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 pub fn set_identity(device: &str, cache_id: &str) {
     crate::info!("pipeline store identity: {device}; {cache_id}; {:?}", DIR.get());
     let _ = IDENTITY.set((device.to_string(), cache_id.to_string()));
+    #[cfg(target_os = "linux")]
+    if !READ_ONLY.load(Ordering::Relaxed) {
+        if let Some(path) = crashed_file() { crate::platform::signals::compiler_crash_file(&path); }
+    }
 }
 
 /// The store's pipeline-binary mode (`binaries-mode.txt` in the store, 2026-11-20): `binaries =

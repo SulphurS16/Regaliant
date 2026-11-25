@@ -411,6 +411,11 @@ fn linux_clock_ns(clock: libc::clockid_t) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+pub fn linux_fault_samples() -> [u64; 3] {
+    LINUX_FAULT_SAMPLES.each_ref().map(|x| x.load(Ordering::Relaxed))
+}
+
+#[cfg(target_os = "linux")]
 pub fn linux_fault_timing() -> String {
     let [n, wall, cpu] = LINUX_FAULT_SAMPLES.each_ref().map(|x| x.load(Ordering::Relaxed));
     format!("Linux direct fault timing: {n} samples (1/256 attempts), mean {:.2} us wall / {:.2} us thread CPU; excludes kernel signal delivery and service-thread faults", wall as f64 / n.max(1) as f64 / 1000.0, cpu as f64 / n.max(1) as f64 / 1000.0)
