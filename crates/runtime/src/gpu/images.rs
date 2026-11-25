@@ -88,7 +88,49 @@ static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 pub(crate) static CLEAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn trace_clears() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    CLEAR_PROBE.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
+    static FLIPS: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    CLEAR_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+        || *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
+        || FLIPS.get_or_init(|| {
+            let value = std::env::var("DS_TRACE_CLEARS_FLIPS").ok()?;
+            let (a, b) = value.split_once(':')?;
+            let (a, b) = (a.parse::<u64>().ok()?, b.parse::<u64>().ok()?);
+            (a <= b && b - a <= 8).then_some((a, b))
+        }).is_some_and(|(a, b)| {
+            let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1;
+            (a..=b).contains(&flip)
+        })
+}
+
+/// Bisect the metadata handoff added upstream: bit 0 colour targets, bit 1 depth targets.
+/// 3 is unchanged behaviour; 0 restores the old bind/resolve path, not a rendering fix.
+fn meta_claim_kind(mask: u8, format: vk::Format) -> bool {
+    mask & if is_depth(format) { 2 } else { 1 } != 0
+}
+
+pub(crate) fn meta_claim_enabled(format: vk::Format) -> bool {
+    static MASK: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mask = *MASK.get_or_init(|| {
+        // On Linux the colour handoff overexposed the scene (mean brightness of the saved
+        // tunnel scene 0.60 with it, 0.07 without; depth handoff alone is fine), so Linux
+        // claims depth only until the colour case is understood. Windows keeps upstream's 3.
+        let default = if cfg!(target_os = "linux") { 2 } else { 3 };
+        let mask = std::env::var("DS_META_CLAIMS").ok().and_then(|v| v.parse::<u8>().ok()).filter(|&v| v <= 3).unwrap_or(default);
+        crate::info!("images: metadata claim mask {mask} (1 colour, 2 depth; 3 upstream default, 2 the Linux default); claim rebind invalidation {}", meta_claim_rebind());
+        mask
+    });
+    meta_claim_kind(mask, format)
+}
+
+/// Diagnostic candidate: use the attachment-binding generation protocol on a claim too.
+/// The upstream claim updates NOTE_GEN but bypasses bind_clear_metadata's LOOKUP_GEN.
+fn meta_claim_rebind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_META_CLAIM_REBIND").ok().as_deref() == Some("1"))
+}
+
+fn bind_claim_metadata(map: &mut std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>, meta: u64, binding: (ImageKey, [u32; 2]), invalidate: bool) -> bool {
+    if invalidate { bind_clear_metadata(map, meta, binding) } else { map.insert(meta, binding) != Some(binding) }
 }
 
 /// A pending fast clear: its metadata address, the value a fill gave it (None: a write of
@@ -204,6 +246,14 @@ mod clear_tests {
     }
 
     #[test]
+    fn metadata_claim_controls_separate_colour_and_depth() {
+        for (mask, colour, depth) in [(0, false, false), (1, true, false), (2, false, true), (3, true, true)] {
+            assert_eq!(meta_claim_kind(mask, vk::Format::R16G16B16A16_SFLOAT), colour);
+            assert_eq!(meta_claim_kind(mask, vk::Format::D32_SFLOAT_S8_UINT), depth);
+        }
+    }
+
+    #[test]
     fn fractional_ui_clear_after_metadata_rebind() {
         // CPU offscreen model: 240x135 logical at 1.6 density, two moving UI rectangles.
         // Vulkan is deliberately not needed; exercise the real attachment memo invalidation
@@ -235,6 +285,14 @@ mod clear_tests {
         assert_eq!(LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), generation);
         // Same image with different clear words must invalidate too.
         assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [1; 2])));
+        // Upstream's new claim path can change the binding without expiring a cached target.
+        // The opt-in rebind candidate follows the existing attachment protocol instead.
+        tls(|m| { m.targets.insert(surface_key(&surface), target); });
+        assert!(bind_claim_metadata(&mut metadata, surface.meta, (b, [0; 2]), false));
+        assert!(tls(|m| m.targets.contains_key(&surface_key(&surface))));
+        assert!(bind_claim_metadata(&mut metadata, surface.meta, (a, [0; 2]), true));
+        assert!(tls(|m| m.targets.get(&surface_key(&surface)).is_none()));
+        assert_eq!(metadata[&surface.meta], (a, [0; 2]));
     }
 
     #[test]
@@ -5533,6 +5591,9 @@ impl Images {
         let others: Vec<ImageKey> = self.pending_clears.iter().filter(|(k, v)| **k != key && v.0 == meta && v.3 == 0).map(|(k, _)| *k).collect();
         for &o in &others {
             if let Some(e) = self.pending_clears.remove(&o) {
+                if trace_clears() {
+                    crate::info!("trace clears: claim transfer {o:?} -> {key:?}, metadata {meta:#x}, pending {e:?}, previous binding {:?}, destination words {clear:08x?}", self.meta_of.get(&meta));
+                }
                 merge_pending(&mut self.pending_clears, key, e);
                 META_CLAIMS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if trace_clears() {
@@ -5551,7 +5612,7 @@ impl Images {
                 }
             }
         }
-        if self.meta_of.insert(meta, (key, clear)) != Some((key, clear)) {
+        if bind_claim_metadata(&mut self.meta_of, meta, (key, clear), meta_claim_rebind()) {
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }

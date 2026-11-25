@@ -17158,7 +17158,7 @@ impl Exec {
     /// that metadata (the cache's, or its held run's) is not its to take: it stops, as for the
     /// current frame's other clears, and the draw is recorded again by the executor after it.
     pub(crate) fn claim_meta(&mut self, key: super::images::ImageKey, meta: u64, clear: [u32; 2]) {
-        if meta == 0 {
+        if meta == 0 || !super::images::meta_claim_enabled(key.format) {
             return;
         }
         if self.held {
@@ -17166,6 +17166,9 @@ impl Exec {
                 let others: Vec<super::images::ImageKey> = self.held_clears.iter().filter(|(k, v)| **k != key && v.0 == meta && v.3 == 0).map(|(k, _)| *k).collect();
                 for o in others {
                     if let Some(e) = self.held_clears.remove(&o) {
+                        if super::images::trace_clears() {
+                            crate::info!("trace clears: held claim transfer {o:?} -> {key:?}, metadata {meta:#x}, pending {e:?}, destination words {clear:08x?} [{}]", self.name);
+                        }
                         super::images::merge_pending(&mut self.held_clears, key, e);
                         super::images::META_CLAIMS[1].fetch_add(1, Ordering::Relaxed);
                         self.held_claimed.insert(meta, (key, clear));
@@ -17296,7 +17299,7 @@ impl Exec {
             };
             let k = c.key;
             if super::images::trace_clears() {
-                crate::info!("trace clears: {:#x} ({:?} {}x{}) applied, metadata {:#x} = {v:#x}{} (for flip {}, [{}] before programs {:#x}/{:#x})", k.base, k.format, k.width, k.height, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1]);
+                crate::info!("trace clears: {:#x} ({:?} {}x{}) applied, metadata {:#x} = {v:#x}{} clear words {:08x?} layers {:#x} (for flip {}, [{}] before programs {:#x}/{:#x})", k.base, k.format, k.width, k.height, c.meta, if c.known.is_some() { " (from the fill)" } else { " (read)" }, c.clear, c.layers, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) + 1, self.name, self.sync_readers[0], self.sync_readers[1]);
             }
             let (first, count) = run.unwrap_or((0, vk::REMAINING_ARRAY_LAYERS));
             if run.is_some() {

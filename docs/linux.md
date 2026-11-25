@@ -201,4 +201,7 @@ is not a physical input-to-photon latency measurement. Watch moving scenes as we
 - Whole-run parallel recording (`DS_PAR_WHOLE_RUN=1`) is visually incorrect; keep it off.
   C4 held pages remain disabled on Linux, so eager FE2 write-back still costs copies and waits.
 
+For fixed-flip brightness comparisons across binaries and tracking backends, use the
+[exposure checker and revision matrix](linux-exposure-check.md).
+
 Implementation constraints and regression rationale are in [linux-notes.md](linux-notes.md).
