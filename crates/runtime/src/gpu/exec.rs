@@ -1549,7 +1549,13 @@ pub fn outlier_note(ms: f64, flip: u64) {
         let w: Vec<u32> = (0..OUTLIER_STRIDE as usize).map(|k| unsafe { std::ptr::read_volatile(p.add(base + k)) }).collect();
         let tag = (w[1] as u64) << 32 | w[0] as u64;
         let f = |x: u32| f32::from_bits(x);
-        out += &format!("{ms:.1} {flip} {tag:#018x} {d} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e} {:08x} {:08x}\n", f(w[3]), f(w[4]), f(w[5]), f(w[6]), f(w[7]), w[8], w[9]);
+        out += &format!("{ms:.1} {flip} {tag:#018x} {d} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e} {:08x} {:08x}", f(w[3]), f(w[4]), f(w[5]), f(w[6]), f(w[7]), w[8], w[9]);
+        // (`DS_VS_OUTLIER_REGS`: the registers after the first two.)
+        let named = rdna::translate::outlier_regs().map_or(2, |r| r.len().max(2));
+        for x in &w[10..8 + named] {
+            out += &format!(" {x:08x}");
+        }
+        out.push('\n');
         // (`DS_IMM_STATE`: the immediate-mode program's sample names its draw by its vertex
         // buffer's address, V# words 0-1.)
         if imm_state_on() && (IMM_PROGS.contains(&tag) || IMM_PROGS.contains(&(tag ^ 1))) {

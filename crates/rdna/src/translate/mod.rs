@@ -695,9 +695,34 @@ pub const DUMP_POS_VERTICES: u32 = 64;
 
 /// The vertex outlier census (`Spec::outlier`): slots of the debug binding, `OUTLIER_STRIDE`
 /// dwords each: [code hash low, high, vertices counted, the largest magnitude (f32 bits), a
-/// sample position x, y, z, w (f32 bits), the sample's first two user-data SGPRs, 0, 0].
+/// sample position x, y, z, w (f32 bits), the sample's first two user-data SGPRs (or the
+/// `DS_VS_OUTLIER_REGS` registers, [`outlier_regs`]), zeros].
 pub const OUTLIER_SLOTS: u32 = 32768;
-pub const OUTLIER_STRIDE: u32 = 12;
+pub const OUTLIER_STRIDE: u32 = 20;
+/// Registers a census sample can hold (`DS_VS_OUTLIER_REGS`).
+pub const OUTLIER_REGS: usize = 12;
+
+/// Diagnosis (`DS_VS_OUTLIER_REGS=v17,s20,...`, at most [`OUTLIER_REGS`]): a census sample holds
+/// those registers' values at the position export instead of the first two user-data SGPRs
+/// (true: a VGPR).
+pub fn outlier_regs() -> Option<&'static [(bool, u32)]> {
+    static R: std::sync::OnceLock<Option<Vec<(bool, u32)>>> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let v = std::env::var("DS_VS_OUTLIER_REGS").ok()?;
+        let r: Vec<(bool, u32)> = v
+            .split([',', ';'])
+            .filter_map(|x| {
+                let x = x.trim();
+                let (vg, n) = if let Some(n) = x.strip_prefix('v') { (true, n) } else { (false, x.strip_prefix('s')?) };
+                let n: u32 = n.parse().ok()?;
+                (n < if vg { 256 } else { 106 }).then_some((vg, n))
+            })
+            .take(OUTLIER_REGS)
+            .collect();
+        (!r.is_empty()).then_some(r)
+    })
+    .as_deref()
+}
 
 /// The census slot of a program's code hash (`Spec::outlier`).
 pub fn outlier_slot(tag: u64) -> u32 {

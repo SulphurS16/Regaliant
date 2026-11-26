@@ -3551,10 +3551,20 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
                 for &c in &cs {
                     raw.push(tr.to_u(c)?);
                 }
-                // (The first two user-data SGPRs: which draw, e.g. its vertex buffer's address.)
-                let ub = tr.spec.user_base as u32;
-                raw.push(tr.sreg(ub)?);
-                raw.push(tr.sreg(ub + 1)?);
+                // (The first two user-data SGPRs: which draw, e.g. its vertex buffer's address;
+                // `DS_VS_OUTLIER_REGS`: the registers named there, at the export.)
+                match super::outlier_regs() {
+                    Some(regs) => {
+                        for &(v, k) in regs {
+                            raw.push(if v { tr.vreg(k)? } else { tr.sreg(k)? });
+                        }
+                    }
+                    None => {
+                        let ub = tr.spec.user_base as u32;
+                        raw.push(tr.sreg(ub)?);
+                        raw.push(tr.sreg(ub + 1)?);
+                    }
+                }
                 for (class_tag, c) in [(tag, over), (tag ^ 1, wz)] {
                     let cond = e(tr.b.logical_and(bt, None, c, live))?;
                     let base = super::outlier_slot(class_tag) * super::OUTLIER_STRIDE;
