@@ -9,6 +9,7 @@
 - Water outside the Nexus can show bands. Some other rare picture faults are known.
 - The sky in the opening cutscene is a little darker than on PS5. Some light shafts look softer too.
 - HDR has not been seen on an HDR screen yet.
+- Frame generation (DLSS's and FSR's) is not available yet.
 - AMD and Intel graphics cards have not been tested.
 - On graphics cards with 12 GB or less the game can run short of graphics memory in busy places. It then keeps some textures in system memory, and the frame rate there can drop.
 - On cards with 4 or 5 GB the game keeps its large images in system memory from the start. It runs, but slowly. Cards with less than 4 GB have not been tested.
