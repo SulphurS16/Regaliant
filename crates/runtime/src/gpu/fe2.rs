@@ -6334,7 +6334,15 @@ pub fn c4_on() -> bool {
 /// before it turns on, and the first callers may come before that).
 fn c4_wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() != Some("0") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1")) && (crate::hosted::on() || SPECS_AS_HOSTED.load(Ordering::Acquire))
+    *ON.get_or_init(|| std::env::var("DS_C4").ok().as_deref() != Some("0") && !wb_buckets() && wb_same_mode() != 2 && std::env::var("DS_FE2_HOLD").ok().as_deref() != Some("1")) && (hosted_c4() || SPECS_AS_HOSTED.load(Ordering::Acquire))
+}
+
+/// The host serves C4's held pages: Windows' debugger host. Linux's in-process arming
+/// (`DS_LINUX_ARMING=1`) serves no held pages, so C4 stays off there: its translations
+/// (`Spec::marks_held`) stay the ones the pipeline store holds (turned on with arming, every
+/// affected pipeline was made anew in play, 3,412 of them in a 2.5-minute session).
+fn hosted_c4() -> bool {
+    cfg!(windows) && crate::hosted::on()
 }
 
 /// This process only makes translations for the game's sessions (`--precompile-all`, the
