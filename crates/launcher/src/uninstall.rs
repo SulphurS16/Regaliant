@@ -200,6 +200,10 @@ pub fn run(app: &mut App) {
         app.set_status("Stop the shader preparation or the compression first.");
         return;
     }
+    if crate::update::downloading(app) {
+        app.set_status("An update is being downloaded. Uninstall when it is done.");
+        return;
+    }
     let data = human(size_of(&paths.cache) + if paths.user != paths.cache { size_of(&paths.user) } else { 0 });
     let text = format!("Uninstall Regaliant from this PC?\n\nThis removes its program files, its prepared shaders, logs and settings ({data}).\n\nYour game files and add-ons are not touched.");
     if unsafe { crate::ui::message(app.hwnd, &text, TITLE, MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2) } != IDOK {

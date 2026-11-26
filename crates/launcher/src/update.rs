@@ -687,11 +687,34 @@ pub fn after_start(app: &mut App) {
     }
     log(app, &format!("now {VERSION}"));
     app.set_status(&format!("Updated to Regaliant {VERSION}."));
-    let changes = changes.trim();
+    let changes = changes_text(changes);
     if !changes.is_empty() {
-        let text = format!("Regaliant {VERSION} is installed.\n\nWhat changed:\n{}", changes.replace("\n- ", "\n\u{2022} ").trim_start_matches("- "));
+        let text = format!("Regaliant {VERSION} is installed.\n\nWhat changed:\n{changes}");
         unsafe { ui::message(app.hwnd, &text, TITLE, MB_ICONINFORMATION | MB_OK) };
     }
+}
+
+/// The Changes section for a message box: each "- " item one paragraph with a bullet (the
+/// changelog's wrapped lines joined), blank lines kept between items out.
+fn changes_text(changes: &str) -> String {
+    let mut items: Vec<String> = Vec::new();
+    for line in changes.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.strip_prefix("- ") {
+            Some(rest) => items.push(format!("\u{2022} {rest}")),
+            None => match items.last_mut() {
+                Some(last) => {
+                    last.push(' ');
+                    last.push_str(t);
+                }
+                None => items.push(t.to_string()),
+            },
+        }
+    }
+    items.join("\n")
 }
 
 /// A game session ended normally: the earlier version's backup goes.
@@ -1090,6 +1113,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(inst.join("upscalers").join("libxess.dll")).unwrap(), "new");
         assert_eq!(std::fs::read_to_string(inc2.join("regaliant.exe")).unwrap(), "newer");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn changes_for_the_box() {
+        let c = "- Fixed one thing\n  on two lines.\n\n- Added another.\nA stray line.";
+        assert_eq!(changes_text(c), "\u{2022} Fixed one thing on two lines.\n\u{2022} Added another. A stray line.");
+        assert_eq!(changes_text("Plain text."), "Plain text.");
+        assert_eq!(changes_text(""), "");
     }
 
     #[test]
