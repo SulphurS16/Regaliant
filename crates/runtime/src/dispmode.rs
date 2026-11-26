@@ -63,6 +63,15 @@ static GETTER_SET: AtomicU64 = AtomicU64::new(0);
 static HELD: AtomicU64 = AtomicU64::new(0);
 /// The PC tab's render scale (percent of the window's 16:9 area; 0: the title's own size).
 pub static SCALE_PCT: AtomicU32 = AtomicU32::new(0);
+/// The Upscaling mode's factor, used while DLSS, FSR or XeSS replaces the TAA
+/// (`upscale::active`): the screen's size over the render size per side, x100
+/// (`pcsettings::UPSCALE_FACTORS`; 150 Quality).
+pub static UPSCALE_FACTOR: AtomicU32 = AtomicU32::new(150);
+/// The upscaler's output size (width << 32 | height; 0: the TAA output's): the screen's size at
+/// the output's shape where that is smaller than the title's output, which the merge then fills
+/// from it (`gpu::upmerge`; until 2026-11-26 evening the upscalers always output the title's
+/// 3840x2160, costing a mid-range card at a 1080p screen as much as at a 4K one).
+static UPSCALE_OUT: AtomicU64 = AtomicU64::new(0);
 /// `DS_RENDER_SIZE` set the render size (the setting then leaves it alone).
 static RENDER_FROM_ENV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The options' mode at the title's display call (the pulse's other mode is chosen from it).
@@ -80,6 +89,49 @@ static WANT_TICKS: AtomicU32 = AtomicU32::new(0);
 /// `rsize` (width << 32 | height; 0: the title's own), for in-run
 /// comparisons: applied by a mode pulse as the Render Scale is.
 static HEADLESS_WANT: AtomicU64 = AtomicU64::new(0);
+
+/// The upscaler's output size while it is smaller than the title's output (the screen's).
+pub fn upscale_output() -> Option<(u32, u32)> {
+    let v = UPSCALE_OUT.load(Ordering::Relaxed);
+    (v != 0).then_some(((v >> 32) as u32, v as u32))
+}
+
+/// Tests: `DS_UPSCALE_SCREEN=<w>x<h>` stands for the screen in a run without a window (the
+/// upscalers' render and output sizes as at that screen).
+fn test_screen() -> Option<(u32, u32)> {
+    static V: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("DS_UPSCALE_SCREEN").ok()?;
+        let size = v.trim().split_once(['x', 'X']).and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)));
+        match size {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => {
+                crate::info!("upscaler sizes as at a {w}x{h} screen (DS_UPSCALE_SCREEN)");
+                Some((w, h))
+            }
+            _ => {
+                crate::warn!("DS_UPSCALE_SCREEN={v}: not a size (WxH, 640x360 to 7680x4320)");
+                None
+            }
+        }
+    })
+}
+
+/// The render size and the upscaler's output size at the Upscaling mode's factor: the output the
+/// screen's area at the output's shape (at most the title's output; the output itself without a
+/// screen), the render that over the factor, rounded up to a multiple of 4 lines (at least 360),
+/// so that each upscaler runs at its own mode's ratio.
+fn upscaling_sizes(area: Option<(u32, u32)>) -> ((u32, u32), (u32, u32)) {
+    let (ow, oh) = output_size();
+    let (uw, uh) = match area {
+        Some((w, h)) => scaled_for(w, h, 100, ow, oh),
+        None => (ow, oh),
+    };
+    let f = UPSCALE_FACTOR.load(Ordering::Relaxed).clamp(100, 400) as u64;
+    let lines = (uh as u64 * 100).div_ceil(f).div_ceil(4) * 4;
+    let rh = lines.clamp(360, uh.max(360) as u64) as u32;
+    let rw = ((rh as u64 * ow as u64 / oh as u64 + 2) / 4 * 4).min(7680) as u32;
+    ((rw, rh), (uw, uh))
+}
 
 /// `rsize <w>x<h>` (0x0: the title's own size again; no window only).
 pub fn set_headless_size(w: u32, h: u32) -> Result<(), String> {
@@ -146,6 +198,12 @@ const ASPECTS: [f32; 4] = [16.0 / 9.0, 16.0 / 10.0, 64.0 / 27.0, 32.0 / 9.0];
 pub fn render_size() -> (u32, u32) {
     let r = RENDER.load(Ordering::Relaxed);
     if r == 0 { sizes(TITLE_MODE.load(Ordering::Relaxed)).0 } else { ((r >> 32) as u32, r as u32) }
+}
+
+/// The title's own render size for its Visual Mode (2560x1440 in Performance), whatever size the
+/// port holds.
+pub fn title_render_size() -> (u32, u32) {
+    sizes(TITLE_MODE.load(Ordering::Relaxed)).0
 }
 
 /// The output size (the title's 3840x2160 unless an aspect or `DS_OUTPUT_SIZE` changed it).
@@ -350,6 +408,8 @@ fn effective_size() -> u64 {
 
 pub fn tick() {
     apply_aspect();
+    // (The textures' bias for the upscaler's ratio, from the sizes in effect.)
+    crate::gpu::upscale::note_sizes(render_size(), upscale_output().unwrap_or_else(output_size));
     if RENDER_FROM_ENV.load(Ordering::Relaxed) || PULSE_LEFT.load(Ordering::Relaxed) > 0 {
         return;
     }
@@ -362,17 +422,39 @@ pub fn tick() {
         crate::gpu::images::note_left_size((last >> 32) as u32, last as u32);
     }
     let pct = SCALE_PCT.load(Ordering::Relaxed);
-    let want = match crate::gpu::vk::present::area() {
-        Some((w, h)) if pct != 0 => {
-            let (rw, rh) = scaled_size(w, h, pct);
+    let area = crate::gpu::vk::present::area().or_else(test_screen);
+    let headless_want = HEADLESS_WANT.load(Ordering::Relaxed);
+    // An upscaler in the TAA's place: its Upscaling mode's size below the screen's, its output
+    // at the screen's (`rsize` decides in a run without a window, for comparisons).
+    let upscaling = crate::gpu::upscale::active() && !(crate::gpu::vk::present::area().is_none() && headless_want != 0);
+    let want = if upscaling {
+        let ((rw, rh), (uw, uh)) = upscaling_sizes(area);
+        let (ow, oh) = output_size();
+        let out = if uw >= ow || uh >= oh { 0 } else { (uw as u64) << 32 | uh as u64 };
+        if UPSCALE_OUT.swap(out, Ordering::Relaxed) != out {
+            crate::info!("upscaler: output {uw}x{uh} for the screen, render {rw}x{rh} (Upscaling at {:.2}x)", UPSCALE_FACTOR.load(Ordering::Relaxed) as f32 / 100.0);
+        }
+        // (The title's own size needs no pulse while the port holds none.)
+        let title = TITLE_MODE.load(Ordering::Relaxed);
+        if RENDER.load(Ordering::Relaxed) == 0 && (3..=5).contains(&title) && (rw, rh) == sizes(title).0 && (ow, oh) == (3840, 2160) {
+            0
+        } else {
             (rw as u64) << 32 | rh as u64
         }
-        // No window: the title's own size, or its shape's for another aspect
-        // (`rsize`: the size asked for).
-        _ => match HEADLESS_WANT.load(Ordering::Relaxed) {
-            0 => headless_render(),
-            v => v,
-        },
+    } else {
+        UPSCALE_OUT.store(0, Ordering::Relaxed);
+        match area {
+            Some((w, h)) if pct != 0 && crate::gpu::vk::present::area().is_some() => {
+                let (rw, rh) = scaled_size(w, h, pct);
+                (rw as u64) << 32 | rh as u64
+            }
+            // No window: the title's own size, or its shape's for another aspect
+            // (`rsize`: the size asked for).
+            _ => match headless_want {
+                0 => headless_render(),
+                v => v,
+            },
+        }
     };
     // (Back to the title's own size by a pulse: in Cinematic, 2160 lines at 16:9 (`MAX_LINES`);
     // at wider shapes the capped size.)

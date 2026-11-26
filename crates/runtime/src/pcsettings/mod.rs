@@ -132,10 +132,15 @@ impl Item {
 /// 1-9; option 0, the default, is the title's own render size (the Visual Mode's).
 pub const RENDER_SCALES: [u32; 9] = [50, 60, 67, 75, 85, 100, 125, 150, 200];
 
+/// The Upscaling modes' factors, the screen's size over the render size per side, x100 (the
+/// vendors' own: Native AA 1, Quality 1.5, Balanced 1.72, Performance 2, Ultra Performance 3).
+pub const UPSCALE_FACTORS: [u32; 5] = [100, 150, 172, 200, 300];
+
 /// The PC tab's items, in order (each one works: what it changes is in `apply`). The tab shows
 /// 11 rows (rows past them are reached but never drawn: the four list openers were, 2026-11-13):
 /// these 7, then the openers of the Graphics & Display, Controls, Sound & Saves, Key Bindings
-/// and Controller Bindings lists.
+/// and Controller Bindings lists. (Upscaling took Motion Blur Fix's row, 2026-11-26 evening:
+/// that one is in the Graphics & Display list now.)
 pub fn items() -> Vec<Item> {
     let s = |v: &str| v.to_string();
     vec![
@@ -154,7 +159,7 @@ pub fn items() -> Vec<Item> {
         Item {
             id: s("RenderScale"),
             label: s("Render Scale"),
-            tooltip: s("Lower runs faster, higher looks sharper."),
+            tooltip: s("Lower runs faster, higher looks sharper. With DLSS, FSR or XeSS, Upscaling sets it instead."),
             kind: ItemKind::Choice(std::iter::once(s("Visual Mode")).chain(RENDER_SCALES.iter().map(|p| format!("{p}%"))).collect(), 0),
         },
         Item {
@@ -164,18 +169,16 @@ pub fn items() -> Vec<Item> {
             kind: ItemKind::AntiAliasing,
         },
         Item {
+            id: s("UpscaleMode"),
+            label: s("Upscaling"),
+            tooltip: s("How far below the screen's resolution DLSS, FSR or XeSS render. Performance runs faster, Quality looks sharper."),
+            kind: ItemKind::Choice(vec![s("Native AA"), s("Quality"), s("Balanced"), s("Performance"), s("Ultra Performance")], 1),
+        },
+        Item {
             id: s("FrameRateLimit"),
             label: s("Frame Rate Limit"),
             tooltip: s("60 FPS is the original. Uncapped shows frames as soon as they are ready."),
             kind: ItemKind::Choice(vec![s("30 FPS"), s("60 FPS"), s("Uncapped")], 1),
-        },
-        Item {
-            id: s("MouseMotionBlur"),
-            label: s("Motion Blur Fix"),
-            // (Named by what each gives: "Off" read as no blur and gave the game's full blur to a
-            // player who saw every camera move smear, issue #6, 2026-11-25. The values stay.)
-            tooltip: s("No Blur keeps plants sharp while the camera moves. Game's Blur uses the game's Motion Blur."),
-            kind: ItemKind::Choice(vec![s("Game's Blur"), s("Reduced Blur"), s("No Blur")], 2),
         },
         Item {
             id: s("MouseSensitivity"),
@@ -230,6 +233,14 @@ pub fn graphics_items() -> Vec<Item> {
             label: s("Sharpening"),
             tooltip: s("Sharpens the image. Off is the original."),
             kind: ItemKind::Choice(vec![s("Off"), s("25%"), s("50%"), s("75%"), s("100%")], 0),
+        },
+        Item {
+            id: s("MouseMotionBlur"),
+            label: s("Motion Blur Fix"),
+            // (Named by what each gives: "Off" read as no blur and gave the game's full blur to a
+            // player who saw every camera move smear, issue #6, 2026-11-25. The values stay.)
+            tooltip: s("No Blur keeps plants sharp while the camera moves. Game's Blur uses the game's Motion Blur."),
+            kind: ItemKind::Choice(vec![s("Game's Blur"), s("Reduced Blur"), s("No Blur")], 2),
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
@@ -389,6 +400,13 @@ pub fn apply() {
     // Option 0: the title's own render size (0); 1-9 the percentages.
     let scale = get("RenderScale").unwrap_or(0).checked_sub(1).and_then(|i| RENDER_SCALES.get(i as usize).copied()).unwrap_or(0);
     crate::dispmode::SCALE_PCT.store(scale, std::sync::atomic::Ordering::Relaxed);
+    // While DLSS, FSR or XeSS replaces the TAA, the Upscaling mode sets the render size instead:
+    // the screen's over the mode's factor, the upscaler's output at the screen's (`dispmode::tick`).
+    // Until 2026-11-26 evening only Render Scale set it, by default the title's 1440 lines: at a
+    // 1440p or 1080p screen the upscalers only anti-aliased, at a cost (players' "DLSS gives no
+    // frames").
+    let factor = UPSCALE_FACTORS.get(get("UpscaleMode").unwrap_or(1) as usize).copied().unwrap_or(150);
+    crate::dispmode::UPSCALE_FACTOR.store(factor, std::sync::atomic::Ordering::Relaxed);
     // The window: applied when it changes (the window opens with it, `window_mode`).
     static WINDOW_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     if let Some(m) = get("WindowMode") {
@@ -500,6 +518,7 @@ pub fn state_report() {
         format!("HdrOutput {} (HDR allowed {}, output range {})", v("HdrOutput"), hdr_allowed(), crate::hle::libs::videoout::dynamic_range()),
         format!("AspectRatio {} (output {:?})", v("AspectRatio"), crate::dispmode::output_size()),
         format!("RenderScale {} (scale {}%)", v("RenderScale"), crate::dispmode::SCALE_PCT.load(Relaxed)),
+        format!("UpscaleMode {} (factor {:.2}, upscaler in use {}, output {:?}, render {:?})", v("UpscaleMode"), crate::dispmode::UPSCALE_FACTOR.load(Relaxed) as f32 / 100.0, crate::gpu::upscale::active(), crate::dispmode::upscale_output(), crate::dispmode::render_size()),
         format!("Sharpness {} (amount {:.2})", v("Sharpness"), f32::from_bits(crate::gpu::vk::sharpen::AMOUNT.load(Relaxed))),
         format!("MouseSensitivity {} (in effect {:.2})", f("MouseSensitivity"), f32::from_bits(crate::input::PC_SENSITIVITY.load(Relaxed))),
         format!("InvertMouseY {} (in effect {})", v("InvertMouseY"), crate::input::PC_INVERT_Y.load(Relaxed)),

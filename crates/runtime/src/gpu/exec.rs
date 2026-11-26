@@ -21021,7 +21021,14 @@ impl Exec {
                 return false;
             }
         };
-        let output = match super::upmerge::target(to.width, to.height) {
+        // The upscaler's output: the screen's size where it is smaller than the title's output
+        // (and not below the render size, as while a resized window's render size settles),
+        // which the merge then fills the TAA's output from; else the output's own.
+        let (uw, uh) = match crate::dispmode::upscale_output() {
+            Some((w, h)) if w <= to.width && h <= to.height && w >= tc.width && h >= tc.height => (w, h),
+            _ => (to.width, to.height),
+        };
+        let output = match super::upmerge::target(uw, uh) {
             Ok(t) => t,
             Err(e) => {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -21042,8 +21049,8 @@ impl Exec {
             output,
             in_width: tc.width,
             in_height: tc.height,
-            width: to.width,
-            height: to.height,
+            width: uw,
+            height: uh,
             ldr: false,
             jitter_x: j.map_or(0.0, |j| j.x),
             jitter_y: j.map_or(0.0, |j| j.y),
@@ -21052,7 +21059,7 @@ impl Exec {
             return false;
         }
         let (src, view, w, h) = (inp.output.view, taa_out.view, to.width, to.height);
-        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, view, w, h, exposure)));
+        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, uw, uh, view, w, h, exposure)));
         // (The upscaler and the merge bound pipelines and descriptors of their own.)
         self.dyncache = Default::default();
         true

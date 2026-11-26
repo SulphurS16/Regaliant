@@ -270,31 +270,36 @@ pub fn offered(name: &str) -> bool {
 pub fn choices() -> Vec<(String, String)> {
     let mut v = vec![("off".to_string(), "TAA (the game's)".to_string())];
     if ready(Kind::Dlss) {
-        v.push(("dlss".into(), "DLSS (DLAA)".into()));
+        v.push(("dlss".into(), "DLSS".into()));
     }
     if ready(Kind::Xess) {
-        v.push(("xess".into(), "XeSS Native AA".into()));
+        v.push(("xess".into(), "XeSS".into()));
     }
     if ready(Kind::Fsr) {
-        v.push(("fsr".into(), "FSR Native AA".into()));
+        v.push(("fsr".into(), "FSR".into()));
     }
     v
 }
 
-/// The render scale of upscaling done by the port: none (the title's TAA, which the upscalers
-/// replace, already scales its render size up to the output).
-pub fn render_scale() -> f32 {
-    1.0
+/// The textures' level-of-detail bias added to the title's own while an upscaler fills in from
+/// below its output, in 1/16 steps (0 otherwise): the upscalers' guidance, log2 of the render
+/// size over the output's (`note_sizes`, each vblank), so that surfaces keep the detail the
+/// output shows. The title's own TAA keeps the title's biases at every Render Scale.
+static MIP_BIAS16: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The sizes in effect (`dispmode::tick`): the render size and the upscaler's output.
+pub fn note_sizes(render: (u32, u32), out: (u32, u32)) {
+    let b = if active() && render.1 > 0 && render.1 < out.1 { ((render.1 as f32 / out.1 as f32).log2() * 16.0).round() as i32 } else { 0 };
+    if MIP_BIAS16.swap(b, Relaxed) != b {
+        crate::info!("upscaler: texture bias {:+.2} for {}x{} to {}x{}", b as f32 / 16.0, render.0, render.1, out.0, out.1);
+    }
 }
 
-/// The textures' level-of-detail bias while the game renders below the
-/// output (the upscalers' guidance: log2 of the render scale).
-pub fn mip_bias() -> f32 {
-    let s = render_scale();
-    if s < 1.0 { s.log2() } else { 0.0 }
+/// The textures' added bias now, in 1/16 steps (`MIP_BIAS16`).
+pub fn mip_bias16() -> i32 {
+    MIP_BIAS16.load(Relaxed)
 }
 
-/// `k` cannot run in this session: logged once, the game's TAA stays for it.
 fn fail(k: Kind, msg: impl std::fmt::Display) {
     if !failed_flag(k).swap(true, Relaxed) {
         crate::warn!("upscaler: {} unavailable: {msg}", k.name());
@@ -632,6 +637,11 @@ impl Inputs {
     fn ratio(&self) -> f32 {
         self.width as f32 / self.in_width.max(1) as f32
     }
+
+    /// The render size is below the output's.
+    fn upscales(&self) -> bool {
+        self.in_width < self.width || self.in_height < self.height
+    }
 }
 
 /// Records the chosen upscaler into `cmd` after the game's TAA or the game's
@@ -959,7 +969,7 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
         // XeSS's: pixels, current -> previous.
         let (mx, my) = mv_scale();
         unsafe { (x.velocity_scale)(h, -(inp.in_width as f32) * mx, -(inp.in_height as f32) * my) };
-        if inp.ldr {
+        if inp.upscales() {
             crate::info!("upscaler: XeSS upscaling {}x{} to {}x{} (preset {quality}) after the game's TAA", inp.in_width, inp.in_height, inp.width, inp.height);
         } else {
             crate::info!("upscaler: XeSS native anti-aliasing at {}x{} after the game's TAA", inp.width, inp.height);
@@ -1924,7 +1934,7 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let new_size = d.key != key;
     let mode = dlss_mode(inp.ratio());
     if new_size {
-        if inp.ldr {
+        if inp.upscales() {
             crate::info!("upscaler: DLSS upscaling {}x{} to {}x{} (mode {mode}) after the game's TAA", inp.in_width, inp.in_height, inp.width, inp.height);
         } else {
             crate::info!("upscaler: DLSS native anti-aliasing (DLAA) at {}x{} after the game's TAA", inp.width, inp.height);
@@ -2382,7 +2392,7 @@ fn fsr_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
         } else {
             "?".into()
         };
-        if inp.ldr {
+        if inp.upscales() {
             crate::info!("upscaler: FSR upscaling {}x{} to {}x{} after the game's TAA (provider {name})", inp.in_width, inp.in_height, inp.width, inp.height);
         } else {
             crate::info!("upscaler: FSR native anti-aliasing at {}x{} after the game's TAA (provider {name})", inp.width, inp.height);

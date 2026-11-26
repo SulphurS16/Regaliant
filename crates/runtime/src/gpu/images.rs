@@ -507,7 +507,7 @@ struct Tls {
     gpu_base: HashMap<u64, bool>,
     depth_feed: HashMap<u64, bool>,
     views: HashMap<[u32; 8], ViewMemo>,
-    samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool, u32), vk::Sampler>,
 }
 
 /// The PC settings' texture filtering: 0 the title's own, otherwise the anisotropy (8, 16) its
@@ -654,10 +654,41 @@ pub fn tsharp_diff_line() -> String {
     format!("    T#s new to a thread's view memo (`DS_TSHARP_DIFF`): {}, {} of them another T# at a base seen before; differing dwords 0-7: {:?}; bits that differed: [{}]\n", v[0], v[1], &v[2..], x.join(" "))
 }
 
+/// The part of a sampler's key the PC settings decide: the texture filtering's anisotropy and the
+/// surfaces' extra level-of-detail bias below the title's render size (`upscale::mip_bias`, 1/16
+/// steps) above it.
+fn sampler_key_extra() -> u32 {
+    let aniso = ANISO.load(std::sync::atomic::Ordering::Relaxed) as u32;
+    let bias16 = super::upscale::mip_bias16();
+    aniso | ((bias16 as u32 & 0xff) << 8)
+}
+
+/// The title's own biases on its surface textures' samplers, counted over the first 512 made and
+/// logged once (diagnosis: whether its samplers already sharpen for its own TAA's upscale).
+fn note_title_bias(bias: f32) {
+    static SEEN: parking_lot::Mutex<(u32, Vec<(i32, u32)>)> = parking_lot::Mutex::new((0, Vec::new()));
+    let mut g = SEEN.lock();
+    if g.0 >= 512 {
+        return;
+    }
+    g.0 += 1;
+    let q = (bias * 16.0).round() as i32;
+    match g.1.iter_mut().find(|(v, _)| *v == q) {
+        Some((_, n)) => *n += 1,
+        None => g.1.push((q, 1)),
+    }
+    if g.0 == 512 {
+        let mut v = g.1.clone();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let list: Vec<String> = v.iter().take(8).map(|(b, n)| format!("{:+.2} x{n}", *b as f32 / 16.0)).collect();
+        crate::info!("samplers: the title's own biases on its first 512 surface samplers: {}", list.join(", "));
+    }
+}
+
 /// `Images::sampler` from this thread's memo.
 pub fn sampler_hit(s: [u32; 4], compare: bool) -> Option<vk::Sampler> {
-    let aniso = ANISO.load(std::sync::atomic::Ordering::Relaxed);
-    tls(|m| m.samplers.get(&(s, compare, aniso)).copied())
+    let extra = sampler_key_extra();
+    tls(|m| m.samplers.get(&(s, compare, extra)).copied())
 }
 
 /// `Images::resolved_key` from this thread's memo (None: not memoized).
@@ -2314,7 +2345,7 @@ pub struct Images {
     /// Images whose fast-clear metadata was written: (metadata address, its
     /// first word when the writer's value is known: `note_meta_fill`).
     pending_clears: HashMap<ImageKey, PendingClear>,
-    samplers: HashMap<([u32; 4], bool, u8), vk::Sampler>,
+    samplers: HashMap<([u32; 4], bool, u32), vk::Sampler>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -7812,8 +7843,12 @@ impl Images {
     /// Sampler of an S#; `compare`: used by depth-compare instructions (the
     /// S# compare function applies only to those).
     pub fn sampler(&mut self, s: [u32; 4], compare_use: bool) -> Result<vk::Sampler, String> {
-        let aniso_pc = ANISO.load(std::sync::atomic::Ordering::Relaxed);
-        let key = (s, compare_use, aniso_pc);
+        // The PC filtering and the surfaces' extra level-of-detail bias below the title's own
+        // render size (`sampler_key_extra`), read once: the key and the sampler agree.
+        let extra = sampler_key_extra();
+        let aniso_pc = (extra & 0xff) as u8;
+        let bias16 = ((extra >> 8) & 0xff) as u8 as i8 as i32;
+        let key = (s, compare_use, extra);
         if let Some(&v) = self.samplers.get(&key) {
             tls(|m| {
                 m.samplers.insert(key, v);
@@ -7845,7 +7880,14 @@ impl Images {
         let max_lod = b(s[1], 12, 12) as f32 / 256.0;
         // The PC texture filtering (`ANISO`): anisotropic at that level for the title's
         // mipmapped, linearly filtered samplers that do not compare (its surface textures).
-        let raise = aniso_pc > 1 && !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
+        let surface = !compare_use && mip == 2 && b(s[2], 22, 2) >= 1 && b(s[2], 20, 2) >= 1;
+        let raise = aniso_pc > 1 && surface;
+        // (While an upscaler fills in from below its output the same surface textures keep the
+        // output's detail: the upscalers' guidance, a negative bias of log2 of the ratio.)
+        if surface {
+            note_title_bias(lod_bias);
+        }
+        let lod_bias = lod_bias + if surface { bias16 as f32 / 16.0 } else { 0.0 };
         let ci = vk::SamplerCreateInfo::default()
             .mag_filter(filt(b(s[2], 20, 2)))
             .min_filter(filt(b(s[2], 22, 2)))
