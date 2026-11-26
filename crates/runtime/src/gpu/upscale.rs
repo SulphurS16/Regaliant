@@ -134,6 +134,89 @@ pub fn set_choice(v: &str) {
     }
 }
 
+/// Upscaler contexts left by new sizes (kind, context, the flip from which it is freed): the GPU
+/// may still run their last dispatches for a few frames. Until 2026-11-26 night a new size made a
+/// new FSR or XeSS context and kept the old one, and a switch to another Anti-Aliasing kept its
+/// context too, each holding its images (hundreds of MB at 4K) until the game ended: a player's
+/// frame rate fell to ~10 after several Render Scale and upscaler changes, until a restart (issue
+/// #26, an RX 9070 on 0.1.8). The Upscaling modes make such changes common.
+static RETIRED: Mutex<Vec<(Kind, usize, u64)>> = Mutex::new(Vec::new());
+/// Flips a retired context waits, and how long one of an upscaler not chosen may sit unused.
+const RETIRE_FLIPS: u64 = 8;
+const IDLE_FREE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn retire(k: Kind, ctx: usize) {
+    if ctx != 0 {
+        RETIRED.lock().push((k, ctx, super::FRAMES.load(Relaxed) + RETIRE_FLIPS));
+    }
+}
+
+/// Destroys a context of `k` (under its state's lock: not beside a recording with it).
+fn destroy_context(k: Kind, ctx: usize, why: &str) {
+    match k {
+        Kind::Fsr => {
+            if let Some(f) = ffx() {
+                let mut c = ctx as FfxContext;
+                let r = unsafe { (f.destroy)(&mut c, std::ptr::null()) };
+                crate::info!("upscaler: FSR's context {why} freed ({r})");
+            }
+        }
+        Kind::Xess => {
+            if let Some(x) = xess() {
+                // (XeSS's library may wait for the device in it: the port's queues held meanwhile.
+                // From the flip thread, which holds none of them.)
+                let r = super::vk::ctx().with_queues_held(|| unsafe { (x.destroy)(ctx as Handle) });
+                crate::info!("upscaler: XeSS's context {why} freed ({r})");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// At each flip (`pacing::note_flip`): frees the retired contexts whose flip has come, and the
+/// context of FSR or XeSS when another Anti-Aliasing is chosen and it has not run for a while.
+pub fn free_retired() {
+    let now = super::FRAMES.load(Relaxed);
+    let due: Vec<(Kind, usize, u64)> = {
+        let mut r = RETIRED.lock();
+        if r.iter().any(|x| x.2 <= now) {
+            let (due, keep): (Vec<_>, Vec<_>) = r.drain(..).partition(|x| x.2 <= now);
+            *r = keep;
+            due
+        } else {
+            Vec::new()
+        }
+    };
+    for (k, ctx, _) in due {
+        match k {
+            Kind::Fsr => {
+                let _g = FSR_STATE.lock();
+                destroy_context(k, ctx, "of an earlier size");
+            }
+            Kind::Xess => {
+                let _g = XESS_STATE.lock();
+                destroy_context(k, ctx, "of an earlier size");
+            }
+            _ => {}
+        }
+    }
+    let chosen = choice();
+    if chosen != Kind::Fsr
+        && let Some(mut st) = FSR_STATE.try_lock()
+        && st.as_ref().is_some_and(|s| s.last.elapsed() > IDLE_FREE)
+        && let Some(old) = st.take()
+    {
+        destroy_context(Kind::Fsr, old.ctx, "(another Anti-Aliasing chosen)");
+    }
+    if chosen != Kind::Xess
+        && let Some(mut st) = XESS_STATE.try_lock()
+        && st.as_ref().is_some_and(|s| s.last.elapsed() > IDLE_FREE)
+        && let Some(old) = st.take()
+    {
+        destroy_context(Kind::Xess, old.ctx as usize, "(another Anti-Aliasing chosen)");
+    }
+}
+
 /// The device is made (`device_created`): XeSS and FSR are ready by then or not at all.
 static DEVICE_MADE: AtomicBool = AtomicBool::new(false);
 
@@ -808,6 +891,7 @@ struct XessLib {
     execute: unsafe extern "C" fn(Handle, vk::CommandBuffer, *const XessExecute) -> i32,
     velocity_scale: unsafe extern "C" fn(Handle, f32, f32) -> i32,
     logging: unsafe extern "C" fn(Handle, i32, LogFn) -> i32,
+    destroy: unsafe extern "C" fn(Handle) -> i32,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded.
@@ -854,6 +938,7 @@ fn load_xess() -> Result<XessLib, LoadError> {
             execute: std::mem::transmute(f(c"xessVKExecute")?),
             velocity_scale: std::mem::transmute(f(c"xessSetVelocityScale")?),
             logging: std::mem::transmute(f(c"xessSetLoggingCallback")?),
+            destroy: std::mem::transmute(f(c"xessDestroyContext")?),
         };
         crate::info!("upscaler: XeSS loaded from {}", path.display());
         Ok(lib)
@@ -919,6 +1004,8 @@ struct XessState {
     ctx: Handle,
     key: (u32, u32, u32, u32, bool),
     frame: u32,
+    /// When it last ran (`free_retired`: one left unused while another Anti-Aliasing is chosen).
+    last: std::time::Instant,
 }
 
 /// XeSS's preset nearest to an output/render ratio (its fixed scalings:
@@ -948,8 +1035,10 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let key = (inp.in_width, inp.in_height, inp.width, inp.height, inp.ldr);
     let mut st = XESS_STATE.lock();
     if st.as_ref().is_some_and(|s| s.key != key) {
-        // (Other sizes: a new context; the old one leaks - rare.)
-        *st = None;
+        // (Other sizes: a new context, the old one freed a few frames later: `retire`.)
+        if let Some(old) = st.take() {
+            retire(Kind::Xess, old.ctx as usize);
+        }
     }
     if st.is_none() {
         let c = super::vk::ctx();
@@ -977,9 +1066,10 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
         } else {
             crate::info!("upscaler: XeSS native anti-aliasing at {}x{} after the game's TAA", inp.width, inp.height);
         }
-        *st = Some(XessState { ctx: h, key, frame: 0 });
+        *st = Some(XessState { ctx: h, key, frame: 0, last: std::time::Instant::now() });
     }
     let s = st.as_mut().unwrap();
+    s.last = std::time::Instant::now();
     let (jx, jy) = (inp.jitter_x, inp.jitter_y);
     let (sx, sy) = jitter_scale();
     let (w, h) = (inp.in_width, inp.in_height);
@@ -2212,6 +2302,7 @@ struct FfxLib {
     create: unsafe extern "C" fn(*mut FfxContext, *mut FfxHeader, *const c_void) -> u32,
     query: unsafe extern "C" fn(*mut FfxContext, *mut FfxHeader) -> u32,
     dispatch: unsafe extern "C" fn(*mut FfxContext, *const FfxHeader) -> u32,
+    destroy: unsafe extern "C" fn(*mut FfxContext, *const c_void) -> u32,
 }
 
 // SAFETY: plain function pointers into a library that stays loaded.
@@ -2258,6 +2349,7 @@ fn load_ffx() -> Result<FfxLib, LoadError> {
             create: std::mem::transmute(f(c"ffxCreateContext")?),
             query: std::mem::transmute(f(c"ffxQuery")?),
             dispatch: std::mem::transmute(f(c"ffxDispatch")?),
+            destroy: std::mem::transmute(f(c"ffxDestroyContext")?),
         };
         crate::info!("upscaler: FSR loaded from {}", dir.display());
         Ok(lib)
@@ -2364,8 +2456,10 @@ fn fsr_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let key = (inp.in_width, inp.in_height, inp.width, inp.height, inp.ldr);
     let mut st = FSR_STATE.lock();
     if st.as_ref().is_some_and(|s| s.key != key) {
-        // (Other sizes: a new context; the old one leaks - rare.)
-        *st = None;
+        // (Other sizes: a new context, the old one freed a few frames later: `retire`.)
+        if let Some(old) = st.take() {
+            retire(Kind::Fsr, old.ctx);
+        }
     }
     if st.is_none() {
         let c = super::vk::ctx();

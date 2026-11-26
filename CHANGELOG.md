@@ -13,6 +13,9 @@
   the upscaler fills in to your screen's resolution. Native AA keeps the full resolution. Before,
   they only smoothed edges at the game's own render size, so they gave no frames. Motion Blur Fix
   moved to the Graphics & Display list to make room.
+- Fixed the frame rate falling after several changes of Render Scale, Upscaling or the
+  upscaler, until a restart (issue #26). FSR and XeSS kept their working memory for every size
+  they had run at, and for an upscaler no longer chosen. It is now freed.
 - Probably fixed starts with DLSS that ended at once on some PCs, seen with an RTX 5080 beside
   an integrated graphics chip. Code in NVIDIA's files stops when it sees a debugger, and
   Regaliant runs the game under a helper that Windows counts as one. The game's files no longer

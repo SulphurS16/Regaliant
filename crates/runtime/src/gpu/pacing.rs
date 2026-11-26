@@ -30,6 +30,8 @@ pub fn note_flip(n: u64, us: u64) {
     s.last = Some((us, n));
     drop(s);
     crate::perfhud::note_flip(us);
+    // (The upscalers' contexts of earlier sizes or of one no longer chosen: issue #26.)
+    super::upscale::free_retired();
     super::hitch::flip(n, us);
     super::fe2::census_sample();
 }

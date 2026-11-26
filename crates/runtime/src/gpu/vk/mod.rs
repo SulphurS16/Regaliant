@@ -2302,6 +2302,17 @@ impl Ctx {
         Some((t[0], t[1] as i64))
     }
 
+    /// Runs `f` with every queue of the port's held: a library's call that may wait for the whole
+    /// device (vkDeviceWaitIdle needs every queue externally synchronized; XeSS's library holds
+    /// that call: `upscale::destroy_context`). Not from a thread that holds one of them.
+    pub fn with_queues_held<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _main = self.queue.lock();
+        let _present = self.present_queue.as_ref().map(|q| q.lock());
+        let _compute = self.compute.as_ref().map(|c| c.queue.lock());
+        let _copy = self.copy.as_ref().map(|c| c.queue.lock());
+        f()
+    }
+
     pub fn submit(&self, cmd: vk::CommandBuffer, wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
         self.submit_cmds(&[cmd], wait, signal, fence)
     }
