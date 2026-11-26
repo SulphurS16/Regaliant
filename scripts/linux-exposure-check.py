@@ -31,7 +31,7 @@ prepare = module('linux-prepare-shaders')
 SWITCHES = {'DS_LINUX_WRITE_WATCH': {'uffd', 'mprotect'},
             'DS_NAN_PRESERVE': {'0', '1'}, 'DS_PLAIN_MODES': {'0', '1'},
             'DS_MAX_RECONV': {'0', '1'}, 'DS_META_CLAIMS': {'0', '1', '2', '3'},
-            'DS_META_CLAIM_REBIND': {'0', '1'}, 'DS_PROFILE_GPU': {'0', '1'}, 'DS_LINUX_WW_UNLOCKED_SCAN': {'0', '1'}, 'DS_PAR_WEIGHT': {'500', '750', '1000', '1500'}, 'DS_GPU_CHAINS': {'0', '1', '2'}, 'DS_GPU_SLOTS_GFX': {'8', '12', '16', '24'}, 'DS_RENDER_SIZE': {'3840x2160', '2880x1620', '1920x1080', 'window'}, 'DS_SUBMIT_COALESCE': {'8', '16', '32', '64'}, 'DS_FE2_CALLERS': {'0', '1'}, 'DS_LINUX_ARMING': {'0', '1'}}
+            'DS_META_CLAIM_REBIND': {'0', '1'}, 'DS_PROFILE_GPU': {'0', '1'}, 'DS_LINUX_WW_UNLOCKED_SCAN': {'0', '1'}, 'DS_PAR_WEIGHT': {'500', '750', '1000', '1500'}, 'DS_GPU_CHAINS': {'0', '1', '2'}, 'DS_GPU_SLOTS_GFX': {'8', '12', '16', '24'}, 'DS_RENDER_SIZE': {'3840x2160', '2880x1620', '1920x1080', 'window'}, 'DS_SUBMIT_COALESCE': {'8', '16', '32', '64'}, 'DS_FE2_CALLERS': {'0', '1'}, 'DS_LINUX_ARMING': {'0', '1'}, 'DS_SLOW_PLACE': {'0', '20000', '50000'}}
 
 PLAY_CASES = ('off', 'fg', 'fg-real-only', 'depth-off', 'cpu-detile', 'vertices', 'fg-adaptive', 'fg-adaptive-vertices')
 def play_environment(case, flips):

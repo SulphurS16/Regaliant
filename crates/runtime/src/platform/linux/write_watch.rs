@@ -193,6 +193,7 @@ impl Watch {
     }
 }
 
+static SCAN_LOGGED: AtomicU64 = AtomicU64::new(0);
 /// PAGEMAP_SCAN over [lo, hi): appends the pages written since their last scan and
 /// write-protects them again (WP_MATCHING | CHECK_WPASYNC). Needs no watch mutex.
 fn scan_fd(fd: i32, lo: u64, hi: u64, out: &mut Vec<u64>) -> Result<(), String> {
@@ -202,7 +203,14 @@ fn scan_fd(fd: i32, lo: u64, hi: u64, out: &mut Vec<u64>) -> Result<(), String> 
         let mut arg = Scan { size: size_of::<Scan>() as u64, flags: 3,
             start: at, end: hi, vec: regions.as_mut_ptr() as u64, vec_len: regions.len() as u64,
             category_mask: WRITTEN, return_mask: WRITTEN, ..Default::default() };
+        let ts = std::time::Instant::now();
         let n = unsafe { libc::ioctl(fd, SCAN, &mut arg) };
+        let us = ts.elapsed().as_micros() as u64;
+        // (A scan waits for the mm's lock behind a mapping change, which waits for the
+        // scans before it: long ones are logged, 2026-11-26.)
+        if us >= 5_000 && SCAN_LOGGED.fetch_add(1, Relaxed) < 100 {
+            crate::info!("pagemap scan {at:#x}..{:#x} ({} pages walked, {n} regions) took {us} us", arg.walk_end, (arg.walk_end.max(at) - at) / PAGE);
+        }
         STATS[1].fetch_add(1, Relaxed);
         if n < 0 { return Err(error("PAGEMAP_SCAN")); }
         if n as usize > regions.len() || arg.walk_end <= at || arg.walk_end > hi { return Err("PAGEMAP_SCAN invalid progress".into()); }

@@ -1080,19 +1080,51 @@ pub fn remap_guard() -> parking_lot::RwLockWriteGuard<'static, ()> {
 }
 
 #[cfg(target_os = "linux")]
-pub struct RemapGuard { _lock: parking_lot::RwLockWriteGuard<'static, ()> }
-#[cfg(target_os = "linux")]
-impl Drop for RemapGuard {
-    fn drop(&mut self) { LINUX_REMAP.store(0, Ordering::Release); }
+pub struct RemapGuard {
+    _lock: parking_lot::RwLockWriteGuard<'static, ()>,
+    /// Where it was taken, when, and how long taking it waited for the readers.
+    at: &'static std::panic::Location<'static>,
+    held: std::time::Instant,
+    wait_us: u64,
 }
 #[cfg(target_os = "linux")]
+impl Drop for RemapGuard {
+    fn drop(&mut self) {
+        LINUX_REMAP.store(0, Ordering::Release);
+        // Every take and check waits while this is held (`arm_guard`): a long hold is a
+        // hitch on all of them at once (2026-11-26: four gfx workers' one-page checks
+        // at 107-108 ms together, after mapping changes).
+        let us = self.held.elapsed().as_micros() as u64;
+        REMAP_STATS[0].fetch_add(1, Ordering::Relaxed);
+        REMAP_STATS[1].fetch_add(us, Ordering::Relaxed);
+        REMAP_STATS[2].fetch_add(self.wait_us, Ordering::Relaxed);
+        REMAP_STATS[3].fetch_max(us, Ordering::Relaxed);
+        let (at, wait) = (self.at, self.wait_us);
+        if us >= 5_000 && REMAP_LOGGED.fetch_add(1, Ordering::Relaxed) < 400 {
+            crate::info!("mapping change at {}:{} held every take {us} us (waited {wait} us for readers)", at.file().rsplit('/').next().unwrap_or(""), at.line());
+        }
+        super::hitch::note_since(super::hitch::Kind::Mirror, self.held, || {
+            format!("mapping change held every take ({}:{}; it waited {} us for the readers first)", at.file().rsplit('/').next().unwrap_or(""), at.line(), wait)
+        });
+    }
+}
+/// Mapping changes under `remap_guard`: [count, us held, us waited for readers, longest hold us].
+#[cfg(target_os = "linux")]
+static REMAP_LOGGED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+pub static REMAP_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+#[cfg(target_os = "linux")]
+#[track_caller]
 pub fn remap_guard() -> RemapGuard {
+    let at = std::panic::Location::caller();
+    let t = std::time::Instant::now();
     let lock = ARM_LOCK.write();
     // Only one writer holds ARM_LOCK. Stop admitting signal readers, then wait for the
     // at most one syscall each already admitted reader performs.
     LINUX_REMAP.fetch_or(LINUX_WRITER, Ordering::AcqRel);
     while LINUX_REMAP.load(Ordering::Acquire) != LINUX_WRITER { std::hint::spin_loop(); }
-    RemapGuard { _lock: lock }
+    let wait_us = t.elapsed().as_micros() as u64;
+    RemapGuard { _lock: lock, at, held: std::time::Instant::now(), wait_us }
 }
 
 /// A mapping or protection change of [base, base+len) is done (called under

@@ -390,9 +390,55 @@ pub fn map_new_view(va: u64, n: u64, sec: Sec, off: u64, prot: u32) -> Result<()
     map_view_with(va, n, sec, off, prot, true)
 }
 
+/// The section ranges a fresh view of [off, off+n) must zero (`map_view_with`), taken
+/// from the state (and the direct memory's marked dirty).
+fn stale_for(sec: Sec, off: u64, n: u64) -> Vec<(u64, u64)> {
+    match STATE.lock().as_mut() {
+        Some(st) if sec == Sec::Dmem => {
+            let z = rs_take(&mut st.zero_next, off, off + n);
+            rs_add(&mut st.dirty[0], off, off + n);
+            z
+        }
+        Some(st) => rs_take(&mut st.dirty[1], off, off + n),
+        None => Vec::new(),
+    }
+}
+
 fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) -> Result<(), String> {
     let h = handle(sec).ok_or("sections not set up")?;
     isolate(va, n)?;
+    // Linux: one mmap at the view's own protection. Each mmap or mprotect waits for the
+    // process's mm lock, which the write watch's scans (some 370,000 a second) keep
+    // read-held: a writer gets it only once the kernel hands it over, ~4 ms. The
+    // commit and protection after the map (Windows' steps; mprotects here) were two more
+    // of those under the mapping guard, every take waiting (2026-11-26: section
+    // commits held it 8-38 ms, four gfx workers stalled 107-108 ms at once in play).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let stale = if fresh { stale_for(sec, off, n) } else { Vec::new() };
+        // (Writable while stale bytes are zeroed through it.)
+        let first = if stale.is_empty() { prot } else { PAGE_EXECUTE_READWRITE };
+        let v = MapViewOfFile3(h, GetCurrentProcess(), va as _, off, n as usize, MEM_REPLACE_PLACEHOLDER, first, std::ptr::null_mut(), 0);
+        if v.Value.is_null() {
+            // (Still to be zeroed at the next map.)
+            if let Some(st) = STATE.lock().as_mut() {
+                for &(a, e) in &stale {
+                    rs_add(if sec == Sec::Dmem { &mut st.zero_next } else { &mut st.dirty[1] }, a, e);
+                }
+            }
+            return err(&format!("mapping a view at {va:#x}+{n:#x} (offset {off:#x})"));
+        }
+        for (a, e) in stale {
+            std::ptr::write_bytes((va + (a - off)) as *mut u8, 0, (e - a) as usize);
+            ZEROED[(sec == Sec::Anon) as usize].fetch_add(e - a, Ordering::Relaxed);
+        }
+        let mut old = 0u32;
+        if first != prot && VirtualProtect(va as _, n as usize, prot, &mut old) == 0 {
+            return err(&format!("protecting the view at {va:#x}"));
+        }
+        return Ok(());
+    }
+    #[cfg(windows)]
     unsafe {
         let v = MapViewOfFile3(h, GetCurrentProcess(), va as _, off, n as usize, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, std::ptr::null_mut(), 0);
         if v.Value.is_null() {
@@ -404,16 +450,7 @@ fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) ->
             return Err(format!("committing {va:#x}+{n:#x}: error {e}"));
         }
         if fresh {
-            let stale = match STATE.lock().as_mut() {
-                Some(st) if sec == Sec::Dmem => {
-                    let z = rs_take(&mut st.zero_next, off, off + n);
-                    rs_add(&mut st.dirty[0], off, off + n);
-                    z
-                }
-                Some(st) => rs_take(&mut st.dirty[1], off, off + n),
-                None => Vec::new(),
-            };
-            for (a, e) in stale {
+            for (a, e) in stale_for(sec, off, n) {
                 std::ptr::write_bytes((va + (a - off)) as *mut u8, 0, (e - a) as usize);
                 ZEROED[(sec == Sec::Anon) as usize].fetch_add(e - a, Ordering::Relaxed);
             }
@@ -423,6 +460,7 @@ fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) ->
             return err(&format!("protecting the view at {va:#x}"));
         }
     }
+    #[cfg(windows)]
     Ok(())
 }
 
