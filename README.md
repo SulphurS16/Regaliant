@@ -1,14 +1,11 @@
 <p align="center"><img src="assets/regaliant-logo.png" alt="Regaliant" width="560"></p>
 
-<p align="center">
-  <a href="https://discord.gg/rSr5JhxxtZ"><img src="https://img.shields.io/badge/Discord-Join%20the%20server-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="48"></a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/SulphurS16/Regaliant/releases/latest"><img src="https://img.shields.io/badge/Download-Latest%20release-2EA043?style=for-the-badge&logo=github&logoColor=white" alt="Download the latest release" height="48"></a>
-</p>
+> **This is a Linux-focused fork of [SulphurS16/Regaliant](https://github.com/SulphurS16/Regaliant).**
+> It adds a native Linux build. The work happens on the `linux-support` branch, which is this fork's default.
+> Windows support still comes from the original project, and this fork follows it. For Windows builds, releases and the Discord, see the original repository.
+> Please report Linux problems in this fork's issues, not upstream.
 
-<p align="center"><b><a href="https://discord.gg/rSr5JhxxtZ">Join the Discord</a></b> for news, help and more ports. <b><a href="https://github.com/SulphurS16/Regaliant/releases/latest">Download the latest release</a></b> to play.</p>
-
-Regaliant is an unofficial PC port of Demon's Souls (PS5) for Windows. It runs the game's own PS5 program from your copy of the game, with no CPU emulation. The PS5's system libraries are reimplemented for Windows, and the game's graphics run on Vulkan.
+Regaliant is an unofficial PC port of Demon's Souls (PS5). It runs the game's own PS5 program from your copy of the game, with no CPU emulation. The PS5's system libraries are reimplemented for the PC, and the game's graphics run on Vulkan. The original project targets Windows. This fork adds a native Linux build.
 
 **You need your own copy of the game.** Regaliant contains no game data, no game code and no keys, and it decrypts nothing. It needs Demon's Souls for PS5 (PPSA01341) at version 01.007.000, with its executable and two libraries decrypted. See the [install guide](docs/install.md).
 
@@ -16,7 +13,26 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, Bl
 
 This is an early version.
 
-The `linux-port` branch has an experimental [Linux native bootstrap](docs/linux.md). It builds, renders the tutorial world through Vulkan and resumes saved progress. Performance and physical playtesting remain under investigation. See the Linux guide for the play command and remaining hardware-testing limits.
+## Linux
+
+The Linux build is experimental. It runs the game natively on x86-64 Linux, with Vulkan graphics and SDL3 windowing, input and audio. No Wine or Proton is involved. Regaliant builds from source: see the [Linux guide](docs/linux.md) for the build and play commands.
+
+What works:
+
+- Gameplay and resuming saves.
+- Fullscreen on fractional-scale displays.
+- The full shader-preparation tour.
+- Intro movies at their own 30 fps on any refresh rate.
+- Optional [FSR3 frame generation](docs/linux-frame-generation.md).
+
+Still in progress:
+
+- Frame rate in busy areas.
+- Stutter.
+- Graphical glitches: oversized glows, stray geometry, some black textures.
+- Audio dropouts in long sessions.
+
+Testing so far has been on one NVIDIA PC. The Features, Performance and Known issues sections below describe the Windows build. Not everything there applies to Linux yet.
 
 ## Features
 
@@ -58,7 +74,7 @@ Goals, roughly in order. They are aims, not promises or dates.
 
 - A steady 60 fps everywhere, the busiest places included, then higher frame rates for high-refresh screens.
 - Shorter shader preparation, then none. Shaders get compiled in the background while you play, without stutter.
-- A native Linux build, once the Windows version runs stable. Until then, Linux, Proton and the Steam Deck are not supported.
+- Linux (this fork): a steady frame rate in the busiest places, no graphical glitches, and testing on AMD and Intel graphics.
 - Mod support: a mods folder whose files the game loads in place of its own, so mods never change your game files.
 - Online play: messages, bloodstains, co-op and invasions through a community server. This is the biggest goal and the furthest off.
 
