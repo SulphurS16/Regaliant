@@ -14,6 +14,7 @@
 - On graphics cards with 12 GB or less the game can run short of graphics memory in busy places. It then keeps some textures in system memory, and the frame rate there can drop.
 - On cards with 4 or 5 GB the game keeps its large images in system memory from the start. It runs, but slowly. Cards with less than 4 GB have not been tested.
 - PCs with 16 GB of memory have not been tested on a real PC. A simulation of one played the tested levels. 32 GB is recommended.
+- The US release (PPSA01342) is accepted at 01.007.000, but its executable has not been verified here. Regaliant was built and tested with the European copy's code, and the launcher says that no fingerprint is on file for the US release. The code patches are applied only where the game's bytes are as expected; where they differ, they are skipped. US saves are kept apart from European saves, under its own title id.
 - Online features (messages, bloodstains, co-op and invasions) are not available. The game plays offline.
 - Linux, Proton and the Steam Deck are not supported yet.
 

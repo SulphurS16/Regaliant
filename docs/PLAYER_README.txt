@@ -1,7 +1,7 @@
 Regaliant 0.1.2 - an unofficial PC port of Demon's Souls for Windows (64-bit)
 =============================================================================
 
-Regaliant is an unofficial PC port of Demon's Souls (PS5, PPSA01341). It is not rebuilt from the game's
+Regaliant is an unofficial PC port of Demon's Souls (PS5, PPSA01341 or the US PPSA01342). It is not rebuilt from the game's
 source code. It runs the game's own PS5 program from your copy of the game's files. The
 program's x86-64 code runs directly on your processor. The PS5 system libraries it calls are
 reimplemented for Windows, and its graphics commands and shaders are translated to Vulkan.
@@ -18,11 +18,12 @@ Bug reports: https://github.com/SulphurS16/Regaliant/issues
 
 What you need
 -------------
-- Your own copy of Demon's Souls for PS5 (PPSA01341) at version 01.007.000, as a folder or as
-  a .zar archive of that folder. The folder holds sce_sys, the game's data folders and
-  eboot.bin. The executable and its two libraries must be decrypted: a decrypted eboot.bin (in
-  the folder or in its "decrypted" folder) and decrypted libc.prx and libSceNpCppWebApi.prx in
-  sce_module, as plain ELF files or in their SELF containers with the segments decrypted.
+- Your own copy of Demon's Souls for PS5 (PPSA01341, or the US release PPSA01342) at version
+  01.007.000, as a folder or as a .zar archive of that folder. The folder holds sce_sys, the
+  game's data folders and eboot.bin. The executable and its two libraries must be decrypted: a
+  decrypted eboot.bin (in the folder or in its "decrypted" folder) and decrypted libc.prx and
+  libSceNpCppWebApi.prx in sce_module, as plain ELF files or in their SELF containers with the
+  segments decrypted.
 - Windows 10 or 11, 64-bit.
 - A graphics card and driver with Vulkan 1.3.
 - A processor with AVX2 (Intel from 2013 on, AMD Ryzen).

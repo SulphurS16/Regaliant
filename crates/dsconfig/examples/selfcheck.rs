@@ -3,7 +3,7 @@
 //! decrypted in place) rebuilds the decrypted ELF byte for byte, and so does the container with
 //! its data entries replaced by the decrypted ELF's segments; scrambled into random bytes (as
 //! encryption leaves them), it is refused.
-//!     cargo run --release -p dsconfig --example selfcheck -- <PPSA01341-app0 folder>
+//!     cargo run --release -p dsconfig --example selfcheck -- <PPSA01341-app0 or PPSA01342-app0 folder>
 use dsconfig::self_file;
 
 fn sha(b: &[u8]) -> String {
@@ -13,7 +13,7 @@ fn sha(b: &[u8]) -> String {
 }
 
 fn main() {
-    let app = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: selfcheck <PPSA01341-app0 folder>"));
+    let app = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: selfcheck <PPSA01341-app0 or PPSA01342-app0 folder>"));
     let mut failed = false;
     for rel in ["eboot.bin", "sce_module/libc.prx", "sce_module/libSceNpCppWebApi.prx"] {
         let retail = std::fs::read(app.join(rel)).expect("the retail file");

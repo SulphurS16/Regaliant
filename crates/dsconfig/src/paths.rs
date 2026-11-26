@@ -216,7 +216,12 @@ impl Paths {
                 return Some(PathBuf::from(t));
             }
         }
-        self.root.as_ref().map(|r| r.join("Game").join("Demon-Souls-Remake-PPSA01341-1.07").join(crate::game::APP_DIR))
+        self.root.as_ref().map(|r| {
+            let game = r.join("Game");
+            let eu = game.join("Demon-Souls-Remake-PPSA01341-1.07").join(crate::game::APP_DIR);
+            let us = game.join("Demon-Souls-Remake-PPSA01342-1.07").join(crate::game::APP_DIR_US);
+            if eu.is_dir() { eu } else if us.is_dir() { us } else { eu }
+        })
     }
 
     /// Keeps `dir` as the game folder (`game.txt`).

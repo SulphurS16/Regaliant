@@ -230,6 +230,25 @@ mod tests {
     }
 
     #[test]
+    fn import_keeps_the_us_release_folder() {
+        // A US copy's save lives under PPSA01342, not the European PPSA01341. The port takes the
+        // folder name from the game's own title id (`start` passes `savedata::title_id()`), so an
+        // imported US save must land under that same id and not mix with a European one.
+        let base = std::env::temp_dir().join(format!("dsport-ps5import-us-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let from = base.join(IMPORT_DIR);
+        let player = from.join("export").join("PPSA01342").join("SAVEDATA0PlayerProfile0");
+        std::fs::create_dir_all(&player).unwrap();
+        std::fs::write(player.join("USR-DATA"), "us ps5").unwrap();
+        let saves = base.join("saves");
+        assert_eq!(import(&from, &saves, "PPSA01342"), 1);
+        let got = saves.join(user()).join("PPSA01342").join("SAVEDATA0PlayerProfile0");
+        assert_eq!(std::fs::read_to_string(got.join("USR-DATA")).unwrap(), "us ps5");
+        assert!(!saves.join(user()).join("PPSA01341").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn import_takes_sdimg_folders_without_the_ps5_backups() {
         // A decrypted save as a player's tool left it (2026-11-24): sdimg_ folders, and the PS5's
         // backups beside them.

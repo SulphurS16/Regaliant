@@ -1,13 +1,18 @@
-//! The game folder's checks: Demon's Souls (PS5, PPSA01341) at version 01.007.000, with its
-//! executable and its two libraries decrypted, and its data folders. The runtime checks the
-//! same at start and the launcher when a folder is chosen; both show `Problem`'s text. The game
-//! can also be a `.zar` archive of that folder (`zar`, since 2026-11-23), read in place.
+//! The game folder's checks: Demon's Souls (PS5, PPSA01341 or PPSA01342) at version 01.007.000,
+//! with its executable and its two libraries decrypted, and its data folders. The runtime checks
+//! the same at start and the launcher when a folder is chosen; both show `Problem`'s text. The
+//! game can also be a `.zar` archive of that folder (`zar`, since 2026-11-23), read in place.
 
 use crate::zar::Source;
 use std::path::{Path, PathBuf};
 
 /// The release the port was made and tested with (Europe).
 pub const TITLE_ID: &str = "PPSA01341";
+/// The US release (issue #17). The port takes the saves' folder and the add-on content ids from
+/// the game's own files, so a US copy keeps its own `PPSA01342` saves and its bonus packages.
+pub const TITLE_ID_US: &str = "PPSA01342";
+/// The two releases the port names in its checks and its notes.
+pub const TITLE_IDS: [&str; 2] = [TITLE_ID, TITLE_ID_US];
 
 /// Demon's Souls' PS5 title ids (PPSA0134x: the regions' releases). Only PPSA01341 was tested;
 /// the others are taken when their version matches (the executable's fingerprint says whether
@@ -15,10 +20,21 @@ pub const TITLE_ID: &str = "PPSA01341";
 pub fn is_demons_souls(id: &str) -> bool {
     id.len() == 9 && id.starts_with("PPSA0134") && id.as_bytes()[8].is_ascii_digit()
 }
+/// The name of a release the port documents, for messages; other PPSA0134x releases are still
+/// taken by `is_demons_souls`, but the port makes no claim about them.
+pub fn release_name(id: &str) -> Option<&'static str> {
+    match id {
+        TITLE_ID => Some("European (PPSA01341)"),
+        TITLE_ID_US => Some("US (PPSA01342)"),
+        _ => None,
+    }
+}
 /// The one version the port supports.
 pub const VERSION: &str = "01.007.000";
-/// The application folder's usual name.
+/// The application folders' usual names, one for each documented release.
 pub const APP_DIR: &str = "PPSA01341-app0";
+pub const APP_DIR_US: &str = "PPSA01342-app0";
+pub const APP_DIRS: [&str; 2] = [APP_DIR, APP_DIR_US];
 /// The decrypted executable this port was made and tested with (SHA-256).
 pub const TESTED_EBOOT: &str = "4a6ca8a2904d02a9ff11aebcb10379c89974cd9bff1a37e09c21a7e782447674";
 /// The title's own libraries the port loads (decrypted, in `sce_module`).
@@ -73,7 +89,7 @@ impl std::fmt::Display for Problem {
             Problem::NotFound => write!(f, "No Demon's Souls game files were found in this folder. Choose the folder that holds eboot.bin and sce_sys."),
             Problem::NotFoundInArchive => write!(f, "No Demon's Souls game files were found in this .zar archive. It must hold the folder with eboot.bin and sce_sys."),
             Problem::Archive(e) => write!(f, "This .zar archive could not be read ({e})."),
-            Problem::OtherGame(id) => write!(f, "This folder holds another game ({id}). This port runs the PS5 game Demon's Souls (PPSA01341)."),
+            Problem::OtherGame(id) => write!(f, "This folder holds another game ({id}). This port runs the PS5 game Demon's Souls ({}).", TITLE_IDS.join(" or ")),
             Problem::Version(v) => write!(f, "This is version {v} of the game. This port needs version {VERSION}."),
             Problem::Param(e) => write!(f, "The game's sce_sys\\param.json could not be read ({e})."),
             Problem::NoExecutable => write!(f, "The game's eboot.bin is missing."),
@@ -90,18 +106,22 @@ fn has_param(d: &Path) -> bool {
     d.join("sce_sys").join("param.json").is_file()
 }
 
-/// The application folder at or under `dir`: `dir` itself, its `PPSA01341-app0`, or one
-/// folder further down (a dump's folder holding the application folder).
+/// The application folder at or under `dir`: `dir` itself, one of the releases' `...-app0`
+/// folders, or one folder further down (a dump's folder holding the application folder).
 pub fn locate(dir: &Path) -> Option<PathBuf> {
     if has_param(dir) {
         return Some(dir.to_path_buf());
     }
-    if has_param(&dir.join(APP_DIR)) {
-        return Some(dir.join(APP_DIR));
+    for app in APP_DIRS {
+        if has_param(&dir.join(app)) {
+            return Some(dir.join(app));
+        }
     }
     let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     subs.sort();
-    subs.into_iter().find_map(|s| [s.clone(), s.join(APP_DIR)].into_iter().find(|d| has_param(d)))
+    subs.into_iter().find_map(|s| {
+        std::iter::once(s.clone()).chain(APP_DIRS.iter().map(|app| s.join(app))).find(|d| has_param(d))
+    })
 }
 
 /// What one of the game's executables is (`exe_state`).
@@ -218,8 +238,31 @@ pub fn check(dir: &Path) -> Result<Game, Problem> {
     Ok(Game { id, app, code, source, code_dir: code_dir.to_string(), version })
 }
 
-/// Whether the executable is the one the port was tested with (its SHA-256).
-pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
+/// What the launcher knows about a copy's executable. A documented release whose fingerprint is
+/// not on file is *unverified*, not a known bad copy: the port's patches are placed by the tested
+/// European program's addresses, and are skipped where the game's bytes differ, so no claim about
+/// another release's code can be made from the title id alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fingerprint {
+    /// The executable the port was built and tested with.
+    Tested,
+    /// A fingerprint is on file for this release, but this copy does not match it.
+    Different,
+    /// No fingerprint is on file for this release (its code has not been verified).
+    Unverified,
+}
+
+/// The SHA-256 on file for a documented release, if one has been supplied. Only the European
+/// copy's is known; a US copy's cannot be inferred from the European one or from the title id.
+pub fn known_fingerprint(id: &str) -> Option<&'static str> {
+    match id {
+        TITLE_ID => Some(TESTED_EBOOT),
+        _ => None,
+    }
+}
+
+/// The decrypted executable's SHA-256, whether it is a folder's file or an archive's own file.
+fn executable_sha256(g: &Game) -> std::io::Result<String> {
     let rel = if g.code_dir.is_empty() { "eboot.bin".to_string() } else { format!("{}/eboot.bin", g.code_dir) };
     // (A decrypted SELF container: the ELF it holds, rebuilt byte for byte, is what is compared.)
     let f = g.source.open_file(&rel)?;
@@ -228,10 +271,10 @@ pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
         let elf = executable_bytes(&g.source, &rel).map_err(std::io::Error::other)?;
         let mut sha = crate::sha::Sha256::new()?;
         sha.update(&elf)?;
-        return Ok(crate::sha::hex(&sha.finish()?) == TESTED_EBOOT);
+        return Ok(crate::sha::hex(&sha.finish()?));
     }
     if let Source::Dir(_) = &g.source {
-        return Ok(crate::sha::file_sha256(&g.code.join("eboot.bin"))? == TESTED_EBOOT);
+        return crate::sha::file_sha256(&g.code.join("eboot.bin"));
     }
     let mut sha = crate::sha::Sha256::new()?;
     let mut buf = vec![0u8; 8 << 20];
@@ -244,7 +287,18 @@ pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
         sha.update(&buf[..n])?;
         off += n as u64;
     }
-    Ok(crate::sha::hex(&sha.finish()?) == TESTED_EBOOT)
+    Ok(crate::sha::hex(&sha.finish()?))
+}
+
+/// How this copy's executable compares with the fingerprint on file for its release.
+pub fn fingerprint(g: &Game) -> std::io::Result<Fingerprint> {
+    let Some(want) = known_fingerprint(&g.id) else { return Ok(Fingerprint::Unverified) };
+    Ok(if executable_sha256(g)? == want { Fingerprint::Tested } else { Fingerprint::Different })
+}
+
+/// Whether the executable is the one the port was tested with (its SHA-256).
+pub fn tested_executable(g: &Game) -> std::io::Result<bool> {
+    Ok(fingerprint(g)? == Fingerprint::Tested)
 }
 
 #[cfg(test)]
@@ -252,9 +306,13 @@ mod tests {
     use super::*;
 
     fn fake(root: &Path, version: &str, decrypted_dir: bool) -> PathBuf {
-        let app = root.join(APP_DIR);
+        fake_with_id(root, version, TITLE_ID, decrypted_dir)
+    }
+
+    fn fake_with_id(root: &Path, version: &str, id: &str, decrypted_dir: bool) -> PathBuf {
+        let app = root.join(format!("{id}-app0"));
         std::fs::create_dir_all(app.join("sce_sys")).unwrap();
-        std::fs::write(app.join("sce_sys").join("param.json"), format!("{{\"titleId\": \"PPSA01341\", \"contentVersion\": \"{version}\"}}")).unwrap();
+        std::fs::write(app.join("sce_sys").join("param.json"), format!("{{\"titleId\": \"{id}\", \"contentVersion\": \"{version}\"}}")).unwrap();
         for d in DATA_DIRS {
             std::fs::create_dir_all(app.join(d)).unwrap();
         }
@@ -323,6 +381,39 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
         assert_eq!(check(&tmp).unwrap_err(), Problem::NotFound);
         assert!(!Problem::Encrypted.to_string().contains(';'));
+    }
+
+    #[test]
+    fn us_release() {
+        assert!(is_demons_souls(TITLE_ID_US));
+        assert_eq!(release_name(TITLE_ID), Some("European (PPSA01341)"));
+        assert_eq!(release_name(TITLE_ID_US), Some("US (PPSA01342)"));
+        assert_eq!(release_name("PPSA01343"), None);
+        assert_eq!(known_fingerprint(TITLE_ID), Some(TESTED_EBOOT));
+        assert_eq!(known_fingerprint(TITLE_ID_US), None);
+
+        let tmp = std::env::temp_dir().join(format!("dsconfig-game-us-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dump = tmp.join("Demon-Souls-US-dump");
+        let app = fake_with_id(&dump, VERSION, TITLE_ID_US, true);
+        assert_eq!(app.file_name().unwrap().to_string_lossy(), APP_DIR_US);
+        // A US dump is found by its own application folder, from the dump, the app folder and
+        // the folder above it; its id and version are what the game's param.json says.
+        for d in [&dump, &app, &tmp] {
+            let g = check(d).unwrap();
+            assert_eq!(g.id, TITLE_ID_US);
+            assert_eq!(g.version, VERSION);
+            assert_eq!(g.code, app.join("decrypted"));
+            assert_eq!(fingerprint(&g).unwrap(), Fingerprint::Unverified);
+        }
+        assert_eq!(locate(&dump).as_deref(), Some(app.as_path()));
+        // A European copy with the US version's number is still a European copy.
+        std::fs::write(app.join("sce_sys").join("param.json"), format!("{{\"titleId\": \"{TITLE_ID}\", \"contentVersion\": \"{VERSION}\"}}")).unwrap();
+        assert_eq!(check(&dump).unwrap().id, TITLE_ID);
+        // Another game still names both releases it can run.
+        let e = Problem::OtherGame("PPSA00000".into()).to_string();
+        assert!(e.contains(TITLE_ID) && e.contains(TITLE_ID_US), "{e}");
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
