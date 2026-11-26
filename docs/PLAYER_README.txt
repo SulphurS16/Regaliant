@@ -134,7 +134,10 @@ The launcher
   Shaders page says why, and Play starts the game.
 - Saves: the save folder and the backups the game makes. The game copies each save before a
   session first changes it. "Restore..." puts a backup back. The save as it is now is kept
-  as a backup first.
+  as a backup first. "Import saves..." brings saves made elsewhere: choose the folder that
+  holds them, such as a decrypted PS5 save or another program's own folder.
+  The saves they replace are kept as backups. Saves copied into the save folder by hand are
+  imported at the game's next start too.
 - Reset settings puts the PC settings, display choices and key bindings back to their
   defaults. The old files are kept as .bak files.
 - Open logs opens the logs folder with the newest session's folder selected. The launcher's own

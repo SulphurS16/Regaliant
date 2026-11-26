@@ -1,9 +1,10 @@
 //! What the port's runtime (`dsport`) and its launcher share: where the port keeps its files
-//! (`paths`), the game folder's checks (`game`).
+//! (`paths`), the game folder's checks (`game`), the import of saves made elsewhere (`saves`).
 
 pub mod display;
 pub mod game;
 pub mod paths;
+pub mod saves;
 pub mod self_file;
 pub mod sha;
 pub mod zar;

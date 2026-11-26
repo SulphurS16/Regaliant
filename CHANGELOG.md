@@ -8,6 +8,11 @@
   session of the new version ends normally, Roll back puts the earlier version back. A check box
   on the Game page turns the check off. This version still has to be installed by hand once.
 - The README's first line names the version it came with. Before, it always said 0.1.2.
+- Saves made in another program can be brought over now. The launcher's Saves page has Import
+  saves: choose the folder that holds them, such as that program's own folder or a decrypted PS5
+  save. Saves copied into the save folder by hand are found at the next start too. Before, only
+  the PS5 Saves folder was read, and saves copied in by hand were not seen. The saves an import
+  replaces are kept as backups.
 
 ## 0.1.8
 

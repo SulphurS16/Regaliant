@@ -1,6 +1,7 @@
 //! The Saves page: where the saves are, the backups the game makes before a session first
-//! changes a save (and before an import or a restore), a restore of one, and the folder a PS5
-//! save is imported from. Backups live beside the save folder: `save-backups\<user>\<title>\
+//! changes a save (and before an import or a restore), a restore of one, the import of saves
+//! made elsewhere (a decrypted PS5 save, another program's save folder: `dsconfig::saves`) from a
+//! folder the player picks, and the folder the game's own Import PS5 Saves reads. Backups live beside the save folder: `save-backups\<user>\<title>\
 //! <save>\<UTC time>[-before-...]`, as the runtime writes them.
 
 use crate::ui::{self, Builder};
@@ -14,12 +15,14 @@ const ID_LIST: i32 = 302;
 const ID_RESTORE: i32 = 303;
 const ID_OPEN_BACKUPS: i32 = 304;
 const ID_OPEN_IMPORT: i32 = 305;
+const ID_IMPORT: i32 = 306;
 
 #[derive(Default)]
 pub struct Page {
     folder: usize,
     list: usize,
     restore: usize,
+    import: usize,
     /// The listed backups (save directory under the save folder, backup folder).
     rows: Vec<(PathBuf, PathBuf)>,
 }
@@ -73,9 +76,11 @@ pub fn build(app: &mut App) {
         app.saves.restore = app.put(3, b.button("Restore...", r, ID_RESTORE), r) as usize;
         let r = (164, 362, 180, 28);
         app.put(3, b.button("Open backups folder", r, ID_OPEN_BACKUPS), r);
-        let r = (16, 404, 560, 44);
-        app.put(3, b.label("To import a decrypted PS5 save, put it in the PS5 Saves folder. Then turn on Import PS5 Saves in the game's PC settings and restart the game.", r, -1), r);
-        let r = (584, 410, 180, 28);
+        let r = (16, 404, 400, 44);
+        app.put(3, b.label("Saves made elsewhere, such as a decrypted PS5 save: choose the folder that holds them.", r, -1), r);
+        let r = (424, 410, 150, 28);
+        app.saves.import = app.put(3, b.button("Import saves...", r, ID_IMPORT), r) as usize;
+        let r = (582, 410, 182, 28);
         app.put(3, b.button("Open PS5 Saves folder", r, ID_OPEN_IMPORT), r);
     }
     refresh(app);
@@ -108,7 +113,7 @@ pub fn refresh(app: &mut App) {
     app.saves.rows.clear();
     for (name, dir, b) in rows {
         let why = if name.ends_with("-before-import") {
-            "Before a PS5 save was imported"
+            "Before saves were imported"
         } else if name.ends_with("-before-restore") {
             "Before a backup was restored"
         } else {
@@ -128,6 +133,41 @@ pub fn update(app: &App) {
     }
     let sel = unsafe { ui::lv_selected(h(app.saves.list)) }.is_some();
     unsafe { ui::enable(h(app.saves.restore), sel && app.running.is_none()) };
+    if app.saves.import != 0 {
+        unsafe { ui::enable(h(app.saves.import), app.running.is_none()) };
+    }
+}
+
+/// Imports the saves in a folder the player picks into the save folder in use (the saves they
+/// replace kept as backups first; the picked folder left as it is). Not while the game runs: it
+/// keeps its saves open.
+fn import(app: &mut App) {
+    if app.running.is_some() {
+        return;
+    }
+    let Some(from) = ui::pick_folder(app.hwnd, "Choose the folder that holds the saves") else { return };
+    let title = app.game.id.clone().unwrap_or_else(|| dsconfig::game::TITLE_ID.to_string());
+    let r = dsconfig::saves::import(&from, &save_folder(app), &title, &dsconfig::utc_stamp());
+    let names: Vec<String> = r.imported.iter().map(|(n, _, _)| label(n)).collect();
+    crate::shaders::log(app, &format!("saves imported from a folder the player chose: {} ({} kept as backups, {} left out)", if names.is_empty() { "none".to_string() } else { names.join(", ") }, r.kept.len(), r.notes.len()));
+    let text = if names.is_empty() {
+        format!("No saves of the game were found in {}.\n\nChoose the folder that holds them, for example a decrypted PS5 save or another program's save folder.", ui::short(&from, 80))
+    } else {
+        let mut t = format!("Imported: {}.", names.join(", "));
+        if !r.kept.is_empty() {
+            t.push_str("\n\nThe saves they replaced are kept as backups.");
+        }
+        if !r.notes.is_empty() {
+            t.push_str("\n\nSome saves could not be imported.");
+        }
+        t
+    };
+    let icon = if names.is_empty() { MB_ICONERROR } else { MB_ICONINFORMATION };
+    unsafe { ui::message(app.hwnd, &text, crate::TITLE, icon | MB_OK) };
+    if !names.is_empty() {
+        app.set_status("Saves imported.");
+    }
+    refresh(app);
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<u64> {
@@ -186,6 +226,7 @@ pub fn command(app: &mut App, id: i32, code: u32) {
         (ID_OPEN_SAVES, 0) => ui::open_path(&save_folder(app)),
         (ID_OPEN_BACKUPS, 0) => ui::open_path(&backups_root(&save_folder(app))),
         (ID_OPEN_IMPORT, 0) => ui::open_path(&import_dir(app)),
+        (ID_IMPORT, 0) => import(app),
         (ID_RESTORE, 0) => restore(app),
         _ => {}
     }

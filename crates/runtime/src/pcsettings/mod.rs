@@ -324,7 +324,7 @@ pub fn game_items() -> Vec<Item> {
         Item {
             id: s("ImportSaves"),
             label: s("Import PS5 Saves"),
-            tooltip: s("Imports a decrypted PS5 save from the PS5 Saves folder at the next start."),
+            tooltip: s("Imports the saves put in the PS5 Saves folder at the next start."),
             kind: ItemKind::Choice(vec![s("No"), s("At Next Start")], 0),
         },
     ]

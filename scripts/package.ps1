@@ -19,7 +19,7 @@
 # license texts, from local-data\upscalers (scripts\upscalers.ps1); each DLL must carry a valid
 # signature. -NoUpscalers leaves it out.
 # Note: do not use ErrorActionPreference=Stop here; cargo writes progress to stderr.
-param([switch]$NoBuild, [string]$Pgo, [switch]$NoUpscalers, [string]$Upscalers)
+param([switch]$NoBuild, [string]$Pgo, [switch]$NoUpscalers, [string]$Upscalers, [string]$SigningKey = $env:REGALIANT_SIGNING_KEY)
 $root = Split-Path -Parent $PSScriptRoot
 $target = 'x86_64-pc-windows-msvc'
 $ver = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
@@ -217,15 +217,16 @@ if (-not (Test-Path $final)) {
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 Write-Host ("package {0}: {1} files, {2:N1} MB; zip {3:N1} MB, SHA-256 {4}; build {5}, symbols in {6}" -f $out, $count, ($size / 1MB), ((Get-Item $zip).Length / 1MB), $hash, $buildId, $symDir)
 # The update signature (docs/UPDATES.md): the zip signed with the update key (Ed25519; its private
-# half kept privately, never in Git), then checked against the public key the launcher holds.
-# Launchers from 0.1.9 on offer a release as an update only with its <zip>.sig.
-$key = $env:REGALIANT_SIGNING_KEY
+# half is the publisher's and never in Git: -SigningKey <file>, or REGALIANT_SIGNING_KEY), then
+# checked against the public key the launcher holds. Launchers from 0.1.9 on offer a release as
+# an update only with its <zip>.sig.
+$key = $SigningKey
 $pub = Join-Path $root 'crates\launcher\update-public-key.pem'
 $sig = "$zip.sig"
 if (Test-Path $sig) { Remove-Item -Force $sig }
 $openssl = @((Get-Command openssl -ErrorAction SilentlyContinue).Source, 'C:\Program Files\Git\usr\bin\openssl.exe', 'C:\Program Files\Git\mingw64\bin\openssl.exe') | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-if (-not (Test-Path $key)) {
-  Write-Host "no update key ($key): the zip is not signed, and launchers will not offer it as an update"
+if (-not $key -or -not (Test-Path $key)) {
+  Write-Host "no update key (-SigningKey): the zip is not signed, and launchers will not offer it as an update"
 } elseif (-not $openssl) {
   Write-Host "no openssl found (Git for Windows has one): the zip is not signed"; exit 1
 } else {

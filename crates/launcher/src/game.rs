@@ -32,6 +32,8 @@ pub struct Page {
     pub ok: bool,
     /// The checked game's folder when it is a folder (what Compress makes an archive of).
     folder: Option<PathBuf>,
+    /// The checked game's title id (its saves' folder: `saves::import`).
+    pub id: Option<String>,
     /// The game's check, shown again under the compression's progress.
     text: String,
     job: Option<Job>,
@@ -166,10 +168,12 @@ pub fn check(app: &mut App, dir: &Path, keep: bool) {
                 Err(e) => t.push_str(&format!("\nIts executable could not be read ({e}).")),
             }
             app.game.folder = (!g.source.is_archive()).then(|| g.app.clone());
+            app.game.id = Some(g.id.clone());
             (true, t)
         }
         Err(e) => {
             app.game.folder = None;
+            app.game.id = None;
             (false, e.to_string())
         }
     };
