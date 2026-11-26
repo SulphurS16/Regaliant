@@ -61,7 +61,7 @@ const PASSED_LOG: usize = 16;
 const HELD_RING: usize = 4096;
 /// Runs one hold request carries (`hold_by_host`).
 pub const HOLD_RUNS: usize = 1024;
-const MAGIC: u64 = 0x6473_706f_7274_4832; // "dsportH2"
+const MAGIC: u64 = 0x6473_706f_7274_4833; // "dsportH3"
 
 /// The shared mapping.
 #[repr(C)]
@@ -138,6 +138,10 @@ struct Shared {
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
     /// Held bits, by leaf as `leaves` (a held page's armed bit is set too).
     held: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
+    /// The game's log file (UTF-16, `log_path_len` units, written once by dsport at start-up):
+    /// the host adds a line there when the game ends at an exception nothing handled.
+    log_path_len: AtomicU32,
+    log_path: [std::sync::atomic::AtomicU16; 520],
 }
 
 /// dsport's view of the mapping (hosted), or null.
@@ -203,6 +207,20 @@ pub fn page_held(a: u64) -> bool {
     shared().is_some_and(|s| is_held(s, a))
 }
 
+/// Clears this process's BeingDebugged flag (the PEB's byte 2, which IsDebuggerPresent reads);
+/// whether IsDebuggerPresent then says false.
+unsafe fn hide_debugger() -> bool {
+    let peb: *mut u8;
+    unsafe {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly, preserves_flags));
+        if peb.is_null() {
+            return false;
+        }
+        std::ptr::write_volatile(peb.add(2), 0);
+        IsDebuggerPresent() == 0
+    }
+}
+
 /// Whether dsport runs under its host.
 pub fn on() -> bool {
     !SHARED.load(Ordering::Acquire).is_null()
@@ -229,6 +247,16 @@ pub fn init() {
             return;
         }
         SHARED.store(s, Ordering::Release);
+        if let Some(p) = crate::log::path() {
+            use std::os::windows::ffi::OsStrExt;
+            let w: Vec<u16> = p.as_os_str().encode_wide().collect();
+            if w.len() <= (*s).log_path.len() {
+                for (i, c) in w.iter().enumerate() {
+                    (*s).log_path[i].store(*c, Ordering::Relaxed);
+                }
+                (*s).log_path_len.store(w.len() as u32, Ordering::Release);
+            }
+        }
         // (0x0010_0000: SYNCHRONIZE.)
         let e = OpenEventW(0x0010_0000, 0, wide(&format!("{name}-held")).as_ptr());
         if e.is_null() {
@@ -238,6 +266,18 @@ pub fn init() {
         }
     }
     crate::info!("hosted: under the host (write faults on armed guest pages answered there; {name})");
+    // The game's libraries see no debugger. The host is one to Windows, so IsDebuggerPresent was
+    // true here and code that stops only for a debugger stopped: NVIDIA's 621.40 compiler (the
+    // breaks stepped over in `exception`), and a player's every start with DLSS (an RTX 5080 beside
+    // an AMD integrated GPU, driver 617.42, 0.1.6 to 0.1.8) ended right after XeSS's device query
+    // with nothing logged, while the separate check, run without the host, passed the same
+    // Streamline load and DLSS query (2026-11-26 night). The flag (the PEB's BeingDebugged) is
+    // cleared before any of them loads. `DS_KEEP_DEBUGGER_FLAG=1` keeps it (a test).
+    if std::env::var_os("DS_KEEP_DEBUGGER_FLAG").is_none() {
+        // SAFETY: this process's own PEB (gs:[0x60] on x64), its byte 2.
+        let hidden = unsafe { hide_debugger() };
+        crate::info!("hosted: the host is hidden from the game's libraries ({})", if hidden { "IsDebuggerPresent false" } else { "IsDebuggerPresent still true" });
+    }
     // Every 5 s with debug events or faults since the last look: their
     // counts (each one stops the whole process while the host handles it).
     let _ = std::thread::Builder::new().name("host-events".into()).spawn(|| {
@@ -942,6 +982,12 @@ pub fn run_host() -> ! {
     let mut spinning: Vec<(u32, u64)> = Vec::new();
     let mut first_bp = true;
     let mut code = 0u32;
+    // The game's modules (base, size, file name), for the line on a fatal exception; the fatal
+    // exception's description; the last exception passed on (code, address, faulting instruction,
+    // thread, access kind, when), in case the game ends right after one without a second chance.
+    let mut modules: Vec<(u64, u64, String)> = Vec::new();
+    let mut fatal: Option<String> = None;
+    let mut last_passed: Option<(u32, u64, u64, u32, u64, std::time::Instant)> = None;
     loop {
         // (Hold requests between events: `hold_by_host`. Waits of 1 ms so
         // that a request waits no longer than that for a quiet process.)
@@ -959,15 +1005,21 @@ pub fn run_host() -> ! {
         match ev.dwDebugEventCode {
             CREATE_PROCESS_DEBUG_EVENT => unsafe {
                 let f = ev.u.CreateProcessInfo.hFile;
+                note_module(&mut modules, pi.hProcess, ev.u.CreateProcessInfo.lpBaseOfImage as u64, f);
                 if !f.is_null() {
                     CloseHandle(f);
                 }
             },
             LOAD_DLL_DEBUG_EVENT => unsafe {
                 let f = ev.u.LoadDll.hFile;
+                note_module(&mut modules, pi.hProcess, ev.u.LoadDll.lpBaseOfDll as u64, f);
                 if !f.is_null() {
                     CloseHandle(f);
                 }
+            },
+            UNLOAD_DLL_DEBUG_EVENT => unsafe {
+                let base = ev.u.UnloadDll.lpBaseOfDll as u64;
+                modules.retain(|m| m.0 != base);
             },
             EXCEPTION_DEBUG_EVENT => unsafe {
                 let t = std::time::Instant::now();
@@ -1054,6 +1106,14 @@ pub fn run_host() -> ! {
                     first_bp = false;
                 } else {
                     status = DBG_EXCEPTION_NOT_HANDLED;
+                    // (The second chance: nothing in the game took it, and it ends there. Its
+                    // place, written into the game's log after it ends: under the host Windows
+                    // calls no unhandled-exception filter of the game's, so such an end left
+                    // nothing in its log, as the DLSS starts of 2026-11-26 did.)
+                    if e.dwFirstChance == 0 && fatal.is_none() {
+                        fatal = Some(describe_fatal(pi.hProcess, ev.dwThreadId, &rec, &modules));
+                    }
+                    last_passed = Some((exc, addr, rec.ExceptionAddress as u64, ev.dwThreadId, rec.ExceptionInformation[0] as u64, std::time::Instant::now()));
                     let k = s.passed.fetch_add(1, Ordering::Relaxed) as usize;
                     if k < PASSED_LOG {
                         let l = &s.passed_log[k];
@@ -1081,7 +1141,118 @@ pub fn run_host() -> ! {
     // preparation step, started at the host's exit, met the lock still held and ended
     // ("another game session runs", 2026-11-20). At most a minute.
     unsafe { WaitForSingleObject(pi.hProcess, 60_000) };
+    // An end at an exception (its status an NTSTATUS error or a breakpoint's): its place in the
+    // game's log, the game's own last lines being gone with its buffer.
+    let ended_at_exception = code >= 0xC000_0000 || code == 0x8000_0003;
+    let line = match (fatal, last_passed) {
+        (Some(f), _) => Some(f),
+        (None, Some((exc, addr, at, tid, kind, when))) if ended_at_exception && when.elapsed() < std::time::Duration::from_secs(70) => {
+            let place = module_at(&modules, at).unwrap_or_else(|| format!("{at:#x}"));
+            let access = if exc == 0xC000_0005 { format!(" ({} of {addr:#x})", access_kind(kind)) } else { String::new() };
+            Some(format!("the game ended (status {code:#x}) right after an exception passed on to it: {exc:#010x}{access} at {place}, thread {tid}"))
+        }
+        _ if ended_at_exception => Some(format!("the game ended with status {code:#x} without an exception the host saw")),
+        _ => None,
+    };
+    if let Some(line) = line {
+        append_game_log(s, &line);
+    }
     std::process::exit(code as i32);
+}
+
+fn access_kind(k: u64) -> &'static str {
+    match k {
+        0 => "read",
+        1 => "write",
+        8 => "execute",
+        _ => "access",
+    }
+}
+
+/// A module the game loaded (`base`; `file` its open file, the debug event's): its file name
+/// and its image's size from its PE header.
+unsafe fn note_module(modules: &mut Vec<(u64, u64, String)>, process: HANDLE, base: u64, file: HANDLE) {
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = [0u16; 520];
+    let n = if file.is_null() { 0 } else { (unsafe { GetFinalPathNameByHandleW(file, buf.as_mut_ptr(), buf.len() as u32, 0) }) as usize };
+    let path = if n > 0 && n < buf.len() { String::from_utf16_lossy(&buf[..n]) } else { String::new() };
+    let name = path.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+    let name = if name.is_empty() { format!("module at {base:#x}") } else { name };
+    let mut hdr = [0u8; 0x400];
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(process, base as _, hdr.as_mut_ptr() as _, hdr.len(), &mut got) } != 0 && got == hdr.len();
+    let size = if ok {
+        let lfanew = u32::from_le_bytes([hdr[0x3c], hdr[0x3d], hdr[0x3e], hdr[0x3f]]) as usize;
+        // (The optional header follows the signature and the file header, 4 + 20 bytes;
+        // SizeOfImage is its bytes 56-59.)
+        let at = lfanew + 24 + 56;
+        if at + 4 <= hdr.len() && hdr[lfanew..lfanew + 4] == *b"PE\0\0" { u32::from_le_bytes([hdr[at], hdr[at + 1], hdr[at + 2], hdr[at + 3]]) as u64 } else { 0 }
+    } else {
+        0
+    };
+    modules.retain(|m| m.0 != base);
+    modules.push((base, size.max(0x1000), name));
+}
+
+/// `a` as a module and offset (`dsport.exe+0x1234`).
+fn module_at(modules: &[(u64, u64, String)], a: u64) -> Option<String> {
+    modules.iter().find(|m| a >= m.0 && a < m.0 + m.1).map(|m| format!("{}+{:#x}", m.2, a - m.0))
+}
+
+/// The fatal exception's line: its code (and access), its place, its thread and the words on the
+/// thread's stack that point into modules (the calls on the way there, roughly; innermost first).
+unsafe fn describe_fatal(process: HANDLE, tid: u32, rec: &EXCEPTION_RECORD, modules: &[(u64, u64, String)]) -> String {
+    #[repr(C, align(16))]
+    struct Aligned(CONTEXT);
+    const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
+    let code = rec.ExceptionCode as u32;
+    let at = rec.ExceptionAddress as u64;
+    let place = module_at(modules, at).unwrap_or_else(|| format!("{at:#x}"));
+    let access = if code == 0xC000_0005 && rec.NumberParameters >= 2 { format!(" ({} of {:#x})", access_kind(rec.ExceptionInformation[0] as u64), rec.ExceptionInformation[1]) } else { String::new() };
+    let mut calls: Vec<String> = Vec::new();
+    unsafe {
+        let th = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
+        if !th.is_null() {
+            let mut c: Aligned = std::mem::zeroed();
+            c.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+            if GetThreadContext(th, &mut c.0) != 0 {
+                let mut words = [0u64; 256];
+                let mut got = 0usize;
+                if ReadProcessMemory(process, c.0.Rsp as _, words.as_mut_ptr() as _, std::mem::size_of_val(&words), &mut got) != 0 || got > 0 {
+                    for &w in words.iter().take(got / 8) {
+                        if let Some(m) = module_at(modules, w)
+                            && !calls.contains(&m)
+                        {
+                            calls.push(m);
+                            if calls.len() == 12 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            CloseHandle(th);
+        }
+    }
+    format!(
+        "the game ended at an exception nothing in it handled: {code:#010x}{access} at {place}, thread {tid}; module addresses on that thread's stack: {}",
+        if calls.is_empty() { "none read".to_string() } else { calls.join(", ") }
+    )
+}
+
+/// Adds `line` to the game's log (its path from the shared block), after the game ended.
+fn append_game_log(s: &Shared, line: &str) {
+    use std::os::windows::ffi::OsStringExt;
+    let n = s.log_path_len.load(Ordering::Acquire) as usize;
+    if n == 0 || n > s.log_path.len() {
+        return;
+    }
+    let w: Vec<u16> = s.log_path[..n].iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&w));
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "[  the end ][port-host] E: {line} (written by the port's host after the game's end)");
+    }
 }
 
 /// `WORD_MODE` (the debuggee stopped): the armed pages of `page`'s 64-page

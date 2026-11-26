@@ -1800,6 +1800,18 @@ fn dlss_device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Opti
         crate::log::flush();
         std::process::abort();
     }
+    // (Diagnosis: `DS_SL_CRASH_TEST=5` breaks here only for a debugger, as NVIDIA's code does:
+    // with the host's flag hidden (`hosted`) the start goes on, with `DS_KEEP_DEBUGGER_FLAG=1` it
+    // ends here and the host writes where into the log.)
+    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "5") {
+        use windows_sys::Win32::System::Diagnostics::Debug::{DebugBreak, IsDebuggerPresent};
+        let debugged = unsafe { IsDebuggerPresent() } != 0;
+        crate::warn!("upscaler: DS_SL_CRASH_TEST=5: a break at DLSS's support query only for a debugger ({})", if debugged { "one is seen: breaking" } else { "none is seen" });
+        crate::log::flush();
+        if debugged {
+            unsafe { DebugBreak() };
+        }
+    }
     let r = unsafe { (s.is_supported)(SL_FEATURE_DLSS, &info) };
     if r != SL_OK {
         fail(Kind::Dlss, format!("not supported on this GPU or driver (Streamline result {r})"));

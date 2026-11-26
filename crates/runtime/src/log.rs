@@ -26,6 +26,13 @@ pub static TRACE_HLE: AtomicBool = AtomicBool::new(false);
 
 static SINK: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
 static START: OnceLock<Instant> = OnceLock::new();
+/// The log file (`init`): the port's host adds a line there when the game ends at an exception
+/// nothing handled (`hosted`).
+static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+pub fn path() -> Option<&'static Path> {
+    PATH.get().map(|p| p.as_path())
+}
 
 /// A tap of the lines written (`prepplay`'s self-play reads the log as the development drivers
 /// do): while on, each line is kept, the last `TAP_KEEP`, with a running count.
@@ -55,6 +62,7 @@ thread_local! {
 
 pub fn init(path: &Path) -> std::io::Result<()> {
     START.get_or_init(Instant::now);
+    let _ = PATH.set(path.to_path_buf());
     let f = File::create(path)?;
     *SINK.lock() = Some(BufWriter::with_capacity(1 << 20, f));
     // Buffered lines reach the file within a quarter second (warnings are not flushed where they
