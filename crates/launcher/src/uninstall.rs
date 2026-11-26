@@ -9,8 +9,10 @@
 //! - Saves (each Save Folder's saves, the save backups, the PS5 Saves import folder, the trophy
 //!   progress): kept unless the player chooses to delete them.
 //!
-//! The launcher's own program file cannot be deleted while it runs: a hidden command deletes it
-//! after the launcher has closed, then the package's folders if they are empty.
+//! The launcher's own program file cannot be deleted while it runs: the player is shown its folder
+//! to delete. Until 0.1.9 a hidden command deleted it after the launcher closed (`cmd /c ping ... &
+//! del ...`), the pattern antivirus programs flag as self-deleting malware: Kaspersky reported
+//! 0.1.8's launcher as "selfdel" (issue #11's comments, 2026-11-26).
 
 use crate::{App, TITLE};
 use dsconfig::paths::{Layout, Paths};
@@ -221,12 +223,13 @@ pub fn run(app: &mut App) {
     }
     let (failed, kept) = perform(&paths, &others, delete_saves);
     let mut text = if failed.is_empty() { "Regaliant was removed.".to_string() } else { format!("Some files could not be removed:\n{}", failed.join("\n")) };
+    text.push_str(&format!("\n\nTo finish, delete the folder it ran from once this window has closed:\n{}\nThe launcher cannot delete its own file while it runs.", paths.exe_dir.display()));
     if !kept.is_empty() {
         text.push_str("\n\n");
         text.push_str(&kept.join("\n"));
     }
     unsafe { crate::ui::message(app.hwnd, &text, TITLE, if failed.is_empty() { MB_ICONINFORMATION | MB_OK } else { MB_ICONWARNING | MB_OK }) };
-    remove_self_after_exit(&paths.exe_dir);
+    show_folder(&paths.exe_dir);
     unsafe { PostMessageW(app.hwnd, WM_CLOSE, 0, 0) };
 }
 
@@ -292,20 +295,11 @@ fn perform(paths: &Paths, others: &[PathBuf], delete_saves: bool) -> (Vec<String
     (failed, kept)
 }
 
-/// After the launcher has closed: its program file deleted, then the upscalers folder and the
-/// package's folder if they are empty (a hidden command that waits two seconds; `rmdir` without
-/// `/s` removes only empty folders).
-fn remove_self_after_exit(exe_dir: &Path) {
+/// The package's folder in File Explorer, selected in its parent, for the player to delete once
+/// the launcher has closed.
+fn show_folder(exe_dir: &Path) {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let Ok(exe) = std::env::current_exe() else { return };
-    let line = format!(
-        "ping -n 3 127.0.0.1 >nul & del /f /q \"{}\" & rmdir \"{}\" & rmdir \"{}\"",
-        exe.display(),
-        exe_dir.join("upscalers").display(),
-        exe_dir.display()
-    );
-    let _ = std::process::Command::new("cmd.exe").arg("/d").arg("/c").raw_arg(&line).current_dir(std::env::temp_dir()).creation_flags(CREATE_NO_WINDOW).spawn();
+    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", exe_dir.display())).spawn();
 }
 
 #[cfg(test)]

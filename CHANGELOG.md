@@ -20,6 +20,9 @@
 - Graphics & Display has a Performance Overlay. In the bottom-right corner it shows the frame
   rate and its 1% and 0.1% lows, the CPU use of the game's busiest thread, the GPU's use, clock
   and video memory, and memory. Frame Rate shows the first line only.
+- Uninstall no longer removes the launcher's own file through a hidden command. Antivirus
+  programs flag that method as malware, and Kaspersky reported 0.1.8's launcher (issue #11). After
+  an uninstall the launcher now shows its folder for you to delete.
 - The launcher's Display page can download NVIDIA's DLSS file. It fetches it from NVIDIA's own
   DLSS SDK on GitHub after you accept NVIDIA's license, and checks it is NVIDIA's file as
   released. Copying your own file still works.
