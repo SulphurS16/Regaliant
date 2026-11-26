@@ -73,6 +73,15 @@ static PB_EVENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 static PB_LEDGER: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 static PB_LEDGER_DROPPED: AtomicU64 = AtomicU64::new(0);
 static PB_FRESH: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Variants of a key (`variant_name`): [made from one, captured into one].
+static STATS_VARIANT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The file of a pipeline binary made from other code than the one its key's file holds
+/// (`create_with`): `<kind><key>.<fingerprint>.pb`, pruned with the others (`prune` goes by
+/// the extension).
+fn variant_name(kind: char, key: u64, fp: u64) -> String {
+    format!("{kind}{key:016x}.{fp:016x}.pb")
+}
 fn reuse_record(kind: char, key: u64, fp: u64, outcome: &str, ms: f64) {
     let mut rows = PB_LEDGER.lock();
     if rows.len() < 32768 {
@@ -104,7 +113,7 @@ pub fn reuse_report() -> serde_json::Value {
         "cache_file_hits":STATS[0].load(Ordering::Relaxed), "cache_files_written":STATS[1].load(Ordering::Relaxed),
         "store":DIR.get(), "identity":IDENTITY.get(), "events":&*PB_EVENTS.lock(),
         "schema":"DSPBIN04/creation-contract-1", "ledger":&*PB_LEDGER.lock(), "ledger_dropped":PB_LEDGER_DROPPED.load(Ordering::Relaxed),
-        "store_write_failures":WRITE_FAILS.load(Ordering::Relaxed), "fresh_replay_ok":PB_FRESH[0].load(Ordering::Relaxed), "fresh_replay_failed":PB_FRESH[1].load(Ordering::Relaxed),
+        "store_write_failures":WRITE_FAILS.load(Ordering::Relaxed), "variant_hits":STATS_VARIANT[0].load(Ordering::Relaxed), "variants_captured":STATS_VARIANT[1].load(Ordering::Relaxed), "fresh_replay_ok":PB_FRESH[0].load(Ordering::Relaxed), "fresh_replay_failed":PB_FRESH[1].load(Ordering::Relaxed),
         "driver_cache_env": (["__GL_SHADER_DISK_CACHE", "__GL_SHADER_DISK_CACHE_PATH", "__GL_SHADER_DISK_CACHE_SIZE", "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "DS_PB_NO_INTERNAL"].map(|k| (k, std::env::var(k).ok()))),
         "note":"Source creates may hit driver caches. Binary hits bypass shader compilation but still instantiate Vulkan objects. Events capped at256."})
 }
@@ -1322,11 +1331,38 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     // (Nor does the launcher's probe change them: a refused binary stays, the pipeline made without
     // capturing.)
     let keep = ctx().validation || READ_ONLY.load(Ordering::Relaxed);
+    // Another variant of the key (the same pipeline key made from other code: the precompile's
+    // guessed bindings against a session's own, 49 particle programs in a session of
+    // 2026-11-26, up to 6.9 s each) lives beside the key's file, named by its fingerprint,
+    // instead of replacing it: each kind of session found the other's file and compiled again.
+    let variant = BIN_DIR.get().map(|dir| dir.join(variant_name(kind, key, fp)));
+    // (The file the stored binaries came from, and whether the key's file holds another
+    // variant: a capture goes to `variant` then.)
+    let mut used = path.clone();
+    let mut collided = false;
     if let Some(p) = &path {
         let t = std::time::Instant::now();
+        let from_variant = |reason: &str| -> Option<Vec<super::vk::pbin::Part>> {
+            let v = variant.as_ref()?;
+            let b = std::fs::read(v).ok()?;
+            let d = decode_pb(&b, &pb.global, fp);
+            if d.is_none() && reason == "other_code_or_contract" {
+                // (Damaged or older than the driver: made again below.)
+                reuse_event(kind, key, fp, &format!("variant: {}", pb_rejection(&b, &pb.global, fp)));
+            }
+            d
+        };
         let stored = match std::fs::read(p) {
             Ok(b) => {
-                let decoded = decode_pb(&b, &pb.global, fp);
+                let mut decoded = decode_pb(&b, &pb.global, fp);
+                if decoded.is_none() && pb_rejection(&b, &pb.global, fp) == "other_code_or_contract" {
+                    collided = true;
+                    decoded = from_variant("other_code_or_contract");
+                    if decoded.is_some() {
+                        used = variant.clone();
+                        STATS_VARIANT[0].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 if decoded.is_none() {
                     let reason = pb_rejection(&b, &pb.global, fp);
                     match reason {
@@ -1341,7 +1377,11 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                 }
                 decoded
             }
-            Err(e) => { PB_MISSING.fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, &format!("read: {e}")); None }
+            // (A key's file pruned before its variant's: the variant still serves.)
+            Err(e) => match from_variant("") {
+                Some(d) => { used = variant.clone(); STATS_VARIANT[0].fetch_add(1, Ordering::Relaxed); Some(d) }
+                None => { PB_MISSING.fetch_add(1, Ordering::Relaxed); reuse_event(kind, key, fp, &format!("read: {e}")); None }
+            },
         };
         PB[7].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if let Some(stored) = stored {
@@ -1375,7 +1415,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                     PB[0].fetch_add(1, Ordering::Relaxed);
                     PB[1].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     reuse_record(kind, key, fp, "hit", t.elapsed().as_secs_f64() * 1000.0);
-                    touch_later(p);
+                    if let Some(u) = &used { touch_later(u); }
                     return Ok(pipe);
                 }
                 Err(e) => {
@@ -1394,7 +1434,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                         CREATING.fetch_sub(1, Ordering::Relaxed);
                         return r;
                     }
-                    let _ = std::fs::remove_file(p);
+                    if let Some(u) = &used { let _ = std::fs::remove_file(u); }
                 }
             }
         }
@@ -1412,7 +1452,8 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
     if stepped {
         crate::warn!("pipeline cache: {kind}{key:016x}'s binaries not kept: its compile had a driver debug break stepped over");
     }
-    if let (Ok(pipe), Some(p), false) = (&r, &path, stepped) {
+    let target = if collided { &variant } else { &path };
+    if let (Ok(pipe), Some(p), false) = (&r, target, stepped) {
         let t = std::time::Instant::now();
         match pb.capture(*pipe, &|k| shared_path(k).is_some_and(|p| p.exists())) {
             Ok(bins) => {
@@ -1447,7 +1488,8 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                     reuse_record(kind, key, fp, outcome, started.elapsed().as_secs_f64() * 1000.0);
                 }
                 if write_file(p, &enc) {
-                    reuse_record(kind, key, fp, "captured", 0.0);
+                    reuse_record(kind, key, fp, if collided { "captured_variant" } else { "captured" }, 0.0);
+                    if collided { STATS_VARIANT[1].fetch_add(1, Ordering::Relaxed); }
                     PB[3].fetch_add(1, Ordering::Relaxed);
                     PB[4].fetch_add(enc.len() as u64, Ordering::Relaxed);
                 }
@@ -1702,6 +1744,17 @@ impl ThreadIdNumber for std::thread::ThreadId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variants_sit_beside_their_key_and_are_pruned_with_it() {
+        let v = variant_name('c', 0x5621aff4786e5be5, 0x511f94b333b57ffd);
+        assert_eq!(v, "c5621aff4786e5be5.511f94b333b57ffd.pb");
+        let p = std::path::Path::new(&v);
+        assert_eq!(p.extension().and_then(|x| x.to_str()), Some("pb"));
+        assert_ne!(v, format!("c{:016x}.pb", 0x5621aff4786e5be5u64));
+        // (`write_file`'s temporary name keeps the variant apart from the key's own.)
+        assert!(p.with_extension("1-2.tmp").to_string_lossy().starts_with("c5621aff4786e5be5.511f94b333b57ffd."));
+    }
 
     #[test]
     fn fake_driver_capture_store_load_replay() {
@@ -1968,7 +2021,10 @@ pub fn pb_check(phase: &str) -> i32 {
         let ranges = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 4 * (4 + 2 * rdna::kernels::TS_MANY) }];
         let Ok(layout) = (unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts).push_constant_ranges(&ranges), None) }) else { return 1 };
         let key = 0x5042_4348_4b00_0000u64 | k as u64;
-        let fp = fingerprint(&[&code, &[k]]);
+        // (`DS_PB_CHECK_SALT=<n>`, a test: other code under the same keys, as two sessions that
+        // translate a program differently: the second keeps its own variant, `variant_name`.)
+        let salt = std::env::var("DS_PB_CHECK_SALT").ok().and_then(|v| v.parse::<u32>().ok());
+        let fp = match salt { Some(n) => fingerprint(&[&code, &[k, n]]), None => fingerprint(&[&code, &[k]]) };
         // (This mode's file only: one the other mode left says nothing about this one.)
         let stored_before = stored_cheap('q', key);
         let pb = [PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed), PB_OTHER_KEY.load(Ordering::Relaxed)];
