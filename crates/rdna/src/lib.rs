@@ -358,6 +358,10 @@ impl Inst {
     pub fn mimg_ssamp(&self) -> u16 {
         (bits(self.w1, 21, 5) * 4) as u16
     }
+    /// TFE (bit 16) and LWE (bit 17): a residency status written after the data.
+    pub fn mimg_tfe_lwe(&self) -> u32 {
+        bits(self.w0, 16, 2)
+    }
     pub fn mimg_a16(&self) -> bool {
         bits(self.w1, 30, 1) != 0
     }

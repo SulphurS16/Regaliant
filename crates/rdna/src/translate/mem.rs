@@ -2502,6 +2502,9 @@ fn image_with(tr: &mut T, ins: &Inst) -> R<()> {
         return Ok(());
     }
     let idim = inst_dim(ins.mimg_dim());
+    if ins.mimg_tfe_lwe() != 0 {
+        tr.warn(format!("{:#x}: {name} with tfe/lwe {} (residency status not written)", ins.pc, ins.mimg_tfe_lwe()));
+    }
     let vd = ins.vdst() as u32;
     let dmask = ins.mimg_dmask();
     let res_ty = match class {

@@ -8,6 +8,9 @@
 //! executor's global memory barriers.
 
 use super::desc::Tsharp;
+/// Views made with a MIN_LOD clamp (`vk::Ctx::view_min_lod`).
+pub static VIEW_MIN_LOD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use super::tiling;
 use super::vk::ctx;
 use ash::vk;
@@ -1310,7 +1313,7 @@ pub struct Image {
     /// Views by (format, type, base mip, mips, base layer, layers, swizzle,
     /// usage: 0 sampled, 1 storage, 2 attachment). Usage is part of the key:
     /// a view created for one usage is not valid for another.
-    views: HashMap<(vk::Format, vk::ImageViewType, u32, u32, u32, u32, [u8; 4], u8), vk::ImageView>,
+    views: HashMap<(vk::Format, vk::ImageViewType, u32, u32, u32, u32, [u8; 4], u32), vk::ImageView>,
     /// Written by the GPU: guest memory is no longer its source.
     pub gpu_written: bool,
     /// Write-tracking region of the guest bytes the upload came from.
@@ -6673,7 +6676,7 @@ impl Images {
         img.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
         let mip = s.mip.min(img.key.levels - 1);
         let layer = if img.key.ty3d { 0 } else { s.slice.min(img.key.layers - 1) };
-        let vkey = (s.format, vk::ImageViewType::TYPE_2D, mip, 1, layer, 1, [4u8, 5, 6, 7], 2u8);
+        let vkey = (s.format, vk::ImageViewType::TYPE_2D, mip, 1, layer, 1, [4u8, 5, 6, 7], 2u32);
         let view = match img.views.get(&vkey) {
             Some(&v) => v,
             None => {
@@ -7745,7 +7748,11 @@ impl Images {
         };
         let sel = |s: u16| -> u8 { (s & 7) as u8 };
         let swz = if storage { [4, 5, 6, 7] } else { [sel(t.dst_sel), sel(t.dst_sel >> 3), sel(t.dst_sel >> 6), sel(t.dst_sel >> 9)] };
-        let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, storage as u8 | (stencil as u8) << 1);
+        // (The T#'s MIN_LOD, 4.8 fixed point in the resource's mips: where its streaming stops
+        // the sampling, `vk::Ctx::view_min_lod`. Part of the view key: the same image is bound
+        // with other clamps as its mips stream in.)
+        let min_lod = if storage || !ctx().view_min_lod { 0 } else { t.min_lod };
+        let vkey = (fmt, vt, t.base_level, levels.saturating_sub(t.base_level).max(1), base_layer, layer_count, swz, (storage as u32) | (stencil as u32) << 1 | (min_lod << 8));
         if storage {
             self.write_seq += 1;
         }
@@ -7806,6 +7813,12 @@ impl Images {
             });
         let mut usage = vk::ImageViewUsageCreateInfo::default().usage(if storage { vk::ImageUsageFlags::STORAGE } else { vk::ImageUsageFlags::SAMPLED });
         let ci = ci.push_next(&mut usage);
+        // (Clamped within the view's levels: a MIN_LOD past its last level would leave nothing.)
+        let mut ml = vk::ImageViewMinLodCreateInfoEXT::default().min_lod((min_lod as f32 / 256.0).min((levels_avail - 1) as f32));
+        let ci = if min_lod != 0 {
+            VIEW_MIN_LOD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ci.push_next(&mut ml)
+        } else { ci };
         let v = unsafe { ctx().device.create_image_view(&ci, None) }.map_err(|e| format!("image view {vkey:?}: {e}"))?;
         img.views.insert(vkey, v);
         Ok((v, img.image, img.used))

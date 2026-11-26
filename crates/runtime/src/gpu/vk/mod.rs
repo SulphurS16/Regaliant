@@ -48,6 +48,8 @@ pub struct Ctx {
     pub exec_props: Option<ash::khr::pipeline_executable_properties::Device>,
     pub device_name: String,
     pub validation: bool,
+    /// VK_EXT_image_view_min_lod on: sampled views carry the T#'s MIN_LOD (`images`).
+    pub view_min_lod: bool,
     /// Vulkan 1.2's hostQueryReset enabled: batch slots' timestamp queries
     /// are reset by the CPU when the slot is released (`exec::Slot::bq`).
     pub host_query_reset: bool,
@@ -1008,6 +1010,24 @@ fn init_inner() -> Result<(), String> {
             has_robust2, if has_robust2 { Some(r2) } else { None }, up_dev.mutable_descriptor);
         let binary_compatibility = format!("contract1|{binary_extensions:?}|{binary_features}");
         crate::info!("Vulkan pipeline compatibility: {binary_compatibility}");
+        // Image views clamped to the T#'s MIN_LOD (`images`): the title's streaming sets it to
+        // its finest resident mip, and the mips below stay unmapped (zero-filled here, black).
+        // Enabled after the pipelines' compatibility identity on purpose: a view's own clamp,
+        // nothing a pipeline or shader is made from (stored pipelines stay valid).
+        let view_min_lod = std::env::var("DS_VIEW_MIN_LOD").ok().as_deref() != Some("0")
+            && instance.enumerate_device_extension_properties(pdev).unwrap_or_default().iter()
+                .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::image_view_min_lod::NAME)
+            && {
+                let mut f = vk::PhysicalDeviceImageViewMinLodFeaturesEXT::default();
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f);
+                instance.get_physical_device_features2(pdev, &mut f2);
+                f.min_lod != 0
+            };
+        let mut vml = vk::PhysicalDeviceImageViewMinLodFeaturesEXT::default().min_lod(true);
+        if view_min_lod {
+            dexts.push(ash::ext::image_view_min_lod::NAME.as_ptr());
+        }
+        crate::info!("Vulkan image views clamped to the T# MIN_LOD: {view_min_lod}");
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
@@ -1032,6 +1052,9 @@ fn init_inner() -> Result<(), String> {
         }
         if has_fault {
             dci = dci.push_next(&mut fault_f);
+        }
+        if view_min_lod {
+            dci = dci.push_next(&mut vml);
         }
         if has_stats {
             dci = dci.push_next(&mut stats_f);
@@ -1171,6 +1194,7 @@ fn init_inner() -> Result<(), String> {
             limits: props.limits,
             device_name,
             validation,
+            view_min_lod,
             host_query_reset,
             barycentric,
             bary_gs,

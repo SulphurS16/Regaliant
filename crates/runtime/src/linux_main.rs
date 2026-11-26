@@ -299,6 +299,7 @@ fn run() -> Result<(), String> {
                 info!("{}", gpu::resident::linux_fault_timing());
                 if hosted::on() { info!("{}", hosted::status()); }
                 info!("{}", platform::write_watch::status());
+                info!("image views clamped to their T# MIN_LOD: {}", gpu::images::VIEW_MIN_LOD_VIEWS.load(std::sync::atomic::Ordering::Relaxed));
                 info!("{}", platform::sparse::status());
                 info!("{}", audio::status());
                 info!("attachment metadata rebindings: {}", gpu::images::METADATA_REBINDS.load(std::sync::atomic::Ordering::Relaxed));
