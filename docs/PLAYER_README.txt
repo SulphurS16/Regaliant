@@ -100,8 +100,10 @@ stay sharp while the camera moves. Game's Blur uses the game's own Motion Blur s
 smears every camera move. Reduced Blur keeps a tenth of it.
 
 DLSS needs one more file. NVIDIA's nvngx_dlss.dll is under NVIDIA's own license and does not
-come with the port. Copy your own into the "upscalers" folder beside regaliant.exe. Games with DLSS
-have the file in their installation folder. Then DLSS appears in the Anti-Aliasing list. XeSS and
+come with the port. On the launcher's Display page, "Download DLSS..." fetches it from NVIDIA's
+DLSS SDK on GitHub once you accept NVIDIA's license, and checks it. You can also copy your own
+into the "upscalers" folder beside regaliant.exe. Games with DLSS have the file in their
+installation folder. Then DLSS appears in the Anti-Aliasing list. XeSS and
 FSR are in the "upscalers" folder already. Each library is checked for its maker's digital
 signature before it is loaded. NVIDIA and DLSS are trademarks of NVIDIA Corporation. Intel and
 XeSS are trademarks of Intel Corporation. AMD and FSR are trademarks of Advanced Micro Devices,

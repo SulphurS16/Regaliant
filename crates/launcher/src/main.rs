@@ -15,6 +15,7 @@
 #![windows_subsystem = "windows"]
 
 mod display;
+mod dlss;
 mod game;
 mod saves;
 mod shaders;
@@ -85,6 +86,8 @@ pub struct App {
     pub display: display::Page,
     pub shaders: shaders::Page,
     pub saves: saves::Page,
+    /// NVIDIA's DLSS file's row on the Display page (`dlss`).
+    pub dlss: dlss::Row,
     pub update: update::Page,
     /// The game's process id while it runs.
     pub running: Option<u32>,
@@ -381,6 +384,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_DISCORD => ui::open_url(DISCORD),
                 ID_UNINSTALL => uninstall::run(app),
                 update::ID_UPDATE | update::ID_CHECK_UPDATES => update::command(app, id),
+                dlss::ID_GET | dlss::ID_LICENSE => dlss::command(app, id),
                 100..=199 => game::command(app, id, code),
                 200..=299 => shaders::command(app, id, code),
                 300..=399 => saves::command(app, id, code),
@@ -413,6 +417,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == shaders::CHECK_TIMER => with_app(shaders::check_tick).is_some(),
         WM_TIMER if wp == game::TIMER => with_app(game::tick).is_some(),
         WM_TIMER if wp == update::TIMER => with_app(update::tick).is_some(),
+        WM_TIMER if wp == dlss::TIMER => with_app(dlss::tick).is_some(),
         WM_TIMER if wp == update::RETRY_TIMER => {
             update::retry_now(hwnd);
             true
@@ -476,6 +481,14 @@ fn startup_status(app: &mut App) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    // Tests: `--test-fetch-dlss <folder>` fetches and checks NVIDIA's DLSS file into that folder as
+    // the Display page does (no window), the result in <folder>\fetch-result.txt and the exit code.
+    if let Some(dir) = arg("--test-fetch-dlss") {
+        let dir = std::path::PathBuf::from(dir);
+        let r = dlss::fetch(&dir, &std::sync::atomic::AtomicU64::new(0));
+        let _ = std::fs::write(dir.join("fetch-result.txt"), format!("{r:?}\n"));
+        std::process::exit(if r.is_ok() { 0 } else { 1 });
+    }
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
@@ -546,6 +559,7 @@ fn main() {
             display: display::Page::default(),
             shaders: shaders::Page::default(),
             saves: saves::Page::default(),
+            dlss: dlss::Row::default(),
             update: update::Page::default(),
             running: None,
         };

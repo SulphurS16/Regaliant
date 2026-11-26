@@ -552,7 +552,7 @@ fn readme_version(dir: &Path) -> Option<(u32, u32, u32)> {
 
 /// Downloads `url` (`size` bytes) into `part`, going on from what an earlier try left there when
 /// the server sends that range (and starting again when it sends the whole).
-fn download(url: &str, part: &Path, size: u64, done: &AtomicU64) -> Result<(), String> {
+pub(crate) fn download(url: &str, part: &Path, size: u64, done: &AtomicU64) -> Result<(), String> {
     let io = |e: std::io::Error| format!("the download: {e}");
     for _ in 0..2 {
         let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(part).map_err(io)?;

@@ -13,6 +13,9 @@
   the upscaler fills in to your screen's resolution. Native AA keeps the full resolution. Before,
   they only smoothed edges at the game's own render size, so they gave no frames. Motion Blur Fix
   moved to the Graphics & Display list to make room.
+- The launcher's Display page can download NVIDIA's DLSS file. It fetches it from NVIDIA's own
+  DLSS SDK on GitHub after you accept NVIDIA's license, and checks it is NVIDIA's file as
+  released. Copying your own file still works.
 - Saves made in another program can be brought over now. The launcher's Saves page has Import
   saves: choose the folder that holds them, such as that program's own folder or a decrypted PS5
   save. Saves copied into the save folder by hand are found at the next start too. Before, only

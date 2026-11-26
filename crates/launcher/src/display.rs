@@ -107,6 +107,7 @@ pub fn build(app: &mut App) {
         let r = (16, 356, 748, 60);
         app.display.note = app.put(PAGE, b.label("", r, -1), r) as usize;
     }
+    crate::dlss::build(app, PAGE);
     refresh(app);
 }
 
@@ -128,6 +129,7 @@ pub fn refresh(app: &mut App) {
     }
     modes_for(app, mon_i, &choice);
     update(app);
+    crate::dlss::refresh(app);
 }
 
 /// The chosen monitor's resolutions and rates, the choice selected.
