@@ -23,15 +23,16 @@ This is an early version.
 - Windowed, borderless or exclusive fullscreen with a choice of monitor, resolution and refresh rate.
 - 16:9, 16:10, 21:9 and 32:9 without stretching. A wider screen shows more to the sides.
 - HDR output through the game's own HDR mode.
-- NVIDIA DLSS, AMD FSR and Intel XeSS as anti-aliasing, fed the game's own motion vectors and jitter. DLSS needs your own copy of NVIDIA's DLSS file.
+- NVIDIA DLSS, AMD FSR and Intel XeSS, fed the game's own motion vectors and jitter: upscaling to your screen's resolution (Quality, Balanced, Performance, Ultra Performance) or anti-aliasing at it (Native AA). DLSS needs NVIDIA's DLSS file, which the launcher can download for you.
 - Render scale, sharpening, quality presets, geometry detail, shadow distance, texture filtering, bloom and vignette.
 - A frame rate limit of 30, 60 or uncapped. The game keeps its normal speed at any frame rate.
+- A performance overlay with the frame rate, its 1% and 0.1% lows, and the CPU, GPU and memory use.
 - Even frame pacing at any refresh rate, with G-SYNC and FreeSync.
 - Keyboard and mouse with raw mouse look, a mouse pointer in menus and prompts for the keys you bound. Every key can be changed in the game.
 - Xbox and PlayStation controllers with their own button prompts. A DualSense works directly over USB or Bluetooth, without Steam Input.
 - 5.1 and 7.1 sound, and headphone output of the game's 3D sound, also through Windows Sonic or Dolby Atmos for Headphones.
 - Trophies as achievements with a pop-up and a list.
-- A launcher that checks your game files, sets the display before the game starts, prepares the shaders ahead (the game plays itself in the background, hidden and silent, once: about an hour on a fast PC, longer on others), backs up and restores saves, and offers a safe mode.
+- A launcher that checks your game files, sets the display before the game starts, prepares the shaders ahead (the game plays itself in the background, hidden and silent, once: about an hour on a fast PC, longer on others), backs up, restores and imports saves, offers a safe mode, and updates Regaliant when you choose.
 - The game can also be one .zar archive, about two thirds of the folder's size and read in place. The launcher makes one from your game folder ([what you trade](docs/install.md#save-disk-space-with-a-zar-archive)).
 
 ## Performance
