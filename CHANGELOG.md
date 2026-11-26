@@ -13,10 +13,10 @@
   the upscaler fills in to your screen's resolution. Native AA keeps the full resolution. Before,
   they only smoothed edges at the game's own render size, so they gave no frames. Motion Blur Fix
   moved to the Graphics & Display list to make room.
-- Fixed starts with DLSS that ended at once on some PCs, seen with an RTX 5080 beside an
-  integrated graphics chip. Code in NVIDIA's files stops when it sees a debugger, and Regaliant
-  runs the game under a helper that Windows counts as one. The game's files no longer see it.
-  When the game ends at an error now, its log says where.
+- Probably fixed starts with DLSS that ended at once on some PCs, seen with an RTX 5080 beside
+  an integrated graphics chip. Code in NVIDIA's files stops when it sees a debugger, and
+  Regaliant runs the game under a helper that Windows counts as one. The game's files no longer
+  see it. If the game still ends at an error, its log now says where.
 - Graphics & Display has a Performance Overlay. In the bottom-right corner it shows the frame
   rate and its 1% and 0.1% lows, the CPU use of the game's busiest thread, the GPU's use, clock
   and video memory, and memory. Frame Rate shows the first line only.
