@@ -398,7 +398,11 @@ fn run() -> Result<(), String> {
                 let [texture_zero_parts, texture_missing_parts, texture_gpu_upload_bytes, texture_upload_ns, texture_remaps] = gpu::images::play_counters();
                 info!("Linux play: {seconds}s fg_generated={fg_generated} fg_dispatches={fg_dispatches} fg_ns={fg_ns} fg_pace_ns={fg_pace_ns} fg_retired={fg_retired} fg_pool_deferred={fg_pool_deferred} fg_failed={fg_failed} pb_hits={pb_hits} pb_refused={pb_refused} pb_missing={pb_missing} pb_source_calls={pb_source_calls} pb_source_ns={pb_source_ns} pb_active={pb_active} ww_samples={ww_samples} ww_mapping_ns={ww_mapping_ns} ww_lock_ns={ww_lock_ns} ww_work_ns={ww_work_ns} ww_regions={ww_regions} ww_journal={ww_journal} ww_writers={ww_writers} texture_zero_parts={texture_zero_parts} texture_missing_parts={texture_missing_parts} texture_gpu_upload_bytes={texture_gpu_upload_bytes} texture_upload_ns={texture_upload_ns} texture_remaps={texture_remaps}");
             }
-            if !headless && seconds % 15 == 0 && std::env::var("DS_LINUX_INTERVAL_SHOTS").ok().as_deref() != Some("0") {
+            // (Every `DS_LINUX_SHOT_SECONDS`, 5 by default: short-lived artifacts show in more of
+            // them. ~18 MB each at 4K; the run directory's screenshots are diagnosis, cleaned up.)
+            static SHOT_SECONDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let every = *SHOT_SECONDS.get_or_init(|| std::env::var("DS_LINUX_SHOT_SECONDS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(5));
+            if !headless && seconds % every == 0 && std::env::var("DS_LINUX_INTERVAL_SHOTS").ok().as_deref() != Some("0") {
                 let mut shot = hle::libs::videoout::SHOT_REQUEST.lock();
                 if shot.is_none() { *shot = Some(format!("elapsed-{seconds:04}s")); }
             }
