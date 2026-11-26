@@ -444,6 +444,20 @@ pub fn linux_protection_span(a: u64, end: u64) -> (u64, bool) {
     (p.min(end), armed)
 }
 
+/// Admits a signal-context reader of guest mappings (async-signal-safe): false while a remap
+/// holds or is taking `remap_guard` (the fault then goes to the service thread). Pair with
+/// `signal_leave`.
+#[cfg(target_os = "linux")]
+pub fn signal_admit() -> bool {
+    let gate = LINUX_REMAP.load(Ordering::Acquire);
+    gate & LINUX_WRITER == 0 && LINUX_REMAP.compare_exchange(gate, gate + 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+pub fn signal_leave() {
+    LINUX_REMAP.fetch_sub(1, Ordering::Release);
+}
+
 /// Async-signal-safe: permanent table chunks, atomics and one mprotect syscall only.
 /// Never wait on ST_BUSY: the interrupted thread might hold it. Remaps exclude this path
 /// with a lock-free reader count; the slow service handles collisions and readback faults.

@@ -400,7 +400,78 @@ pub fn check() -> Result<(), String> {
     let faults = crate::platform::signals::RECOVERED.load(Relaxed)-before;
     println!("write-watch benchmark: backend={} rounds={rounds} writes={} wall_s={wall:.6} cpu_s={cpu_s:.6} signals={faults}", if enabled() { "uffd" } else { "mprotect" }, rounds*32);
     println!("{}", status());
+    if crate::hosted::on() { arming_check(a, pages)?; }
     crate::mem::MEM.lock().unmap_range(a, a+size);
+    Ok(())
+}
+
+/// `DS_LINUX_ARMING=1` with `--write-watch-check`: page arming over the check's mapping
+/// [a, a + pages*4K) (`hosted`): faults posted exactly once per written page, other pages
+/// still armed, writes landing, concurrent writers, kernel copies after `disarm_if_armed`,
+/// and the uffd take still seeing the armed pages' writes.
+fn arming_check(a: u64, pages: u64) -> Result<(), String> {
+    let size = pages*PAGE;
+    let mut faults = Vec::new();
+    let mut out = Vec::new();
+    let take = |out: &mut Vec<u64>| crate::gpu::resident::take_written(a, size, out).ok_or("write-watch take failed".to_string());
+    let drain = |f: &mut Vec<(u64, bool, u64)>| -> Result<Vec<u64>, String> {
+        f.clear();
+        if !crate::hosted::drain_faults(f) { return Err("arming: faults lost".into()); }
+        let mut v: Vec<u64> = f.iter().map(|x| x.0).collect(); v.sort_unstable(); Ok(v)
+    };
+    drain(&mut faults)?;
+    take(&mut out)?;
+    // 1. One thread: 32 scattered pages written, exactly those faulted and disarmed.
+    crate::hosted::arm(a, size)?;
+    if !crate::hosted::all_armed(a, size) { return Err("arming: not all armed after arm".into()); }
+    let mut expected: Vec<u64> = (0..32u64).map(|j| a + (j*13 % pages)*PAGE).collect();
+    expected.sort_unstable(); expected.dedup();
+    for (k, &p) in expected.iter().enumerate() { unsafe { std::ptr::write_volatile((p+8) as *mut u64, 0xA000 + k as u64); } }
+    for (k, &p) in expected.iter().enumerate() {
+        if unsafe { std::ptr::read_volatile((p+8) as *const u64) } != 0xA000 + k as u64 { return Err(format!("arming: write to {p:#x} lost")); }
+    }
+    let got = drain(&mut faults)?;
+    if got != expected { return Err(format!("arming: {} faults posted, expected {} pages", got.len(), expected.len())); }
+    for p in (a..a+size).step_by(PAGE as usize) {
+        if crate::hosted::armed(p) == expected.contains(&p) { return Err(format!("arming: page {p:#x} armed state wrong after the writes")); }
+    }
+    out.clear(); take(&mut out)?;
+    if out != expected { return Err(format!("arming: take after armed writes found {} pages, expected {}", out.len(), expected.len())); }
+    // 2. Eight threads writing the same 64 pages at once: each page posted once, no write lost.
+    crate::hosted::disarm(a, size);
+    crate::hosted::arm(a, 64*PAGE)?;
+    std::thread::scope(|sc| for t in 0..8u64 {
+        sc.spawn(move || for i in 0..64u64 { unsafe { std::ptr::write_volatile((a + i*PAGE + t*8) as *mut u64, t + 1); } });
+    });
+    for i in 0..64u64 { for t in 0..8u64 {
+        if unsafe { std::ptr::read_volatile((a + i*PAGE + t*8) as *const u64) } != t + 1 { return Err("arming: concurrent write lost".into()); }
+    } }
+    let got = drain(&mut faults)?;
+    if got != (0..64u64).map(|i| a + i*PAGE).collect::<Vec<_>>() { return Err(format!("arming: concurrent writers posted {} faults for 64 pages", got.len())); }
+    // 3. A kernel copy into armed pages after the I/O preparation (read(2) gets EFAULT, no
+    // signal, on a read-only page).
+    crate::hosted::arm(a, 8*PAGE)?;
+    crate::platform::file_hooks::prepare_kernel_io(a, 8*PAGE, true);
+    let zero = std::fs::File::open("/dev/zero").map_err(|e| e.to_string())?;
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::read(zero.as_raw_fd(), a as *mut libc::c_void, (8*PAGE) as usize) } != (8*PAGE) as isize {
+        return Err(format!("arming: kernel copy into disarmed pages failed: {}", std::io::Error::last_os_error()));
+    }
+    if (0..8u64).any(|i| crate::hosted::armed(a + i*PAGE)) { return Err("arming: pages still armed after the I/O preparation".into()); }
+    drain(&mut faults)?;
+    // 4. Cost: arm all, one write per page, timed.
+    crate::hosted::disarm(a, size);
+    let t = std::time::Instant::now();
+    crate::hosted::arm(a, size)?;
+    let arm_us = t.elapsed().as_secs_f64()*1e6;
+    let t = std::time::Instant::now();
+    for p in (a..a+size).step_by(PAGE as usize) { unsafe { std::ptr::write_volatile(p as *mut u64, 1); } }
+    let fault_us = t.elapsed().as_secs_f64()*1e6 / pages as f64;
+    let got = drain(&mut faults)?;
+    if got.len() != pages as usize { return Err(format!("arming: {} faults for {pages} written pages", got.len())); }
+    crate::hosted::disarm(a, size);
+    println!("arming check passed: arm of {pages} pages {arm_us:.0} us; {fault_us:.2} us per armed write fault");
+    println!("{}", crate::hosted::status());
     Ok(())
 }
 

@@ -92,6 +92,16 @@ unsafe extern "C" fn handler(signal: i32, info: *mut libc::siginfo_t, context: *
     if signal == libc::SIGSEGV && !info.is_null() && !context.is_null() {
         let uc = unsafe { &*(context as *const libc::ucontext_t) };
         let error = uc.uc_mcontext.gregs[libc::REG_ERR as usize] as u64;
+        // An armed page (`hosted`, `DS_LINUX_ARMING=1`): a data access (an armed page never
+        // touched yet faults as not present, so the present bit is not asked for).
+        if error & (16 | 32 | 64) == 0
+            && crate::hosted::linux_fault(unsafe { (*info).si_addr() } as u64, error & 2 != 0, uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64)
+        {
+            unsafe {
+                *errno = saved_errno;
+            }
+            return;
+        }
         if error & (2 | 16 | 32 | 64) == 2
             && crate::gpu::resident::linux_write_fault(unsafe { (*info).si_addr() } as u64)
         {
@@ -562,6 +572,9 @@ fn answer(pointer: usize) {
     let split = crate::sections::wait_split(r.address);
     let resident = crate::gpu::resident::on_fault(r.address, r.write);
     let tracked = r.write && crate::gpu::track::on_write_fault(r.address);
+    // (An armed page whose fault the handler could not answer during a remap.)
+    let armed = !(split || resident || tracked) && crate::hosted::service_fault(r.address, r.write, r.rip);
+    let tracked = tracked || armed;
     // Run after the renderer has disarmed its page, preserving both dirty records.
     let watched = r.write && super::os::write_watch_fault(r.address as usize);
     let remapped = !(split || resident || tracked || watched)

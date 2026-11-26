@@ -204,6 +204,7 @@ fn run() -> Result<(), String> {
     cpucheck::check();
     mem::reserve_guest_range()?;
     gpu::resident::init_linux_faults();
+    hosted::init();
     tls::init_slot()?;
     let crash = std::fs::OpenOptions::new().create(true).append(true).open(run_dir.join("crash.log")).map_err(|e| e.to_string())?;
     let _signal_stack = platform::signals::SignalStack::new().map_err(|e| e.to_string())?;
@@ -296,6 +297,7 @@ fn run() -> Result<(), String> {
                 std::thread::sleep(std::time::Duration::from_secs(15));
                 info!("Linux GPU snapshot:\n{}\n{}\n{}\n{}\n{}", gpu::status_ex(false), gpu::track::status(), gpu::resident::status(), gpu::fe2::status(), gpu::vk::present::stats_line());
                 info!("{}", gpu::resident::linux_fault_timing());
+                if hosted::on() { info!("{}", hosted::status()); }
                 info!("{}", platform::write_watch::status());
                 info!("{}", platform::sparse::status());
                 info!("{}", audio::status());

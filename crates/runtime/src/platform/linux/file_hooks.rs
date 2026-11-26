@@ -51,6 +51,8 @@ pub fn save_root(path: std::path::PathBuf) -> std::path::PathBuf {
 pub fn prepare_kernel_io(base: u64, len: u64, into_guest: bool) {
     if into_guest {
         crate::gpu::resident::disarm_for_host(base, len);
+        // (Armed pages too: a kernel copy into a read-only page fails with EFAULT, no signal.)
+        crate::hosted::disarm_if_armed(base, len);
         super::os::prepare_kernel_write(base, len);
     }
 }
