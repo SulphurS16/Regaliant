@@ -79,10 +79,16 @@ PC settings
 -----------
 The game's SETTINGS screen has a PC tab with the port's settings. Most take effect at once.
 - On the tab: window mode (windowed, borderless or exclusive fullscreen), resolution, render
-  scale, Anti-Aliasing / Upscaler (the game's TAA, off, DLSS, FSR or XeSS), frame rate limit
-  (30, 60 or uncapped), Motion Blur Fix and mouse sensitivity.
-- Graphics & Display: quality preset, geometry detail, texture filtering, sharpening, bloom,
-  vignette, HDR, aspect ratio (16:9, 16:10, 21:9, 32:9), monitor and refresh rate.
+  scale, Anti-Aliasing / Upscaler (the game's TAA, off, DLSS, FSR or XeSS), Upscaling, frame
+  rate limit (30, 60 or uncapped) and mouse sensitivity.
+- Graphics & Display: quality preset, geometry detail, texture filtering, sharpening, Motion
+  Blur Fix, bloom, vignette, HDR, aspect ratio (16:9, 16:10, 21:9, 32:9), monitor and refresh
+  rate.
+
+Upscaling sets how far below your screen's resolution DLSS, FSR or XeSS render: Quality,
+Balanced, Performance or Ultra Performance. The upscaler then fills in to your screen's
+resolution. Performance runs faster, Quality looks sharper. Native AA renders at your screen's
+resolution and only smooths edges. With the game's TAA, Render Scale sets the resolution instead.
 - Controls, Sound & Saves: mouse inversion, menu and HUD size, HUD margin, button prompts,
   sound output (headphones, stereo, 5.1, 7.1, Windows Sonic or Dolby Atmos) and device, the
   controller speaker's sounds through your speakers (Pad Speaker), skip intro logos, save

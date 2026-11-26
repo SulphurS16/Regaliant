@@ -8,6 +8,11 @@
   session of the new version ends normally, Roll back puts the earlier version back. A check box
   on the Game page turns the check off. This version still has to be installed by hand once.
 - The README's first line names the version it came with. Before, it always said 0.1.2.
+- DLSS, FSR and XeSS really upscale now. The PC tab's new Upscaling row sets how far below your
+  screen's resolution the game renders (Quality, Balanced, Performance, Ultra Performance), and
+  the upscaler fills in to your screen's resolution. Native AA keeps the full resolution. Before,
+  they only smoothed edges at the game's own render size, so they gave no frames. Motion Blur Fix
+  moved to the Graphics & Display list to make room.
 - Saves made in another program can be brought over now. The launcher's Saves page has Import
   saves: choose the folder that holds them, such as that program's own folder or a decrypted PS5
   save. Saves copied into the save folder by hand are found at the next start too. Before, only
