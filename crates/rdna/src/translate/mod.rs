@@ -436,14 +436,6 @@ pub struct Spec {
     /// subgroup ORs over up to five words and the per-lane path, in one
     /// reduction per word.
     pub marks_part: bool,
-    /// With `write_marks` and without `marks_part` (devices without
-    /// partitioned subgroups: AMD, Intel): the lanes peel off by map word in
-    /// a loop uniform over the subgroup, the first pending lane's word each
-    /// round (a ballot, a shuffle, an OR reduction), at most `WF_ROUNDS`
-    /// rounds, the lanes still pending then marking their own words: the same
-    /// bits and pages as the other forms, one store per distinct word for
-    /// stores spread over a few words (`mem::mark_waterfall`).
-    pub marks_wf: bool,
     /// With `write_marks`, stores into pages whose bit is set in the map's
     /// held region (`kernels::MARK_HELD_AT`: front end 4's held pages) set
     /// no marks and touch no page (C5: a held page's release copies it
@@ -4553,7 +4545,6 @@ impl Spec {
             part_twice,
             dep_loads,
             marks_part,
-            marks_wf,
             marks_held,
             sgpr_ubo,
             gpu_loads,
@@ -4594,7 +4585,6 @@ impl Spec {
             *marks_part,
             *marks_held,
             *pt_linear,
-            *marks_wf,
         ];
         let mask: u64 = flags.iter().enumerate().fold(0, |m, (i, &f)| m | (f as u64) << i);
         let opt = |o: Option<String>| o.unwrap_or_else(|| "-".into());
@@ -4848,7 +4838,6 @@ impl Spec {
             part_twice: f(27),
             dep_loads: f(28),
             marks_part: f(29),
-            marks_wf: f(32),
             marks_held: f(30),
             sgpr_ubo,
             gpu_loads,
@@ -4923,7 +4912,6 @@ mod tests {
         s.part_twice = b();
         s.dep_loads = b();
         s.marks_part = b();
-        s.marks_wf = b();
         s.marks_held = b();
         s.sgpr_ubo = 7;
         s.gpu_loads = 0xdead_beef_0000_1234;
@@ -5013,7 +5001,6 @@ mod tests {
             part_twice: false,
             dep_loads: false,
             marks_part: false,
-            marks_wf: false,
             marks_held: false,
             sgpr_ubo: 0,
             gpu_loads: 0,
@@ -5169,25 +5156,6 @@ mod tests {
             let bytes: Vec<u8> = b.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("write_marks.spv"), bytes).unwrap();
         }
-        // The waterfall form (`Spec::marks_wf`), alone and with C5: the same bindings and
-        // warnings; its loop's phis and merges for spvval.
-        for (held, name) in [(false, "write_marks_wf.spv"), (true, "write_marks_wf_held.spv")] {
-            spec.marks_part = false;
-            spec.marks_held = held;
-            spec.marks_wf = true;
-            let wf = translate(&code, &plan, &spec).unwrap();
-            spec.marks_wf = false;
-            let near = translate(&code, &plan, &spec).unwrap();
-            assert_eq!(wf.bindings.len(), near.bindings.len());
-            assert_eq!(marks(&wf), 1);
-            assert_eq!(wf.warnings, near.warnings);
-            assert_ne!(wf.spirv, near.spirv);
-            if let Ok(dir) = std::env::var("RDNA_MARKS_DUMP") {
-                let bytes: Vec<u8> = wf.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
-            }
-        }
-        spec.marks_held = false;
         // C5 (`Spec::marks_held`), with the ballot and the partitioned forms:
         // the same bindings and warnings, a longer module.
         for (part, name) in [(false, "write_marks_held.spv"), (true, "write_marks_held_part.spv")] {

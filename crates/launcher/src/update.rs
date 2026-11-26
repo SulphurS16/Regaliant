@@ -1,21 +1,25 @@
 //! Updates (docs/UPDATES.md; the user's decision of 2026-11-26): at every start the launcher asks
 //! GitHub for the newest release, and a newer one shows the Update button beside Play. Nothing
-//! downloads or changes until the player presses it. Update downloads the release's zip and its
-//! signature, checks the signature against the key built in here (`update-public-key.pem`,
-//! Ed25519; its private half stays with the user), unpacks the zip's files beside the install,
-//! moves the installed package files into a backup folder and the new ones in, and starts the new
-//! launcher. On a failure the current version stays or is put back. Saves, settings, logs,
-//! prepared shaders, add-ons and the player's own DLSS file are not package files and are never
-//! touched. The backup goes after the new version's first game session that ends normally; until
-//! then Roll back puts the earlier version back.
+//! downloads or changes until the player presses it. Update downloads the release's signature, then
+//! its zip, checks the signature against the key built in here (`update-public-key.pem`, Ed25519;
+//! its private half stays with the user), unpacks the zip's files beside the install and checks
+//! that they are the offered version (the README's first line, inside the signed zip: a genuine
+//! zip of another version offered under this release's name is refused). It then moves the
+//! installed package files into a backup folder and the new ones in, journalled so that an
+//! interrupted swap is undone at the next start, and starts the new launcher, which says when it
+//! is up; if it does not come up, the earlier version is put back. Saves, settings, logs, prepared
+//! shaders, add-ons and the player's own DLSS file are not package files and are never touched.
+//! The backup goes after the new version's first game session that ends normally; until then Roll
+//! back puts the earlier version back.
 //!
 //! The check is one HTTPS request (GitHub sees the address it comes from, as with any download);
 //! the Game page's check box turns it off (`check_updates = 0` in launch.txt). A checkout's build
-//! checks nothing. `DS_UPDATE_URL` (tests) names another release document; plain HTTP is taken
-//! from this PC's own address only.
+//! checks nothing. `DS_UPDATE_URL` (tests) names another release document on this PC's own address
+//! (plain HTTP allowed there only).
 
 use crate::{App, TITLE, VERSION, ui};
 use dsconfig::paths::{GAME_EXE, LAUNCHER_EXE, Layout, PORTABLE_MARKER};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -24,8 +28,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// Posted when the start's check has its answer.
 pub const WM_CHECKED: u32 = WM_APP + 7;
+/// Posted when the started launcher said it is up (WPARAM 1) or did not come up (0).
+pub const WM_STARTED: u32 = WM_APP + 8;
 /// The download's progress and end, looked at twice a second.
 pub const TIMER: usize = 11;
+/// Messages that came while a dialog held the app, posted again.
+pub const RETRY_TIMER: usize = 12;
 pub const ID_UPDATE: i32 = 908;
 pub const ID_CHECK_UPDATES: i32 = 909;
 
@@ -35,6 +43,15 @@ const LATEST: &str = "https://api.github.com/repos/SulphurS16/Regaliant/releases
 const PUBLIC_KEY_PEM: &str = include_str!("../update-public-key.pem");
 /// The largest zip taken (a package is ~100 MB).
 const MAX_ZIP: u64 = 1 << 30;
+/// The update's folders in the install; each holds `MARKER`, and only such folders are removed.
+const STAGE_PREFIX: &str = ".regaliant-update-";
+const BACKUP_PREFIX: &str = ".regaliant-backup-";
+const ROLLED_PREFIX: &str = ".regaliant-rolled-back-";
+const MARKER: &str = ".regaliant-folder";
+/// The swap's journal in the install: written before its first move, gone after its last.
+const JOURNAL: &str = ".regaliant-update-journal.txt";
+/// How long the old launcher waits for the new one to come up before putting itself back.
+const START_WAIT_MS: u32 = 60_000;
 
 /// A newer release on offer.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,8 +70,12 @@ pub struct Page {
     check: usize,
     offer: Option<Offer>,
     job: Option<Job>,
+    /// A version unpacked but not installed (something ran at that moment): Update installs it.
+    staged: Option<Staged>,
     /// The earlier version a backup folder holds (what Roll back puts back).
     backup: Option<String>,
+    /// An installed update whose launcher has not said it is up yet: what to put back otherwise.
+    handoff: Option<Handoff>,
 }
 
 /// A download under way: its thread fetches, checks and unpacks; the timer shows it.
@@ -69,7 +90,24 @@ struct Job {
     result: Arc<Mutex<Option<Result<(PathBuf, Vec<String>), String>>>>,
 }
 
+#[derive(Clone)]
+struct Staged {
+    version: String,
+    changes: String,
+    dir: PathBuf,
+    names: Vec<String>,
+}
+
+/// The swap that installed `to` over `from`: the names it moved in.
+struct Handoff {
+    from: String,
+    to: String,
+    names: Vec<String>,
+}
+
 static CHECKED: Mutex<Option<Result<Option<Offer>, String>>> = Mutex::new(None);
+/// Messages to post again (`RETRY_TIMER`).
+static RETRY: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
 
 fn h(v: usize) -> HWND {
     v as HWND
@@ -88,16 +126,48 @@ pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     it.next().is_none().then_some(v)
 }
 
-fn backup_dir(app: &App, version: &str) -> PathBuf {
-    app.paths.exe_dir.join(format!(".backup-{version}"))
+fn backup_dir(install: &Path, version: &str) -> PathBuf {
+    install.join(format!("{BACKUP_PREFIX}{version}"))
 }
 
-fn staging_dir(app: &App, version: &str) -> PathBuf {
-    app.paths.exe_dir.join(format!(".update-{version}"))
+fn staging_dir(install: &Path, version: &str) -> PathBuf {
+    install.join(format!("{STAGE_PREFIX}{version}"))
+}
+
+fn rolled_dir(install: &Path, version: &str) -> PathBuf {
+    install.join(format!("{ROLLED_PREFIX}{version}"))
 }
 
 fn download_dir(app: &App) -> PathBuf {
     app.paths.cache.join("update")
+}
+
+/// A folder of the update's own (made here, `MARKER` inside it).
+fn ours(p: &Path) -> bool {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    [STAGE_PREFIX, BACKUP_PREFIX, ROLLED_PREFIX].iter().any(|pre| name.starts_with(pre)) && p.join(MARKER).is_file()
+}
+
+/// Makes `dir` (empty) as a folder of the update's own.
+fn make_ours(dir: &Path) -> Result<(), String> {
+    if dir.exists() {
+        if !ours(dir) {
+            return Err(format!("{} is in the way", dir.display()));
+        }
+        std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::write(dir.join(MARKER), "Made by the Regaliant launcher's update. It removes this folder itself.\r\n").map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// The update's folders in `install` (Uninstall removes them) and its journal, when there.
+pub fn own_files(install: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(install).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| ours(p)).collect();
+    let j = install.join(JOURNAL);
+    if j.is_file() {
+        v.push(j);
+    }
+    v
 }
 
 /// The package files this version knows (`scripts\package.ps1`'s allowlist: the launcher, the game
@@ -108,24 +178,39 @@ fn package_names() -> Vec<String> {
     v
 }
 
-/// A zip entry's name as an install's relative path (backslashes), or None when it is not one a
-/// package may hold: absolute, with a drive, `..`, deeper than three folders, or a place of the
-/// player's (the portable layout's marker and data, their own DLSS file).
+/// A file name as an install's relative path (backslashes), or None when it is not one a package
+/// may hold: absolute, with a drive or a stream (`:`), `..`, deeper than three folders, a part
+/// Windows would change or read as something else (a trailing dot or space, `~` of a short name,
+/// a device name), a place of the player's (the portable layout's marker and data, their own DLSS
+/// file) or of the update's own.
 fn valid_name(n: &str) -> Option<String> {
     let n = n.replace('/', "\\");
     let parts: Vec<&str> = n.split('\\').collect();
-    if n.is_empty() || n.len() > 200 || n.contains(':') || parts.len() > 4 || parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+    if n.is_empty() || n.len() > 200 || parts.len() > 4 {
         return None;
     }
+    for p in &parts {
+        if p.is_empty() || p.ends_with('.') || p.ends_with(' ') || p.starts_with(' ') {
+            return None;
+        }
+        if p.chars().any(|c| matches!(c, ':' | '~' | '<' | '>' | '"' | '|' | '?' | '*') || (c as u32) < 32) {
+            return None;
+        }
+        let stem = p.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let numbered = (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit();
+        if numbered || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+            return None;
+        }
+    }
     let lower = n.to_ascii_lowercase();
-    if lower == PORTABLE_MARKER || lower.starts_with("user\\") || lower == "upscalers\\nvngx_dlss.dll" {
+    if lower == PORTABLE_MARKER || lower.starts_with("user\\") || lower == "upscalers\\nvngx_dlss.dll" || lower.starts_with(".regaliant-") {
         return None;
     }
     Some(n)
 }
 
 /// The Update button (beside Uninstall, shown only when it has something to do) and the Game
-/// page's check box.
+/// page's check box. A swap a crash interrupted is undone first.
 pub fn build(app: &mut App) {
     let b = app.builder();
     unsafe {
@@ -137,6 +222,9 @@ pub fn build(app: &mut App) {
         let c = b.check("Check for a new version of Regaliant at every start", r, ID_CHECK_UPDATES);
         app.update.check = app.put(0, c, r) as usize;
         ui::set_check(c, app.launch.check_updates);
+    }
+    if let Some(note) = recover(app) {
+        app.set_status(&note);
     }
     app.update.backup = find_backup(app);
     refresh(app);
@@ -152,28 +240,30 @@ fn refresh(app: &App) {
     unsafe {
         ui::set_text(btn, text);
         ui::show(btn, show);
-        ui::enable(btn, app.update.job.is_none());
+        ui::enable(btn, app.update.job.is_none() && app.update.handoff.is_none());
     }
 }
 
-/// The earlier version whose backup this install keeps: the newest one of this version or older
-/// (older ones, backups of later versions left by a roll back, roll backs' `.rolled-back-*` and
-/// unfinished updates' `.update-*` folders are removed).
+/// The earlier version whose backup this install keeps: the newest whole one of this version or
+/// older (the update's other folders are removed: older or incomplete backups, backups of later
+/// versions left by a roll back, roll backs' and unfinished updates' folders). Nothing is removed
+/// while a journal waits to be undone.
 fn find_backup(app: &App) -> Option<String> {
     let cur = parse_version(VERSION)?;
+    let install = &app.paths.exe_dir;
+    if install.join(JOURNAL).exists() {
+        return None;
+    }
+    let whole = |p: &Path| p.join(GAME_EXE).is_file() && p.join(LAUNCHER_EXE).is_file();
     let mut older: Vec<((u32, u32, u32), String, PathBuf)> = Vec::new();
-    for e in std::fs::read_dir(&app.paths.exe_dir).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".rolled-back-") || name.starts_with(".update-") {
-            let _ = std::fs::remove_dir_all(e.path());
-            continue;
-        }
-        let Some(v) = name.strip_prefix(".backup-") else { continue };
-        let Some(n) = parse_version(v) else { continue };
-        if n > cur {
-            let _ = std::fs::remove_dir_all(e.path());
-        } else {
-            older.push((n, v.to_string(), e.path()));
+    for p in own_files(install) {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let keep = name.strip_prefix(BACKUP_PREFIX).and_then(|v| parse_version(v).map(|n| (n, v.to_string()))).filter(|(n, _)| *n <= cur && whole(&p));
+        match keep {
+            Some((n, v)) => older.push((n, v, p)),
+            None => {
+                let _ = std::fs::remove_dir_all(&p);
+            }
         }
     }
     older.sort();
@@ -185,9 +275,15 @@ fn find_backup(app: &App) -> Option<String> {
 }
 
 /// The start's check, on a thread of its own (none in a checkout or when the player turned it
-/// off).
+/// off; `DS_UPDATE_URL` only on this PC's own address).
 pub fn start_check(app: &App) {
     let test = std::env::var("DS_UPDATE_URL").ok().filter(|u| !u.is_empty());
+    if let Some(u) = &test {
+        if !http::local(u) {
+            log(app, "DS_UPDATE_URL is not on this PC: no check");
+            return;
+        }
+    }
     if !app.launch.check_updates || (test.is_none() && app.paths.layout == Layout::Dev) {
         return;
     }
@@ -259,8 +355,30 @@ fn changes_of(body: &str) -> String {
     out.join("\n").trim().to_string()
 }
 
+/// The update's messages (`WM_CHECKED`, `WM_STARTED`).
+pub fn message(app: &mut App, msg: u32, wp: usize) {
+    match msg {
+        WM_CHECKED => checked(app),
+        WM_STARTED => started(app, wp != 0),
+        _ => {}
+    }
+}
+
+/// `msg` came while a dialog held the app: posted again shortly.
+pub fn retry_later(hwnd: HWND, msg: u32, wp: usize) {
+    RETRY.lock().unwrap().push((msg, wp));
+    unsafe { SetTimer(hwnd, RETRY_TIMER, 250, None) };
+}
+
+pub fn retry_now(hwnd: HWND) {
+    unsafe { KillTimer(hwnd, RETRY_TIMER) };
+    for (msg, wp) in std::mem::take(&mut *RETRY.lock().unwrap()) {
+        unsafe { PostMessageW(hwnd, msg, wp, 0) };
+    }
+}
+
 /// The start's answer arrived.
-pub fn checked(app: &mut App) {
+fn checked(app: &mut App) {
     let Some(r) = CHECKED.lock().unwrap().take() else { return };
     match r {
         Ok(Some(o)) => {
@@ -276,9 +394,11 @@ pub fn checked(app: &mut App) {
     refresh(app);
 }
 
-/// Why the program files cannot change now, if they cannot.
+/// Why the program files cannot change now, if they cannot (the launcher's own short checks of the
+/// game, in its job, do not count).
 fn busy(app: &App) -> Option<&'static str> {
-    if app.running.is_some() || crate::sys::processes_in(&app.paths.exe_dir).iter().any(|(_, n)| n.eq_ignore_ascii_case(GAME_EXE)) {
+    let own = crate::sys::job_processes();
+    if app.running.is_some() || crate::sys::processes_in(&app.paths.exe_dir).iter().any(|(pid, n)| n.eq_ignore_ascii_case(GAME_EXE) && !own.contains(pid)) {
         return Some("Close the game first.");
     }
     if crate::shaders::running(app) {
@@ -290,9 +410,10 @@ fn busy(app: &App) -> Option<&'static str> {
     None
 }
 
-/// Whether an update is being downloaded (Play and the shader preparation wait for it).
+/// Whether an update is being downloaded or installed (Play, the shader preparation and
+/// Uninstall wait for it).
 pub fn downloading(app: &App) -> bool {
-    app.update.job.is_some()
+    app.update.job.is_some() || app.update.handoff.is_some()
 }
 
 pub fn command(app: &mut App, id: i32) {
@@ -301,6 +422,7 @@ pub fn command(app: &mut App, id: i32) {
             app.launch.check_updates = unsafe { ui::checked(h(app.update.check)) };
             app.save_launch();
         }
+        ID_UPDATE if app.update.handoff.is_some() => {}
         ID_UPDATE if app.update.offer.is_some() => update(app),
         ID_UPDATE if app.update.backup.is_some() => roll_back(app),
         _ => {}
@@ -316,6 +438,12 @@ fn update(app: &mut App) {
         return;
     }
     let Some(o) = app.update.offer.clone() else { return };
+    // (Unpacked before, but not installed then: no second download.)
+    if let Some(s) = app.update.staged.clone().filter(|s| s.version == o.version && s.dir.is_dir()) {
+        install(app, &s);
+        refresh(app);
+        return;
+    }
     let t = format!(
         "Download Regaliant {} ({} MB) and update?\n\nThe launcher restarts when it is done. Saves, settings and prepared shaders are kept.",
         o.version,
@@ -326,7 +454,7 @@ fn update(app: &mut App) {
     }
     let job = Job { version: o.version.clone(), changes: o.changes.clone(), total: o.zip_size, done: Arc::default(), step: Arc::default(), result: Arc::default() };
     let (done, step, result) = (job.done.clone(), job.step.clone(), job.result.clone());
-    let (dir, staging) = (download_dir(app), staging_dir(app, &o.version));
+    let (dir, staging) = (download_dir(app), staging_dir(&app.paths.exe_dir, &o.version));
     log(app, &format!("downloading {}", o.version));
     let status = format!("Downloading Regaliant {}.", o.version);
     std::thread::spawn(move || {
@@ -358,7 +486,11 @@ pub fn tick(app: &mut App) {
     unsafe { KillTimer(app.hwnd, TIMER) };
     let job = app.update.job.take().unwrap();
     match r {
-        Ok((staging, names)) => install(app, &job.version, &job.changes, &staging, &names),
+        Ok((dir, names)) => {
+            let s = Staged { version: job.version, changes: job.changes, dir, names };
+            app.update.staged = Some(s.clone());
+            install(app, &s);
+        }
         Err(e) => {
             log(app, &format!("{} not installed: {e}", job.version));
             app.set_status(&format!("The update did not complete: {e}. Regaliant {VERSION} stays."));
@@ -367,12 +499,18 @@ pub fn tick(app: &mut App) {
     refresh(app);
 }
 
-/// The download thread: the zip (resumed where an earlier one stopped), its signature checked,
-/// its files unpacked into `staging`.
+/// The download thread: the signature, then the zip (resumed where an earlier try stopped), the
+/// signature checked, the files unpacked into `staging` and checked to be the offered version.
 fn fetch(o: &Offer, dir: &Path, staging: &Path, done: &AtomicU64, step: &AtomicU64) -> Result<(PathBuf, Vec<String>), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("the download folder: {e}"))?;
     let zip = dir.join(format!("Regaliant-{}.zip", o.version));
-    download(&o.zip_url, &zip, o.zip_size, done)?;
+    let part = zip.with_extension("zip.part");
+    // (Earlier versions' leftovers go.)
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.path() != part && e.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     let mut sig = Vec::new();
     let status = http::get(&o.sig_url, 0, "application/octet-stream", &mut |_, b| {
         if sig.len() + b.len() > 4096 {
@@ -381,66 +519,80 @@ fn fetch(o: &Offer, dir: &Path, staging: &Path, done: &AtomicU64, step: &AtomicU
         sig.extend_from_slice(b);
         Ok(())
     })?;
-    if status != 200 {
-        return Err(format!("the signature's download answered {status}"));
+    if status != 200 || sig.len() != 64 {
+        return Err(format!("the signature's download answered {status} with {} bytes", sig.len()));
     }
+    download(&o.zip_url, &part, o.zip_size, done)?;
     step.store(1, Relaxed);
-    // (Read whole, then the file goes: an unpacked, refused or broken download is never kept.)
-    let bytes = std::fs::read(&zip).map_err(|e| format!("the download: {e}"))?;
-    let _ = std::fs::remove_file(&zip);
+    // (Read whole, then the file goes: a checked, refused or broken download is never kept.)
+    let bytes = std::fs::read(&part).map_err(|e| format!("the download: {e}"))?;
+    let _ = std::fs::remove_file(&part);
     verify(&bytes, &sig)?;
     step.store(2, Relaxed);
-    let names = unpack(&bytes, staging).inspect_err(|_| {
+    let names = unpack(&bytes, staging).and_then(|names| {
+        let want = parse_version(&o.version);
+        match readme_version(staging) {
+            Some(v) if Some(v) == want && v > parse_version(VERSION).unwrap_or((0, 0, 0)) => Ok(names),
+            Some(v) => Err(format!("the download holds Regaliant {}.{}.{}, not {}", v.0, v.1, v.2, o.version)),
+            None => Err("the download does not name its version".into()),
+        }
+    });
+    names.inspect_err(|_| {
         let _ = std::fs::remove_dir_all(staging);
-    })?;
-    Ok((staging.to_path_buf(), names))
+    })
+    .map(|n| (staging.to_path_buf(), n))
 }
 
-/// Downloads `url` (`size` bytes) to `to` through `<to>.part`, going on from a part left by an
-/// earlier try when the server takes a range.
-fn download(url: &str, to: &Path, size: u64, done: &AtomicU64) -> Result<(), String> {
-    use std::io::Write;
-    let part = to.with_extension("zip.part");
-    let mut have = std::fs::metadata(&part).map_or(0, |m| m.len());
-    if have >= size {
-        let _ = std::fs::remove_file(&part);
-        have = 0;
-    }
+/// The version a package's README names on its first line ("Regaliant X.Y.Z - ...").
+fn readme_version(dir: &Path) -> Option<(u32, u32, u32)> {
+    let t = std::fs::read_to_string(dir.join("README.txt")).ok()?;
+    let first = t.trim_start_matches('\u{feff}').lines().next()?;
+    parse_version(first.strip_prefix("Regaliant ")?.split_whitespace().next()?)
+}
+
+/// Downloads `url` (`size` bytes) into `part`, going on from what an earlier try left there when
+/// the server sends that range (and starting again when it sends the whole).
+fn download(url: &str, part: &Path, size: u64, done: &AtomicU64) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("the download: {e}");
     for _ in 0..2 {
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(part).map_err(io)?;
+        let mut have = f.seek(SeekFrom::End(0)).map_err(io)?;
+        if have >= size {
+            f.set_len(0).map_err(io)?;
+            have = f.seek(SeekFrom::Start(0)).map_err(io)?;
+        }
         let from = have;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&part).map_err(|e| format!("the download: {e}"))?;
         let mut first = true;
-        let status = http::get(url, from, "application/octet-stream", &mut |status, b| {
+        let status = http::get(url, from, "application/octet-stream", &mut |a, b| {
             if first {
                 first = false;
-                // (A server that ignores the range sends the whole file again.)
-                if status == 200 && have > 0 {
-                    f.set_len(0).map_err(|e| format!("the download: {e}"))?;
-                    have = 0;
+                if a.status == 200 && have > 0 {
+                    f.set_len(0).map_err(io)?;
+                    have = f.seek(SeekFrom::Start(0)).map_err(io)?;
+                }
+                if a.status == 206 && a.range_start != Some(from) {
+                    return Err(format!("the server sent another part of the file ({:?} for {from})", a.range_start));
                 }
             }
-            if status != 200 && status != 206 {
+            if a.status != 200 && a.status != 206 {
                 return Ok(());
             }
             have += b.len() as u64;
             if have > size {
                 return Err("the download is larger than announced".into());
             }
-            f.write_all(b).map_err(|e| format!("the download: {e}"))?;
+            f.write_all(b).map_err(io)?;
             done.store(have, Relaxed);
             Ok(())
         })?;
+        f.sync_all().map_err(io)?;
         drop(f);
         match status {
-            200 | 206 if have == size => {
-                let _ = std::fs::remove_file(to);
-                return std::fs::rename(&part, to).map_err(|e| format!("the download: {e}"));
-            }
+            200 | 206 if have == size => return Ok(()),
             200 | 206 => return Err(format!("the download stopped at {} of {} MB", have >> 20, size >> 20)),
-            // (The part no longer fits the file on the server: once more from the start.)
+            // (What is there no longer fits the file on the server: once more from the start.)
             416 => {
-                let _ = std::fs::remove_file(&part);
-                have = 0;
+                let _ = std::fs::remove_file(part);
             }
             s => return Err(format!("the download answered {s}")),
         }
@@ -496,12 +648,12 @@ fn verify_with(key: &[u8; 32], data: &[u8], sig: &[u8]) -> Result<(), String> {
     pk.verify(data, &sig).map_err(|_| "the download's signature does not match: it is not a Regaliant release".to_string())
 }
 
-/// The zip's files into `staging` (emptied first): their names, checked by `valid_name`; the
-/// launcher and the game must be among them.
+/// The zip's files into `staging` (made anew as a folder of the update's own), each written to
+/// the disk before it counts: their names, checked by `valid_name`; the launcher and the game
+/// must be among them.
 fn unpack(z: &[u8], staging: &Path) -> Result<Vec<String>, String> {
     let entries = zip::entries(z)?;
-    let _ = std::fs::remove_dir_all(staging);
-    std::fs::create_dir_all(staging).map_err(|e| format!("the update's folder: {e}"))?;
+    make_ours(staging)?;
     let mut names: Vec<String> = Vec::new();
     for e in entries.iter().filter(|e| !e.name.ends_with('/')) {
         let name = valid_name(&e.name).ok_or_else(|| format!("the download holds a file it may not ({})", e.name))?;
@@ -513,7 +665,8 @@ fn unpack(z: &[u8], staging: &Path) -> Result<Vec<String>, String> {
         if let Some(p) = out.parent() {
             std::fs::create_dir_all(p).map_err(|e| format!("the update's folder: {e}"))?;
         }
-        std::fs::write(&out, &data).map_err(|e| format!("{name}: {e}"))?;
+        let mut f = std::fs::File::create(&out).map_err(|e| format!("{name}: {e}"))?;
+        f.write_all(&data).and_then(|_| f.sync_all()).map_err(|e| format!("{name}: {e}"))?;
         names.push(name);
     }
     for need in [GAME_EXE, LAUNCHER_EXE] {
@@ -524,21 +677,60 @@ fn unpack(z: &[u8], staging: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Moves each installed file named in `out_names` into `backup`, then each of `in_names` from
-/// `incoming` into the install. On a failure everything moved goes back and the error is
-/// returned. (A running program's file can be moved on the same drive: the launcher moves its own.)
-fn swap(install: &Path, incoming: &Path, in_names: &[String], out_names: &[String], backup: &Path) -> Result<(), String> {
-    let mv = |from: &Path, to: &Path| -> Result<(), String> {
-        if let Some(p) = to.parent() {
-            std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+/// A rename, tried again for a few seconds while another program holds the file (a virus
+/// scanner reading a new program file).
+fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            // (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.)
+            Err(e) if matches!(e.raw_os_error(), Some(5 | 32 | 33)) && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => return Err(e),
         }
-        std::fs::rename(from, to).map_err(|e| format!("{}: {e}", from.display()))
-    };
-    let _ = std::fs::remove_dir_all(backup);
+    }
+}
+
+fn mv(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(p) = to.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    rename_retry(from, to).map_err(|e| format!("{}: {e}", from.display()))
+}
+
+fn write_synced(p: &Path, text: &str) -> Result<(), String> {
+    let mut f = std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// Moves each installed file named in `out_names` into `backup` (made anew), then each of
+/// `in_names` from `incoming` into the install: the launcher last out and first in, so the install
+/// is without one for two renames only. A journal in the install names the moves before the first
+/// (`recover` undoes them at the next start after a crash) and goes after the last. On a failure
+/// everything moved goes back; what could not go back is in the error, the journal kept for the
+/// next start.
+fn swap(install: &Path, incoming: &Path, in_names: &[String], out_names: &[String], backup: &Path) -> Result<(), String> {
+    let is_l = |n: &&String| n.eq_ignore_ascii_case(LAUNCHER_EXE);
+    let outs: Vec<&String> = out_names.iter().filter(|n| !is_l(n)).chain(out_names.iter().filter(is_l)).collect();
+    let ins: Vec<&String> = in_names.iter().filter(is_l).chain(in_names.iter().filter(|n| !is_l(n))).collect();
+    make_ours(backup)?;
+    let file = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut j = format!("regaliant update journal\nincoming = {}\nbackup = {}\n", file(incoming), file(backup));
+    for n in &ins {
+        j += &format!("in = {n}\n");
+    }
+    for n in &outs {
+        j += &format!("out = {n}\n");
+    }
+    let journal = install.join(JOURNAL);
+    write_synced(&journal, &j)?;
     let mut moved_out: Vec<&String> = Vec::new();
     let mut moved_in: Vec<&String> = Vec::new();
     let mut r = Ok(());
-    for n in out_names {
+    for n in &outs {
         if install.join(n).is_file() {
             if let Err(e) = mv(&install.join(n), &backup.join(n)) {
                 r = Err(e);
@@ -548,7 +740,7 @@ fn swap(install: &Path, incoming: &Path, in_names: &[String], out_names: &[Strin
         }
     }
     if r.is_ok() {
-        for n in in_names {
+        for n in &ins {
             if let Err(e) = mv(&incoming.join(n), &install.join(n)) {
                 r = Err(e);
                 break;
@@ -556,64 +748,251 @@ fn swap(install: &Path, incoming: &Path, in_names: &[String], out_names: &[Strin
             moved_in.push(n);
         }
     }
-    if r.is_err() {
-        for n in moved_in.iter().rev() {
-            let _ = mv(&install.join(n), &incoming.join(n));
-        }
-        for n in moved_out.iter().rev() {
-            let _ = mv(&backup.join(n), &install.join(n));
+    let Err(e) = r else {
+        let _ = std::fs::remove_file(&journal);
+        return Ok(());
+    };
+    let mut left = Vec::new();
+    for n in moved_in.iter().rev() {
+        if let Err(e) = mv(&install.join(n), &incoming.join(n)) {
+            left.push(e);
         }
     }
-    r
+    for n in moved_out.iter().rev() {
+        if let Err(e) = mv(&backup.join(n), &install.join(n)) {
+            left.push(e);
+        }
+    }
+    if !left.is_empty() {
+        return Err(format!("{e}, and some files could not be put back ({}): the launcher tries again at its next start", left.join("; ")));
+    }
+    let _ = std::fs::remove_file(&journal);
+    let _ = std::fs::remove_dir_all(backup);
+    Err(e)
 }
 
-/// The files under `dir` by their relative names (a backup's).
+/// At a start: a swap a crash interrupted (its journal still there) is undone (`recover_at`).
+fn recover(app: &App) -> Option<String> {
+    let note = recover_at(&app.paths)?;
+    log(app, &format!("an interrupted swap found: {note}"));
+    Some(note)
+}
+
+/// The files an interrupted swap moved in go back to where they came from, the ones it moved out
+/// come back; the journal goes once all are back. A note for the status line when there was one.
+fn recover_at(paths: &dsconfig::paths::Paths) -> Option<String> {
+    let install = &paths.exe_dir;
+    let journal = install.join(JOURNAL);
+    let t = std::fs::read_to_string(&journal).ok()?;
+    let mut kv = t.lines().filter_map(|l| l.split_once(" = ")).map(|(k, v)| (k.trim(), v.trim()));
+    let mut incoming = None;
+    let mut backup = None;
+    let (mut ins, mut outs) = (Vec::new(), Vec::new());
+    for (k, v) in kv.by_ref() {
+        match k {
+            "incoming" => incoming = Some(v.to_string()),
+            "backup" => backup = Some(v.to_string()),
+            "in" => ins.extend(valid_name(v)),
+            "out" => outs.extend(valid_name(v)),
+            _ => {}
+        }
+    }
+    let dir = |v: Option<String>| v.filter(|n| n.starts_with(".regaliant-") && !n.contains(['\\', '/', ':'])).map(|n| install.join(n));
+    let (Some(incoming), Some(backup)) = (dir(incoming), dir(backup)) else {
+        let _ = std::fs::remove_file(&journal);
+        return None;
+    };
+    let mut left = Vec::new();
+    for n in ins.iter().rev() {
+        if install.join(n).is_file() && !incoming.join(n).exists() {
+            if let Err(e) = mv(&install.join(n), &incoming.join(n)) {
+                left.push(e);
+            }
+        }
+    }
+    for n in outs.iter().rev() {
+        if backup.join(n).is_file() && !install.join(n).exists() {
+            if let Err(e) = mv(&backup.join(n), &install.join(n)) {
+                left.push(e);
+            }
+        }
+    }
+    if !left.is_empty() {
+        return Some(format!("An update was interrupted and could not be undone yet ({}). Close other programs and start the launcher again.", left.join("; ")));
+    }
+    let _ = std::fs::remove_file(&journal);
+    if files_under(&backup).is_empty() {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+    Some("An update was interrupted and has been undone. Start the launcher again before you play.".into())
+}
+
+/// The files under `dir` by their relative names (a backup's), links and junctions left out.
 fn files_under(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if let Ok(rel) = p.strip_prefix(dir) {
-                out.push(rel.to_string_lossy().into_owned());
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_symlink() {
+                continue;
+            }
+            if t.is_dir() {
+                stack.push(e.path());
+            } else if let Ok(rel) = e.path().strip_prefix(dir) {
+                let rel = rel.to_string_lossy().into_owned();
+                if rel != MARKER {
+                    out.push(rel);
+                }
             }
         }
     }
     out
 }
 
-/// The unpacked version goes in: the installed package files into `.backup-<this version>`, the
-/// new ones in their place, the new launcher started.
-fn install(app: &mut App, version: &str, changes: &str, staging: &Path, names: &[String]) {
+/// The unpacked version goes in: the installed package files into `.regaliant-backup-<this
+/// version>`, the new ones in their place, the new launcher started.
+fn install(app: &mut App, s: &Staged) {
+    // (The launcher's own check of the game first: it runs the game's program for a moment.)
+    crate::shaders::wait_check();
     if let Some(why) = busy(app) {
-        log(app, &format!("{version} unpacked, not installed: {why}"));
+        log(app, &format!("{} unpacked, not installed: {why}", s.version));
         app.set_status(&format!("{why} Then press Update again."));
         return;
     }
     let mut out = package_names();
-    for n in names {
+    for n in &s.names {
         if !out.iter().any(|o| o.eq_ignore_ascii_case(n)) {
             out.push(n.clone());
         }
     }
-    let backup = backup_dir(app, VERSION);
-    if let Err(e) = swap(&app.paths.exe_dir, staging, names, &out, &backup) {
-        log(app, &format!("{version} not installed: {e}"));
+    let install = app.paths.exe_dir.clone();
+    let backup = backup_dir(&install, VERSION);
+    if let Err(e) = swap(&install, &s.dir, &s.names, &out, &backup) {
+        log(app, &format!("{} not installed: {e}", s.version));
         app.set_status(&format!("The update could not be installed: {e}. Regaliant {VERSION} stays."));
         return;
     }
-    let _ = std::fs::remove_dir_all(staging);
-    log(app, &format!("{version} installed, {VERSION} kept in {}", backup.file_name().unwrap_or_default().to_string_lossy()));
+    app.update.staged = None;
+    let _ = std::fs::remove_dir_all(&s.dir);
+    log(app, &format!("{} installed, {VERSION} kept in {}", s.version, backup.file_name().unwrap_or_default().to_string_lossy()));
     let dir = download_dir(app);
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("changes.txt"), format!("{version}\n{changes}\n"));
-    restart(app, &format!("Regaliant {version} is installed. Start the launcher again."));
+    let _ = std::fs::write(dir.join("changes.txt"), format!("{}\n{}\n", s.version, s.changes));
+    app.update.handoff = Some(Handoff { from: VERSION.to_string(), to: s.version.clone(), names: s.names.clone() });
+    hand_over(app);
 }
 
-/// Roll back: the backup's version goes back in, the current one into `.rolled-back-<version>`
-/// (removed at the next start).
+/// Starts the installed launcher and waits on a thread of its own for it to say it is up (a named
+/// event it sets once its window shows); `WM_STARTED` says how that went.
+fn hand_over(app: &mut App) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
+    let name = ui::wide(&ready_event_name(std::process::id()));
+    let ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+    let exe = app.paths.exe_dir.join(LAUNCHER_EXE);
+    let child = spawn_quiet(std::process::Command::new(&exe).arg("--after-update").arg(std::process::id().to_string()).current_dir(&app.paths.exe_dir));
+    let hwnd = app.hwnd as usize;
+    match child {
+        Ok(child) if !ev.is_null() => {
+            unsafe { ShowWindow(app.hwnd, SW_HIDE) };
+            let ev = ev as usize;
+            std::thread::spawn(move || {
+                let handles: [HANDLE; 2] = [ev as HANDLE, child.as_raw_handle() as HANDLE];
+                let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, START_WAIT_MS) };
+                unsafe { CloseHandle(ev as HANDLE) };
+                drop(child);
+                unsafe { PostMessageW(hwnd as HWND, WM_STARTED, (r == WAIT_OBJECT_0) as usize, 0) };
+            });
+        }
+        other => {
+            if !ev.is_null() {
+                unsafe { CloseHandle(ev) };
+            }
+            log(app, &format!("the new launcher did not start: {:?}", other.err()));
+            unsafe { PostMessageW(hwnd as HWND, WM_STARTED, 0, 0) };
+        }
+    }
+}
+
+/// Starts `cmd` with Windows' own error boxes off for this call (a program file that is not one
+/// then fails here, where a system box would have held the window), the program itself given
+/// Windows' default error mode.
+fn spawn_quiet(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetThreadErrorMode};
+    const CREATE_DEFAULT_ERROR_MODE: u32 = 0x0400_0000;
+    let mut old = 0;
+    unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX, &mut old) };
+    let r = cmd.creation_flags(CREATE_DEFAULT_ERROR_MODE).spawn();
+    unsafe { SetThreadErrorMode(old, std::ptr::null_mut()) };
+    r
+}
+
+fn ready_event_name(pid: u32) -> String {
+    format!("Local\\RegaliantUpdateReady-{pid}")
+}
+
+/// A launcher started by an update (`--after-update <pid>`), its window shown: tells the one that
+/// started it.
+pub fn signal_ready(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    let name = ui::wide(&ready_event_name(pid));
+    unsafe {
+        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+        if !ev.is_null() {
+            SetEvent(ev);
+            CloseHandle(ev);
+        }
+    }
+}
+
+/// The new launcher is up (this one closes), or it did not come up: the earlier version back.
+fn started(app: &mut App, ok: bool) {
+    let Some(h) = app.update.handoff.take() else { return };
+    if ok {
+        log(app, &format!("{} is up", h.to));
+        unsafe { PostMessageW(app.hwnd, WM_CLOSE, 0, 0) };
+        return;
+    }
+    let install = app.paths.exe_dir.clone();
+    let from = backup_dir(&install, &h.from);
+    let names = files_under(&from);
+    let mut out = package_names();
+    for n in h.names.iter().chain(names.iter()) {
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(n)) {
+            out.push(n.clone());
+        }
+    }
+    let r = swap(&install, &from, &names, &out, &rolled_dir(&install, &h.to));
+    unsafe {
+        ShowWindow(app.hwnd, SW_SHOW);
+        SetForegroundWindow(app.hwnd);
+    }
+    // (The note of what the new version changed is not for this one.)
+    let _ = std::fs::remove_file(download_dir(app).join("changes.txt"));
+    let text = match r {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&from);
+            log(app, &format!("{} did not come up: {} put back", h.to, h.from));
+            format!("Regaliant {} did not start, so Regaliant {} is back. Please report this.", h.to, h.from)
+        }
+        Err(e) => {
+            log(app, &format!("{} did not come up, and {} could not be put back: {e}", h.to, h.from));
+            format!("Regaliant {} did not start, and Regaliant {} could not be put back: {e}", h.to, h.from)
+        }
+    };
+    app.update.backup = find_backup(app);
+    app.set_status(&text);
+    unsafe { ui::message(app.hwnd, &text, TITLE, MB_ICONWARNING | MB_OK) };
+    refresh(app);
+}
+
+/// Roll back: the backup's version goes back in, the current one into
+/// `.regaliant-rolled-back-<version>` (removed at the next start). The earlier launcher may have no
+/// update code of its own, so this one's window goes before it starts (one launcher at a time).
 fn roll_back(app: &mut App) {
     let Some(old) = app.update.backup.clone() else { return };
     if let Some(why) = busy(app) {
@@ -624,9 +1003,11 @@ fn roll_back(app: &mut App) {
     if unsafe { ui::message(app.hwnd, &t, TITLE, MB_ICONQUESTION | MB_YESNO) } != IDYES {
         return;
     }
-    let from = backup_dir(app, &old);
+    let install = app.paths.exe_dir.clone();
+    let from = backup_dir(&install, &old);
     let names = files_under(&from);
-    if !names.iter().any(|n| n.eq_ignore_ascii_case(LAUNCHER_EXE)) || !names.iter().any(|n| n.eq_ignore_ascii_case(GAME_EXE)) {
+    let valid = names.iter().all(|n| valid_name(n).as_deref() == Some(n.as_str()));
+    if !valid || !names.iter().any(|n| n.eq_ignore_ascii_case(LAUNCHER_EXE)) || !names.iter().any(|n| n.eq_ignore_ascii_case(GAME_EXE)) {
         app.set_status(&format!("The backup of Regaliant {old} is not complete. It cannot be put back."));
         return;
     }
@@ -636,48 +1017,24 @@ fn roll_back(app: &mut App) {
             out.push(n.clone());
         }
     }
-    // (Not `.backup-<this version>`: a backup of this same version is the one being put back.)
-    let current = app.paths.exe_dir.join(format!(".rolled-back-{VERSION}"));
-    if let Err(e) = swap(&app.paths.exe_dir, &from, &names, &out, &current) {
+    if let Err(e) = swap(&install, &from, &names, &out, &rolled_dir(&install, VERSION)) {
         log(app, &format!("roll back to {old} failed: {e}"));
         app.set_status(&format!("Regaliant {old} could not be put back: {e}."));
         return;
     }
     let _ = std::fs::remove_dir_all(&from);
     log(app, &format!("rolled back to {old}"));
-    restart(app, &format!("Regaliant {old} is back. Start the launcher again."));
-}
-
-/// Starts the launcher now in the install (it waits for this one to end) and closes this one.
-fn restart(app: &mut App, if_not: &str) {
-    let exe = app.paths.exe_dir.join(LAUNCHER_EXE);
-    let started = std::process::Command::new(&exe).arg("--after-update").arg(std::process::id().to_string()).current_dir(&app.paths.exe_dir).spawn();
-    if started.is_err() {
-        unsafe { ui::message(app.hwnd, if_not, TITLE, MB_ICONINFORMATION | MB_OK) };
-    }
-    unsafe { PostMessageW(app.hwnd, WM_CLOSE, 0, 0) };
-}
-
-/// A launcher started by an update (`--after-update <pid>`): waits for the one that started it.
-pub fn wait_for(pid: u32) {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-    unsafe {
-        let p = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if !p.is_null() {
-            WaitForSingleObject(p, 20_000);
-            CloseHandle(p);
-        }
+    let exe = install.join(LAUNCHER_EXE);
+    unsafe { DestroyWindow(app.hwnd) };
+    if spawn_quiet(std::process::Command::new(&exe).current_dir(&install)).is_err() {
+        let w = ui::wide(&format!("Regaliant {old} is back. Start the launcher again."));
+        let t = ui::wide(TITLE);
+        unsafe { MessageBoxW(std::ptr::null_mut(), w.as_ptr(), t.as_ptr(), MB_ICONINFORMATION | MB_OK) };
     }
 }
 
-/// At a start after an update or a roll back: what changed, once; the update's leftovers removed.
+/// At a start after an update: what changed, once; the update's leftovers removed.
 pub fn after_start(app: &mut App) {
-    for e in std::fs::read_dir(&app.paths.exe_dir).into_iter().flatten().flatten() {
-        if e.file_name().to_string_lossy().starts_with(".update-") {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
     let notes = download_dir(app).join("changes.txt");
     let Ok(t) = std::fs::read_to_string(&notes) else { return };
     let _ = std::fs::remove_file(&notes);
@@ -695,7 +1052,7 @@ pub fn after_start(app: &mut App) {
 }
 
 /// The Changes section for a message box: each "- " item one paragraph with a bullet (the
-/// changelog's wrapped lines joined), blank lines kept between items out.
+/// changelog's wrapped lines joined), blank lines between items left out.
 fn changes_text(changes: &str) -> String {
     let mut items: Vec<String> = Vec::new();
     for line in changes.lines() {
@@ -720,7 +1077,7 @@ fn changes_text(changes: &str) -> String {
 /// A game session ended normally: the earlier version's backup goes.
 pub fn session_ok(app: &mut App) {
     if let Some(old) = app.update.backup.take() {
-        let _ = std::fs::remove_dir_all(backup_dir(app, &old));
+        let _ = std::fs::remove_dir_all(backup_dir(&app.paths.exe_dir, &old));
         log(app, &format!("the backup of {old} removed after a normal session"));
         refresh(app);
     }
@@ -730,6 +1087,12 @@ pub fn session_ok(app: &mut App) {
 mod http {
     use crate::ui::wide;
     use windows_sys::Win32::Networking::WinHttp::*;
+
+    /// The answer's status, and for a range the first byte it holds.
+    pub struct Answer {
+        pub status: u32,
+        pub range_start: Option<u64>,
+    }
 
     struct H(*mut core::ffi::c_void);
     impl Drop for H {
@@ -744,9 +1107,17 @@ mod http {
         format!("{what} failed ({})", std::io::Error::last_os_error())
     }
 
+    /// Whether `url` names this PC itself (tests only).
+    pub fn local(url: &str) -> bool {
+        let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).unwrap_or("");
+        let host = rest.split(['/', '?']).next().unwrap_or("");
+        let host = host.rsplit_once(':').filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit())).map_or(host, |(h, _)| h);
+        matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "[::1]")
+    }
+
     /// GET `url` (https, or http to this PC's own address for tests), from byte `from` on (a
-    /// range) when not 0: its status code; its body goes to `sink` in pieces, with the status.
-    pub fn get(url: &str, from: u64, accept: &str, sink: &mut dyn FnMut(u32, &[u8]) -> Result<(), String>) -> Result<u32, String> {
+    /// range) when not 0: its status code; its body goes to `sink` in pieces, with the answer.
+    pub fn get(url: &str, from: u64, accept: &str, sink: &mut dyn FnMut(&Answer, &[u8]) -> Result<(), String>) -> Result<u32, String> {
         let w = wide(url);
         let mut host = vec![0u16; 256];
         let mut path = vec![0u16; 4096];
@@ -790,6 +1161,11 @@ mod http {
             if r.0.is_null() {
                 return Err(failed("the request"));
             }
+            if !secure {
+                // (A test server's answer is not followed anywhere else.)
+                let never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+                WinHttpSetOption(r.0, WINHTTP_OPTION_REDIRECT_POLICY, &never as *const u32 as *const _, 4);
+            }
             let mut headers = format!("Accept: {accept}\r\n");
             if from > 0 {
                 headers += &format!("Range: bytes={from}-\r\n");
@@ -807,6 +1183,15 @@ mod http {
             if WinHttpQueryHeaders(r.0, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, std::ptr::null(), &mut status as *mut u32 as *mut _, &mut len, std::ptr::null_mut()) == 0 {
                 return Err(failed("the answer's status"));
             }
+            let mut range_start = None;
+            if status == 206 {
+                let mut buf = vec![0u16; 128];
+                let mut len = (buf.len() * 2) as u32;
+                if WinHttpQueryHeaders(r.0, WINHTTP_QUERY_CONTENT_RANGE, std::ptr::null(), buf.as_mut_ptr() as *mut _, &mut len, std::ptr::null_mut()) != 0 {
+                    range_start = content_range_start(&String::from_utf16_lossy(&buf[..(len / 2) as usize]));
+                }
+            }
+            let answer = Answer { status, range_start };
             let mut buf = vec![0u8; 1 << 16];
             loop {
                 let mut n = 0u32;
@@ -816,10 +1201,15 @@ mod http {
                 if n == 0 {
                     break;
                 }
-                sink(status, &buf[..n as usize])?;
+                sink(&answer, &buf[..n as usize])?;
             }
             Ok(status)
         }
+    }
+
+    /// The first byte of a `Content-Range: bytes <first>-<last>/<size>` header.
+    pub fn content_range_start(v: &str) -> Option<u64> {
+        v.trim().strip_prefix("bytes ")?.split('-').next()?.trim().parse().ok()
     }
 }
 
@@ -959,9 +1349,46 @@ mod tests {
     fn names() {
         assert_eq!(valid_name("upscalers/libxess.dll").as_deref(), Some("upscalers\\libxess.dll"));
         assert_eq!(valid_name("regaliant.exe").as_deref(), Some("regaliant.exe"));
-        for bad in ["../x.exe", "a/../../x", "/x.exe", "C:/x.exe", "c:x", "user/saves/x", "portable.txt", "upscalers/nvngx_dlss.dll", "a//b", "a/b/c/d/e", ""] {
+        assert_eq!(valid_name("README.txt").as_deref(), Some("README.txt"));
+        for bad in [
+            "../x.exe",
+            "a/../../x",
+            "/x.exe",
+            "C:/x.exe",
+            "c:x",
+            "x.exe:stream",
+            "user/saves/x",
+            "user./saves/x",
+            "portable.txt",
+            "portable.txt.",
+            "portable.txt ",
+            "upscalers/nvngx_dlss.dll",
+            "upscalers/nvngx_dlss.dll.",
+            "UPSCAL~1/nvngx_dlss.dll",
+            "upscalers/NVNGX_~1.DLL",
+            "NUL",
+            "con.txt",
+            "upscalers/COM1.dll",
+            "CONIN$",
+            ".regaliant-backup-0.1.8/x",
+            "a//b",
+            "a/b/c/d/e",
+            "",
+        ] {
             assert_eq!(valid_name(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn local_addresses() {
+        assert!(http::local("http://127.0.0.1:8765/latest.json"));
+        assert!(http::local("https://localhost/x"));
+        assert!(http::local("http://[::1]:80/x"));
+        assert!(!http::local("https://api.github.com/repos/x"));
+        assert!(!http::local("https://127.0.0.1.example.com/x"));
+        assert!(!http::local("http://evil.com/127.0.0.1"));
+        assert_eq!(http::content_range_start("bytes 1000-1999/5000"), Some(1000));
+        assert_eq!(http::content_range_start("bytes */5000"), None);
     }
 
     #[test]
@@ -1051,20 +1478,29 @@ mod tests {
     #[test]
     fn unpacks_and_refuses() {
         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let z = make_zip(&[("regaliant.exe", &big, true), ("regaliant-launcher.exe", b"STORED BYTES", false), ("upscalers/libxess.dll", b"xess", true)]);
+        let z = make_zip(&[("regaliant.exe", &big, true), ("regaliant-launcher.exe", b"STORED BYTES", false), ("upscalers/libxess.dll", b"xess", true), ("README.txt", "\u{feff}Regaliant 0.2.0 - a test\r\n".as_bytes(), false)]);
         let d = temp("unpack");
-        let names = unpack(&z, &d.join("stage")).unwrap();
-        assert_eq!(names, vec!["regaliant.exe", "regaliant-launcher.exe", "upscalers\\libxess.dll"]);
-        assert_eq!(std::fs::read(d.join("stage").join("regaliant.exe")).unwrap(), big);
+        let stage = d.join(format!("{STAGE_PREFIX}0.2.0"));
+        let names = unpack(&z, &stage).unwrap();
+        assert_eq!(names, vec!["regaliant.exe", "regaliant-launcher.exe", "upscalers\\libxess.dll", "README.txt"]);
+        assert_eq!(std::fs::read(stage.join("regaliant.exe")).unwrap(), big);
+        assert!(ours(&stage));
+        assert_eq!(readme_version(&stage), Some((0, 2, 0)));
         // A changed byte in a stored file: its CRC-32 no longer matches.
         let mut bad = z.clone();
         let at = bad.windows(12).position(|w| w == b"STORED BYTES").unwrap();
         bad[at] ^= 1;
-        assert!(unpack(&bad, &d.join("bad")).is_err());
+        assert!(unpack(&bad, &d.join(format!("{STAGE_PREFIX}bad"))).is_err());
         // A name outside the package's places, and a package without the game.
-        assert!(unpack(&make_zip(&[("../evil.exe", b"x", false), ("regaliant.exe", b"g", false), ("regaliant-launcher.exe", b"l", false)]), &d.join("evil")).is_err());
-        assert!(unpack(&make_zip(&[("regaliant-launcher.exe", b"l", false)]), &d.join("nogame")).is_err());
-        assert!(unpack(b"not a zip", &d.join("junk")).is_err());
+        assert!(unpack(&make_zip(&[("../evil.exe", b"x", false), ("regaliant.exe", b"g", false), ("regaliant-launcher.exe", b"l", false)]), &d.join(format!("{STAGE_PREFIX}evil"))).is_err());
+        assert!(unpack(&make_zip(&[("regaliant-launcher.exe", b"l", false)]), &d.join(format!("{STAGE_PREFIX}nogame"))).is_err());
+        assert!(unpack(b"not a zip", &d.join(format!("{STAGE_PREFIX}junk"))).is_err());
+        // A folder of the same name that is not the update's own is not replaced.
+        let theirs = d.join(format!("{STAGE_PREFIX}theirs"));
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("keep.txt"), "mine").unwrap();
+        assert!(unpack(&z, &theirs).is_err());
+        assert!(theirs.join("keep.txt").is_file());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1085,33 +1521,86 @@ mod tests {
         }
     }
 
+    fn put(dir: &Path, files: &[(&str, &str)]) {
+        for (n, t) in files {
+            let p = dir.join(n);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        }
+    }
+
+    fn read(dir: &Path, n: &str) -> String {
+        std::fs::read_to_string(dir.join(n)).unwrap_or_default()
+    }
+
     #[test]
     fn swaps_and_puts_back() {
         let d = temp("swap");
-        let (inst, inc, bak) = (d.join("inst"), d.join("inc"), d.join("bak"));
-        for (dir, tag) in [(&inst, "old"), (&inc, "new")] {
-            std::fs::create_dir_all(dir.join("upscalers")).unwrap();
-            std::fs::write(dir.join("regaliant.exe"), tag).unwrap();
-            std::fs::write(dir.join("upscalers").join("libxess.dll"), tag).unwrap();
-        }
-        // The player's own file beside the package's stays where it is.
-        std::fs::write(inst.join("upscalers").join("nvngx_dlss.dll"), "mine").unwrap();
-        let names: Vec<String> = vec!["regaliant.exe".into(), "upscalers\\libxess.dll".into()];
+        let (inst, inc) = (d.join("inst"), d.join(format!("{STAGE_PREFIX}1")));
+        put(&inst, &[("regaliant.exe", "old"), ("regaliant-launcher.exe", "old"), ("upscalers\\libxess.dll", "old"), ("upscalers\\nvngx_dlss.dll", "mine")]);
+        make_ours(&inc).unwrap();
+        put(&inc, &[("regaliant.exe", "new"), ("regaliant-launcher.exe", "new"), ("upscalers\\libxess.dll", "new")]);
+        let names: Vec<String> = vec!["regaliant.exe".into(), "upscalers\\libxess.dll".into(), "regaliant-launcher.exe".into()];
         let mut out = names.clone();
         out.push("README.txt".into());
+        let bak = backup_dir(&inst, "1");
         swap(&inst, &inc, &names, &out, &bak).unwrap();
-        assert_eq!(std::fs::read_to_string(inst.join("regaliant.exe")).unwrap(), "new");
-        assert_eq!(std::fs::read_to_string(bak.join("upscalers").join("libxess.dll")).unwrap(), "old");
-        assert_eq!(std::fs::read_to_string(inst.join("upscalers").join("nvngx_dlss.dll")).unwrap(), "mine");
-        // A failure halfway (an incoming file missing): everything back as it was.
-        let inc2 = d.join("inc2");
-        std::fs::create_dir_all(&inc2).unwrap();
-        std::fs::write(inc2.join("regaliant.exe"), "newer").unwrap();
-        let bak2 = d.join("bak2");
+        assert_eq!(read(&inst, "regaliant.exe"), "new");
+        assert_eq!(read(&inst, "regaliant-launcher.exe"), "new");
+        assert_eq!(read(&bak, "upscalers\\libxess.dll"), "old");
+        assert!(ours(&bak));
+        // The player's own file beside the package's stays where it is; no journal is left.
+        assert_eq!(read(&inst, "upscalers\\nvngx_dlss.dll"), "mine");
+        assert!(!inst.join(JOURNAL).exists());
+        // A failure halfway (an incoming file missing): everything back as it was, the failed
+        // swap's backup folder gone, no journal.
+        let inc2 = d.join(format!("{STAGE_PREFIX}2"));
+        make_ours(&inc2).unwrap();
+        put(&inc2, &[("regaliant-launcher.exe", "newer")]);
+        let bak2 = backup_dir(&inst, "2");
         assert!(swap(&inst, &inc2, &names, &out, &bak2).is_err());
-        assert_eq!(std::fs::read_to_string(inst.join("regaliant.exe")).unwrap(), "new");
-        assert_eq!(std::fs::read_to_string(inst.join("upscalers").join("libxess.dll")).unwrap(), "new");
-        assert_eq!(std::fs::read_to_string(inc2.join("regaliant.exe")).unwrap(), "newer");
+        assert_eq!(read(&inst, "regaliant.exe"), "new");
+        assert_eq!(read(&inst, "regaliant-launcher.exe"), "new");
+        assert_eq!(read(&inst, "upscalers\\libxess.dll"), "new");
+        assert_eq!(read(&inc2, "regaliant-launcher.exe"), "newer");
+        assert!(!bak2.exists());
+        assert!(!inst.join(JOURNAL).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A swap a crash stopped halfway (the journal left, some files moved): `recover` puts every
+    /// file back where it was.
+    #[test]
+    fn interrupted_swap_undone() {
+        let d = temp("recover");
+        let inst = d.join("inst");
+        put(&inst, &[("regaliant.exe", "old"), ("regaliant-launcher.exe", "old"), ("README.txt", "old")]);
+        // (In the install, as a real swap keeps it: the journal names folders there.)
+        let inc = inst.join(format!("{STAGE_PREFIX}9.9.9"));
+        make_ours(&inc).unwrap();
+        put(&inc, &[("regaliant.exe", "new"), ("regaliant-launcher.exe", "new"), ("README.txt", "new")]);
+        let bak = backup_dir(&inst, "0.0.1");
+        make_ours(&bak).unwrap();
+        // As a swap leaves it after moving all out and the launcher in: the journal first.
+        let j = format!(
+            "regaliant update journal\nincoming = {}\nbackup = {}\nin = regaliant-launcher.exe\nin = regaliant.exe\nin = README.txt\nout = regaliant.exe\nout = README.txt\nout = regaliant-launcher.exe\n",
+            inc.file_name().unwrap().to_string_lossy(),
+            bak.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(inst.join(JOURNAL), j).unwrap();
+        for n in ["regaliant.exe", "README.txt", "regaliant-launcher.exe"] {
+            std::fs::rename(inst.join(n), bak.join(n)).unwrap();
+        }
+        std::fs::rename(inc.join("regaliant-launcher.exe"), inst.join("regaliant-launcher.exe")).unwrap();
+        let paths = dsconfig::paths::Paths { layout: Layout::Portable, exe_dir: inst.clone(), user: d.join("user"), cache: d.join("user"), root: None };
+        let note = recover_at(&paths).unwrap();
+        assert!(note.contains("undone"), "{note}");
+        for n in ["regaliant.exe", "regaliant-launcher.exe", "README.txt"] {
+            assert_eq!(read(&inst, n), "old", "{n}");
+            assert_eq!(read(&inc, n), "new", "{n}");
+        }
+        assert!(!inst.join(JOURNAL).exists());
+        assert!(!bak.exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

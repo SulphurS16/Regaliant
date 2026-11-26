@@ -273,6 +273,10 @@ fn perform(paths: &Paths, others: &[PathBuf], delete_saves: bool) -> (Vec<String
             remove(&p, &mut failed);
         }
     }
+    // The update's own folders (earlier versions' backups, unfinished updates) and its journal.
+    for p in crate::update::own_files(&paths.exe_dir) {
+        remove(&p, &mut failed);
+    }
     let up = paths.exe_dir.join("upscalers");
     let _ = std::fs::remove_dir(&up);
     let mut kept = Vec::new();

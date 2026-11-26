@@ -156,8 +156,6 @@ fn translate_one(shader_dir: &std::path::Path, addr: u64, u: &Use) -> Result<Out
         part_twice: false,
         dep_loads: false,
         marks_part: false,
-        // RDNA_MARKS_WF=1: `Spec::marks_wf` (validation).
-        marks_wf: std::env::var_os("RDNA_MARKS_WF").is_some(),
         marks_held: false,
         // RDNA_SGPR_UBO=<n>: `Spec::sgpr_ubo` (validation).
         sgpr_ubo: std::env::var("RDNA_SGPR_UBO").ok().and_then(|v| v.parse().ok()).unwrap_or(0),

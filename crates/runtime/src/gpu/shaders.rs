@@ -2166,7 +2166,6 @@ fn cs_spec(addr: u64, rsrc2: u32, local: [u32; 3], wave64: bool, code_hash: u64)
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
-        marks_wf: marks_wf_wanted(),
         marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -2502,15 +2501,6 @@ fn marks_part_wanted() -> bool {
     marks_wanted() && super::vk::subgroup_partitioned() && !*OFF.get_or_init(|| std::env::var("DS_MARKS_PART").ok().as_deref() == Some("0"))
 }
 
-/// Where the marks are not partitioned (AMD, Intel; `DS_MARKS_PART=0` here): the waterfall form
-/// (`Spec::marks_wf`) in place of the near and far lanes' form. `DS_MARKS_WF=1` (boot; a spec field,
-/// so translations are keyed apart) until its A/B decides the default: the near/far form cost
-/// ~+38% of this RTX 4090's GPU time a frame at the gate (FINDINGS.md 2026-11-26 evening).
-fn marks_wf_wanted() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    marks_wanted() && !marks_part_wanted() && *ON.get_or_init(|| std::env::var("DS_MARKS_WF").ok().as_deref() == Some("1"))
-}
-
 /// C5: stores into pages front end 4 holds set no marks (`Spec::marks_held`,
 /// with C4; `DS_C5=0` off, a spec field, so translations are keyed apart).
 fn marks_held_wanted() -> bool {
@@ -2812,7 +2802,6 @@ fn ps_spec(addr: u64, rsrc2: u32, ctx: &dyn Fn(u32) -> u32) -> Spec {
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
-        marks_wf: marks_wf_wanted(),
         marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -3178,7 +3167,6 @@ fn ngg_spec(addr: u64, rsrc2: u32, stages: u32, insts: &[rdna::Inst]) -> Spec {
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
-        marks_wf: marks_wf_wanted(),
         marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -4270,7 +4258,6 @@ pub(crate) fn vertex_spec(addr: u64, user_sgprs: u16, wave64: bool, base_instanc
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
-        marks_wf: marks_wf_wanted(),
         marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -4332,7 +4319,6 @@ pub(crate) fn pixel_spec(addr: u64, user_sgprs: u16, wave64: bool, ps_input_addr
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
-        marks_wf: marks_wf_wanted(),
         marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,
@@ -4412,7 +4398,6 @@ pub(crate) fn compute_spec(addr: u64, code_hash: u64, rsrc2: u32, local: [u32; 3
         part_twice: marks_wanted() && super::tune::tr_ballast() & 8 != 0,
         dep_loads: super::tune::tr_ballast() & 2 != 0,
         marks_part: marks_part_wanted(),
-        marks_wf: marks_wf_wanted(),
         marks_held: marks_held_wanted(),
         sgpr_ubo: super::tune::sgpr_ubo(),
         gpu_loads: 0,

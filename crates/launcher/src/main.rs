@@ -413,7 +413,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == shaders::CHECK_TIMER => with_app(shaders::check_tick).is_some(),
         WM_TIMER if wp == game::TIMER => with_app(game::tick).is_some(),
         WM_TIMER if wp == update::TIMER => with_app(update::tick).is_some(),
-        update::WM_CHECKED => with_app(update::checked).is_some(),
+        WM_TIMER if wp == update::RETRY_TIMER => {
+            update::retry_now(hwnd);
+            true
+        }
+        // (Came while a dialog held the app: posted again shortly, not lost.)
+        update::WM_CHECKED | update::WM_STARTED => {
+            if with_app(|app| update::message(app, msg, wp)).is_none() {
+                update::retry_later(hwnd, msg, wp);
+            }
+            true
+        }
         WM_GAME_EXIT => {
             handle_exit(hwnd, wp);
             true
@@ -473,14 +483,13 @@ fn main() {
         InitCommonControlsEx(&icc);
         let hinst = GetModuleHandleW(std::ptr::null());
         let class = wide("regaliant_launcher");
-        // (Started by an update or a roll back: the launcher that started it closes first.)
+        // (Started by an update: the launcher that started it waits, hidden, until this one says it
+        // is up, and puts the earlier version back otherwise.)
         let after_update = arg("--after-update").and_then(|p| p.parse::<u32>().ok());
-        if let Some(pid) = after_update {
-            update::wait_for(pid);
-        }
         // One launcher at a time (two could prepare the shaders twice): a second start brings
-        // the first one to the front. (`--shot` runs are layout checks: they may run beside one.)
-        if arg("--shot").is_none() {
+        // the first one to the front. (`--shot` runs are layout checks: they may run beside one;
+        // so does a launcher an update started, beside the hidden one that started it.)
+        if arg("--shot").is_none() && after_update.is_none() {
             let other = FindWindowW(class.as_ptr(), std::ptr::null());
             if !other.is_null() {
                 ShowWindow(other, SW_RESTORE);
@@ -598,8 +607,10 @@ fn main() {
             ShowWindow(hwnd, SW_SHOW);
         }
         ui::redraw(hwnd);
-        // (What the update changed, once, over the shown window; its leftovers removed.)
-        if after_update.is_some() {
+        // (Up: the launcher that started this one may close. Then what the update changed, once,
+        // over the shown window.)
+        if let Some(pid) = after_update {
+            update::signal_ready(pid);
             with_app(update::after_start);
         }
         if let Some(file) = shot {
