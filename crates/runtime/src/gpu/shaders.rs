@@ -260,6 +260,8 @@ impl<T> std::ops::Deref for Local<T> {
 
 #[derive(Clone)]
 pub struct Translated {
+    pub program_hash: u64,
+    pub binding_facts: super::record_opts::BindingFacts,
     pub out: Output,
     pub plan: Arc<Plan>,
     /// Cache key (program hash ^ specialization hash).
@@ -1683,7 +1685,7 @@ fn fmt_worker(name: String) {
     use std::sync::atomic::Ordering;
     crate::log::set_thread_name(&name);
     unsafe {
-        windows_sys::Win32::System::Threading::SetThreadPriority(windows_sys::Win32::System::Threading::GetCurrentThread(), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
+        crate::platform::os::Win32::System::Threading::SetThreadPriority(crate::platform::os::Win32::System::Threading::GetCurrentThread(), crate::platform::os::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL);
     }
     loop {
         let j = {
@@ -2294,7 +2296,7 @@ pub(crate) fn apply_modes(spec: &mut rdna::translate::Spec, code_hash: u64) {
 /// portable mode is the default since then. `DS_PLAIN_MODES=1` / `0` forces it on or off (an
 /// A/B: the stored specs are keyed with the modes, so their programs then compile at their first
 /// dispatch).
-fn plain_modes() -> bool {
+pub(crate) fn plain_modes() -> bool {
     static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     let forced = *FORCED.get_or_init(|| match std::env::var("DS_PLAIN_MODES").ok().as_deref() {
         Some("1") => Some(true),
@@ -3771,7 +3773,9 @@ fn translated(insts: &[rdna::Inst], out: Output, plan: &Arc<Plan>, plan_key: u64
         .collect();
     atomic_res.sort_unstable();
     atomic_res.dedup();
-    Translated { out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
+    let program_hash = plan_key ^ (key_spec.user_sgprs as u64) << 48 ^ (key_spec.user_base as u64) << 56;
+    let binding_facts = super::record_opts::BindingFacts::new(plan, &out.bindings);
+    Translated { program_hash, binding_facts, out, plan: Arc::clone(plan), key: plan_key ^ spec_hash.rotate_left(1), atomic_res, spec: key_spec }
 }
 
 /// `translate_code_for_spec` keeping neither the translation nor its plan,
@@ -4494,6 +4498,7 @@ impl Drop for PlanRecGuard {
 /// `tmpl`: R2's number of the stage template `spec` comes from (0: none),
 /// which the plan's latest translation is checked against (`PlanRec`).
 fn prepare(addr: u64, insts: Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], spec: &mut Spec, tmpl: u64) -> Result<Prepared, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ShaderPrepare);
     // Diagnostics (DS_PROFILE_GPU with DS_PROFILE_REPEATS=1: hashing every
     // word read and a global set per preparation inflate the prepare times
     // the profile reports): the inputs that would key a cached preparation.

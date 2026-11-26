@@ -24,24 +24,11 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::UI::Input::XboxController::{XINPUT_GAMEPAD, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState};
+use crate::platform::controller::{XINPUT_GAMEPAD, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState};
 
-pub const BTN_L3: u32 = 0x2;
-pub const BTN_R3: u32 = 0x4;
-pub const BTN_OPTIONS: u32 = 0x8;
-pub const BTN_UP: u32 = 0x10;
-pub const BTN_RIGHT: u32 = 0x20;
-pub const BTN_DOWN: u32 = 0x40;
-pub const BTN_LEFT: u32 = 0x80;
-pub const BTN_L2: u32 = 0x100;
-pub const BTN_R2: u32 = 0x200;
-pub const BTN_L1: u32 = 0x400;
-pub const BTN_R1: u32 = 0x800;
-pub const BTN_TRIANGLE: u32 = 0x1000;
-pub const BTN_CIRCLE: u32 = 0x2000;
-pub const BTN_CROSS: u32 = 0x4000;
-pub const BTN_SQUARE: u32 = 0x8000;
-pub const BTN_TOUCHPAD: u32 = 0x100000;
+#[path = "input_state.rs"]
+mod state;
+pub use state::*;
 
 /// The pad's buttons as XInput reports them (an Xbox controller's names): the layout file's
 /// name (`PadA = cross`), the menu's, and the XInput button bit (0: a trigger).
@@ -76,24 +63,6 @@ pub fn button_bit(target: &str) -> Option<u32> {
 /// A pad button's place in `PAD_BUTTONS` by its layout file name.
 fn pad_index(name: &str) -> Option<usize> {
     PAD_BUTTONS.iter().position(|(n, _, _)| n.eq_ignore_ascii_case(name.trim()))
-}
-
-/// Pad state in DS4 terms (sticks 0..255, centre 0x80; y grows downwards).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PadState {
-    pub buttons: u32,
-    pub lx: u8,
-    pub ly: u8,
-    pub rx: u8,
-    pub ry: u8,
-    pub l2: u8,
-    pub r2: u8,
-}
-
-impl Default for PadState {
-    fn default() -> Self {
-        PadState { buttons: 0, lx: 0x80, ly: 0x80, rx: 0x80, ry: 0x80, l2: 0, r2: 0 }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,7 +393,10 @@ static PAD_PS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 
 /// The pad in use is a PlayStation controller (read directly or behind Steam Input's pad).
 pub fn pad_is_playstation() -> bool {
-    PAD_PS.load(Relaxed)
+    #[cfg(windows)]
+    { PAD_PS.load(Relaxed) }
+    #[cfg(target_os = "linux")]
+    { crate::platform::controller::prompt_style() == 1 }
 }
 
 /// A controller's input past the dead zones: a button, a trigger past 40 of 255, a stick.
@@ -466,12 +438,12 @@ pub fn xinput_state() -> Option<XINPUT_STATE> {
     let (mut used_ps, mut used_xbox) = (false, false);
     let mut bits = 0u32;
     for i in 0..4usize {
-        if !x.on[i] && x.retry[i].is_some_and(|t| now < t) {
+        if !crate::platform::controller::poll_disconnected() && !x.on[i] && x.retry[i].is_some_and(|t| now < t) {
             continue;
         }
         // (Asking for a controller that is not there can take long, and this runs on the game's
         // thread: the empty slots one at a time, 250 ms apart, each at most once a second.)
-        if !x.on[i] && x.retry[i].is_some() && x.probe.is_some_and(|t| now < t) {
+        if !crate::platform::controller::poll_disconnected() && !x.on[i] && x.retry[i].is_some() && x.probe.is_some_and(|t| now < t) {
             continue;
         }
         let mut s: XINPUT_STATE = unsafe { std::mem::zeroed() };
@@ -481,7 +453,7 @@ pub fn xinput_state() -> Option<XINPUT_STATE> {
             any = true;
             if !x.on[i] {
                 x.first[i] = s.dwPacketNumber;
-                x.active[i] = false;
+                x.active[i] = crate::platform::controller::initial_sample_active();
                 crate::info!("controller: XInput controller {i} connected");
                 XINPUT_SEEN.store(true, Relaxed);
             } else if s.dwPacketNumber != x.first[i] {

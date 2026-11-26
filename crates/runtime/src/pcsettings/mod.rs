@@ -233,6 +233,14 @@ pub fn graphics_items() -> Vec<Item> {
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
+        #[cfg(target_os = "linux")]
+        Item {
+            id: s("FrameGeneration"),
+            label: s("Frame Generation (Experimental)"),
+            tooltip: s("FSR3 inserts an intermediate frame at native resolution. Adds latency. Requires the optional Linux FSR3 library and a restart after installing it."),
+            kind: ItemKind::Choice(vec![s("Off"), s("FSR3 2x")], 0),
+        },
+        #[cfg(windows)]
         Item {
             id: s("HdrOutput"),
             label: s("HDR"),
@@ -353,7 +361,20 @@ pub fn apply() {
     // the TAA here, which at the start it always was: a saved DLSS, FSR or XeSS never took effect
     // after a restart, while the menu still showed it (players' "DLSS not working", 2026-11-25).
     let aa = store::raw_value("Setting_PC_AntiAliasing").unwrap_or(AA_TAA);
-    convar::want("r_aaMethod", (aa == AA_OFF).then_some(0));
+    // Frame generation interpolates from the TAA pass's depth, motion vectors and camera: with
+    // the TAA off it has no inputs and stops (a player's session, 2026-11-25: Anti-Aliasing Off
+    // mid-game, and every frame after it real only). While it is on, Off keeps the TAA.
+    #[cfg(target_os = "linux")]
+    let fg = crate::gpu::framegen::wanted(get("FrameGeneration").unwrap_or(0));
+    #[cfg(not(target_os = "linux"))]
+    let fg = false;
+    if aa == AA_OFF && fg {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::info!("pc settings: Anti-Aliasing Off keeps the title's TAA while Frame Generation is on (its inputs are the TAA's)");
+        }
+    }
+    convar::want("r_aaMethod", (aa == AA_OFF && !fg).then_some(0));
     // (`DS_UPSCALER` decides in development runs.)
     if std::env::var_os("DS_UPSCALER").is_none() { crate::gpu::upscale::set_choice(match aa {
         AA_DLSS => "dlss",
@@ -372,6 +393,8 @@ pub fn apply() {
     // start only away from the default), and as defaults: DS_FRAME_CAP and DS_UNCAPPED, and
     // scripts' `tune` lines, still decide where they are given.
     static FRAME_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    #[cfg(target_os = "linux")]
+    crate::gpu::framegen::set_choice(get("FrameGeneration").unwrap_or(0));
     let limit = get("FrameRateLimit").unwrap_or(1).min(2);
     let was = FRAME_LIMIT.swap(limit, std::sync::atomic::Ordering::Relaxed);
     if was != limit && !(was == u32::MAX && limit == 1) {

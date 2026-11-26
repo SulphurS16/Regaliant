@@ -62,6 +62,15 @@ pub fn menu_depth() -> Option<u64> {
     vec_len(manager()?, 0x1260)
 }
 
+/// Identity of the current menu, for retrying a relay's known offline dialog only.
+#[cfg(target_os = "linux")]
+pub fn top_menu() -> Option<u64> {
+    let m = manager()?;
+    let n = vec_len(m, 0x1260)?;
+    if n == 0 { return None; }
+    rd64(rd64(m + 0x1260)? + (n - 1) * ENTRY).filter(|&p| p >= 0x1000)
+}
+
 /// Active HUD scenes.
 pub fn hud_count() -> Option<u64> {
     let m = manager()?;

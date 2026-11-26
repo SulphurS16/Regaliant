@@ -2332,7 +2332,10 @@ fn int_coord(tr: &mut T, idim: ImageDim, rdim: ImageDim, cs: Vec<Word>) -> R<Wor
     for c in cs.iter().take(n_space) {
         xy.push(*c);
     }
-    let layer = if is_array(idim) { cs.get(n_space).copied() } else { None };
+    let layer = if idim == ImageDim::Cube && rdim == ImageDim::D2Array {
+        // gfx10 integer cube addressing already supplies face_id = slice * 6 + face.
+        cs.get(2).copied()
+    } else if is_array(idim) { cs.get(n_space).copied() } else { None };
     if matches!(rdim, ImageDim::D1 | ImageDim::D1Array | ImageDim::D2 | ImageDim::D2Array | ImageDim::D2Msaa | ImageDim::D2MsaaArray) {
         while xy.len() < 2 {
             xy.push(tr.i(0));
@@ -2464,6 +2467,33 @@ fn image_with(tr: &mut T, ins: &Inst) -> R<()> {
         let ir = &tr.images[&ri];
         (ir.var, ir.img_ty, ir.dim, ir.class, ir.storage, ir.depth, ir.mips)
     };
+    if matches!(name, "image_load" | "image_load_mip") && matches!(rdim, ImageDim::Cube | ImageDim::CubeArray) {
+        // OpImageFetch cannot take Dim Cube, even for float results. Keep the cube variable
+        // for sampling, and read exactly the same texels through a 2D-array alias. No filtering,
+        // float conversion of data or change to LOD, swizzle, class or base array/mip range.
+        if storage || tr.image_tables.contains_key(&ri) {
+            return Err(format!("{:#x}: cube texel load through a storage image/table is unsupported", ins.pc));
+        }
+        let main = tr.images[&ri];
+        let faces = match tr.cube_faces.get(&ri).copied() {
+            Some(v) => v,
+            None => {
+                let sampled = match class { NumClass::Float => tr.t.f32, NumClass::Sint => tr.t.i32, NumClass::Uint => tr.t.u32 };
+                let ty = tr.b.type_image(sampled, spirv::Dim::Dim2D, 0, 1, 0, 1, spirv::ImageFormat::Unknown, None);
+                let pt = tr.b.type_pointer(None, StorageClass::UniformConstant, ty);
+                let v = tr.global_var(pt, StorageClass::UniformConstant);
+                let b = tr.alloc_binding(super::BindingKind::CubeFaces(ri));
+                tr.decorate_binding(v, b);
+                let faces = super::ImageRes { var: v, img_ty: ty, dim: ImageDim::D2Array, class, storage: false, depth, mips: false };
+                tr.cube_faces.insert(ri, faces);
+                faces
+            }
+        };
+        tr.images.insert(ri, faces);
+        let result = image_with(tr, ins);
+        tr.images.insert(ri, main);
+        return result;
+    }
     // 16-bit addresses (A16) and data (D16): image_load / image_store only.
     let (a16, d16) = (ins.mimg_a16(), ins.mimg_d16());
     let packed_ok = matches!(name, "image_load" | "image_load_mip" | "image_store" | "image_store_mip");

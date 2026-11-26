@@ -19,9 +19,18 @@ pub const APP_FOLDER: &str = "Regaliant";
 pub const PORTABLE_MARKER: &str = "portable.txt";
 /// The runtime's and the launcher's file names as shipped (the package names the development
 /// build's runtime, `GAME_EXE_DEV`, `GAME_EXE`).
+#[cfg(windows)]
 pub const GAME_EXE: &str = "regaliant.exe";
+#[cfg(target_os = "linux")]
+pub const GAME_EXE: &str = "regaliant";
+#[cfg(windows)]
 pub const GAME_EXE_DEV: &str = "dsport.exe";
+#[cfg(target_os = "linux")]
+pub const GAME_EXE_DEV: &str = "dsport";
+#[cfg(windows)]
 pub const LAUNCHER_EXE: &str = "regaliant-launcher.exe";
+#[cfg(target_os = "linux")]
+pub const LAUNCHER_EXE: &str = "regaliant-launcher";
 
 /// The runtime in the folder `dir` (the launcher's): `GAME_EXE`, or in a development build's
 /// output folder `GAME_EXE_DEV`.
@@ -88,6 +97,7 @@ impl Paths {
     }
 
     /// The installed layout's folders for a program in `exe_dir`.
+    #[cfg(windows)]
     pub fn installed(exe_dir: &Path) -> Paths {
         let env_dir = |name: &str| std::env::var_os(name).map(PathBuf::from).unwrap_or_else(|| exe_dir.to_path_buf());
         Paths {
@@ -99,8 +109,27 @@ impl Paths {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn installed(exe_dir: &Path) -> Paths {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| exe_dir.to_path_buf());
+        let xdg = |name: &str, fallback: &str| std::env::var_os(name).map(PathBuf::from)
+            .filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback));
+        Paths {
+            layout: Layout::Installed,
+            exe_dir: exe_dir.to_path_buf(),
+            user: xdg("XDG_DATA_HOME", ".local/share").join(APP_FOLDER),
+            cache: xdg("XDG_CACHE_HOME", ".cache").join(APP_FOLDER),
+            root: None,
+        }
+    }
+
     pub fn current() -> Paths {
-        Paths::for_exe(&std::env::current_exe().unwrap_or_default())
+        let paths = Paths::for_exe(&std::env::current_exe().unwrap_or_default());
+        // Linux player runs use XDG even from target/release. Development wrappers opt into
+        // checkout-local output explicitly with DSPORT_HOME; Windows layout detection stays.
+        #[cfg(target_os = "linux")]
+        if paths.layout == Layout::Dev { return Paths::installed(&paths.exe_dir); }
+        paths
     }
 
     /// A player's diagnostic switches (`DS_NAME=value` lines the game sets in its environment at

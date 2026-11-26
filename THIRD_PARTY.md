@@ -70,3 +70,15 @@ common controls and the Universal C Runtime.
 
 Demon's Souls is © Sony Interactive Entertainment Inc. The port contains none of its data or
 code. Each player provides their own copy.
+
+
+### Optional Linux FSR3 frame-generation backend
+
+`scripts/linux-build-framegen.py` builds source from the MIT-licensed
+[ychwch/FidelityFX-SDK-Linux](https://github.com/ychwch/FidelityFX-SDK-Linux) fork,
+pinned to `2c90b7f4b877b97e5779aa4d09d338c1e29cb75c` (AMD FidelityFX SDK1.1.4).
+Archive SHA-256: `b200292e02fd6598ecf915105e8d74dd9da6a25b2f433464058567b81d3bf27d`.
+The only source adjustment bounds native shader compiler workers. The source archive's
+`docs/license.md` is copied beside the built libraries as `fsr-framegen-LICENSE.md`; retain
+it when distributing them. No SDK or prebuilt vendor binary is checked into this repository.
+See [integration details](docs/linux-frame-generation.md).

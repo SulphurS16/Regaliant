@@ -11,6 +11,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Flip number at which to start capturing (u64::MAX = not armed).
 static ARMED: AtomicU64 = AtomicU64::new(u64::MAX);
+static SCENE_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+pub fn completed_flip() -> u64 { COMPLETED.load(Ordering::Acquire) }
+
+/// Async flips ordinarily leave batches queued. A diagnostic frame's boundaries must
+/// complete before target readbacks, otherwise the snapshot can precede its GPU writes.
+pub fn needs_boundary_sync(flip: u64) -> bool {
+    CAPTURE_ON.load(Ordering::Acquire) || flip >= ARMED.load(Ordering::Acquire)
+}
 
 struct Capture {
     flip: u64,
@@ -19,6 +29,7 @@ struct Capture {
     events: u64,
     /// Textures referenced in the frame (dumped as PNG when viewable).
     textures: std::collections::BTreeMap<u64, super::desc::Tsharp>,
+    targets: BTreeSet<u64>,
 }
 
 static ACTIVE: Mutex<Option<Capture>> = Mutex::new(None);
@@ -33,6 +44,21 @@ pub fn init_from_env() {
 /// Arms a capture of the frame after the next flip.
 pub fn arm_next() {
     ARMED.store(super::FRAMES.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+pub fn scene_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_SCENE_PROBE").ok().as_deref() == Some("1"))
+}
+
+/// Explicit player diagnostic at the current camera angle; never armed by normal play.
+#[cfg(target_os = "linux")]
+pub fn arm_scene_probe() {
+    if CAPTURE_ON.load(Ordering::Acquire) || SCENE_PROBE.swap(true, Ordering::AcqRel) { return; }
+    crate::info!("scene probe: capture requested at the current camera angle (F9); readback can stall this frame");
+    *crate::hle::libs::videoout::SHOT_REQUEST.lock() = Some(format!("scene-probe-{}", super::FRAMES.load(Ordering::Relaxed)));
+    arm_next();
 }
 
 pub fn capturing() -> bool {
@@ -66,15 +92,15 @@ pub fn on_flip(flip: u64) {
         finish(c, last);
         if !last {
             MORE.store(more - 1, Ordering::SeqCst);
-            *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
+            *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default(), targets: Default::default() });
         }
         return;
     }
     let armed = ARMED.load(Ordering::SeqCst);
     if armed != u64::MAX && flip >= armed {
         ARMED.store(u64::MAX, Ordering::SeqCst);
-        MORE.store(std::env::var("DS_CAPTURE_COUNT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).saturating_sub(1), Ordering::SeqCst);
-        *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default() });
+        MORE.store(if SCENE_PROBE.load(Ordering::Acquire) { 0 } else { std::env::var("DS_CAPTURE_COUNT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).saturating_sub(1) }, Ordering::SeqCst);
+        *g = Some(Capture { flip, text: format!("# frame after flip {flip}\n"), shaders: BTreeSet::new(), events: 0, textures: Default::default(), targets: Default::default() });
         CAPTURE_ON.store(true, Ordering::SeqCst);
         crate::info!("capture: recording the frame after flip {flip}");
     }
@@ -85,11 +111,18 @@ fn finish(c: Capture, dumps: bool) {
     let path = dir.join(format!("capture-{}.txt", c.flip));
     let _ = std::fs::write(&path, &c.text);
     let dumped = c.shaders.iter().filter(|&&a| save_program(a).is_some()).count();
-    let tex = if dumps { dump_textures(&dir, &c.textures) } else { 0 };
+    let scene_probe = SCENE_PROBE.swap(false, Ordering::AcqRel);
+    let texture_dir = if scene_probe { dir.join(format!("scene-{}", c.flip)) } else { dir.to_path_buf() };
+    let tex = if dumps { dump_textures(&texture_dir, &c.textures) } else { 0 };
     // Render targets as rendered (GPU execution): the graphics queue's work
     // of the frame completed before its flip.
-    let rts = if dumps && super::exec::enabled() { super::images::with(|im| im.dump_targets(&dir.join("targets"))) } else { 0 };
-    crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/, {tex} texture(s) in textures/, {rts} render target(s) in targets/)", c.events, path.display());
+    let frame_targets = scene_probe || std::env::var("DS_CAPTURE_TARGETS_FRAME").ok().as_deref() == Some("1");
+    let target_dir = if frame_targets { dir.join(format!("targets-{}", c.flip)) } else { dir.join("targets") };
+    let rts = if dumps && super::exec::enabled() {
+        super::images::with(|im| if frame_targets { im.dump_frame_targets(&target_dir, &c.targets) } else { im.dump_targets(&target_dir) })
+    } else { 0 };
+    crate::info!("capture: {} event(s) -> {} ({dumped} shader binaries in shaders/, {tex} texture(s) in textures/, {rts} color render target(s) plus depth/stencil in {})", c.events, path.display(), target_dir.display());
+    COMPLETED.store(c.flip, Ordering::Release);
 }
 
 /// Writes viewable textures (RGBA8/R8/RG8 in standard swizzles) of the frame
@@ -136,7 +169,7 @@ fn dump_textures(dir: &std::path::Path, textures: &std::collections::BTreeMap<u6
 pub fn save_program(a: u64) -> Option<std::path::PathBuf> {
     // (Development checkouts only: a player's log folder is what they attach to a public report,
     // and the programs are the game's own code.)
-    if crate::paths().layout != dsconfig::paths::Layout::Dev {
+    if crate::paths().layout != dsconfig::paths::Layout::Dev && std::env::var("DS_CAPTURE_CODE").ok().as_deref() != Some("1") {
         return None;
     }
     let sdir = crate::run_dir()?.join("shaders");
@@ -685,6 +718,7 @@ pub fn draw(cp: &Cp, what: &str) {
         cp.reg(Space::Uc, 0x25B),
         cp.last_draw
     );
+    let _ = writeln!(s, "  packet address {:#x}", cp.packet_address());
     if dumps_env().is_some() || ps_listed(cp) || vs_listed(cp) || WATCH_PIXEL.lock().is_some() {
         if let Some(n) = dump_draw_target(cp, c.events) {
             let _ = writeln!(s, "    target after draw: {n}");
@@ -701,6 +735,7 @@ pub fn draw(cp: &Cp, what: &str) {
     for (name, lo, rsrc, user) in [("ps", 0x08, 0x0A, 0x0C), ("vs", 0x48, 0x4A, 0x4C), ("gs", 0x88, 0x8A, 0x8C), ("es", 0xC8, 0x8A, 0x8C), ("hs", 0x108, 0x10A, 0x10C), ("ls", 0x148, 0x14A, 0x14C)] {
         stage(cp, &mut s, &mut c.shaders, name, lo, rsrc, user);
     }
+    if let Some(d) = super::exec::depth_surface(cp) { c.targets.insert(d.base); }
     let mask = ctx(0x28238);
     for i in 0..8u32 {
         let info = ctx(0x28C70 + 0x3C * i);
@@ -708,6 +743,7 @@ pub fn draw(cp: &Cp, what: &str) {
             continue;
         }
         let base = ((ctx(0x28C60 + 0x3C * i) as u64) << 8) | ((ctx(0x28E40 + 4 * i) as u64 & 0xFF) << 40);
+        c.targets.insert(base);
         let a2 = ctx(0x28EC0 + 4 * i);
         let a3 = ctx(0x28EE0 + 4 * i);
         // Metadata: DCC (INFO bit 28) and CMASK surfaces, fast-clear color.
@@ -919,6 +955,7 @@ pub fn dispatch(cp: &Cp, what: &str) {
         cp.reg(Space::Sh, 0x208) & 0xFFFF,
         cp.reg(Space::Sh, 0x209) & 0xFFFF
     );
+    let _ = writeln!(s, "  packet address {:#x}", cp.packet_address());
     stage(cp, &mut s, &mut c.shaders, "cs", 0x20C, 0x212, 0x240);
     let dumps = DISPATCH_DUMPS.load(Ordering::Relaxed) || std::env::var("DS_CAPTURE_DISPATCHES").ok().as_deref() == Some("1");
     match super::shaders::prepare_compute(cp, true) {
@@ -927,6 +964,11 @@ pub fn dispatch(cp: &Cp, what: &str) {
                 let _ = writeln!(s, "      {l}");
             }
             note_textures(&mut c.textures, &p);
+            for (i, r) in p.resources.iter().enumerate() {
+                if p.tr.plan.resources[i].written {
+                    if let super::shaders::Resolved::Image(t) = r { c.targets.insert(t.base); }
+                }
+            }
             if let Some(limit) = buffer_dump_limit(p.addr).filter(|_| dumps) {
                 // The buffers as the completed dispatch left them.
                 let dir = crate::run_dir().map(|d| d.join("dispatches"));

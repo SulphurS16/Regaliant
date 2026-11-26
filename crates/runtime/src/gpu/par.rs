@@ -34,6 +34,16 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Whole synchronization-free graphics runs on workers, including their first chunk.
+/// Experimental and incorrect: reviewer saw flicker, green geometry and black pops.
+/// Keep off; whole-run resource/state handoff needs investigation before another A/B.
+pub fn whole_run() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PAR_WHOLE_RUN").ok().as_deref() == Some("1"))
+}
+pub static WHOLE_RUNS: AtomicU64 = AtomicU64::new(0);
+pub static WHOLE_COMMANDS: AtomicU64 = AtomicU64::new(0);
+
 /// Chunk workers wanted (`tune par`; 0: runs are recorded by the command
 /// processor alone). By default half the logical CPUs, 2 to 8: on 24 logical
 /// CPUs 6, 7 and 8 workers recorded +2.0%, +2.2% and +2.4% against 5
@@ -41,6 +51,7 @@ use std::sync::Arc;
 /// workers +6% against 2 and 8 none more (2026-10-21, with the title's idle
 /// job workers asleep: a third was for CPUs shared with their polling).
 pub fn workers() -> usize {
+    if super::nan_probe::early_on() { return 0; }
     match super::tune::par() {
         1000 => {
             static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -502,7 +513,7 @@ impl Pool {
     /// Wakes the idle workers to the runs given them (`Worker::give`).
     pub fn wake(&self) {
         self.wake.fetch_add(1, Ordering::AcqRel);
-        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
+        unsafe { crate::platform::os::Win32::System::Threading::WakeByAddressAll(Arc::as_ptr(&self.wake) as *const core::ffi::c_void) };
     }
 
     /// Worker `i` of the command processor `name` (started on first use);
@@ -586,11 +597,11 @@ fn run_worker(w: &Worker, name: &str, compute: bool) {
                 IDLE[k][1].fetch_add(1, Ordering::Relaxed);
             }
             unsafe {
-                windows_sys::Win32::System::Threading::WaitOnAddress(
+                crate::platform::os::Win32::System::Threading::WaitOnAddress(
                     Arc::as_ptr(&w.wake) as *const core::ffi::c_void,
                     &seen as *const u64 as *const core::ffi::c_void,
                     8,
-                    windows_sys::Win32::System::Threading::INFINITE,
+                    crate::platform::os::Win32::System::Threading::INFINITE,
                 )
             };
             IDLE[k][0].fetch_add(1, Ordering::Relaxed);
@@ -863,7 +874,9 @@ pub fn status() -> String {
     } else {
         String::new()
     };
-    past + &format!(
+    let whole = format!("    whole-run recording: enabled {}, runs {}, commands {} (first chunk handed to workers; ordered primary batches)\n",
+        whole_run(), WHOLE_RUNS.load(Ordering::Relaxed), WHOLE_COMMANDS.load(Ordering::Relaxed));
+    past + &whole + &format!(
         "    parallel runs: {runs} runs ({} split at equal recording cost), {} chunks to workers ({} commands; {} per recorder), {} stopped early ({}), {} cancelled; main waited {} ms for workers (its chunk {:.2}x a worker's), workers {} ms for their turns ({} batch slots added), per chunk: start latency {:.0} us (first chunks), setup {:.1} us, recording {:.0} us ({:.0} commands), closing {:.0} us, submitting and posting {:.1} us; runs seen by length (runs/commands) {}; by end {}; runs under 32 commands by end {}; compute queues' runs by length {}; by end {}{}\n",
         super::cp::PAR_COSTED.load(Ordering::Relaxed),
         CHUNKS.load(Ordering::Relaxed),

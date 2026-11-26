@@ -97,11 +97,15 @@ fn present_waiter(rx: std::sync::mpsc::Receiver<(u64, u64, u64, std::time::Insta
             match r {
                 Ok(()) => {
                     let now = std::time::Instant::now();
+                    #[cfg(target_os = "linux")]
+                    crate::platform::present_timing::completed(id);
                     let q = (now.saturating_duration_since(at).as_secs_f64() * 4000.0) as usize;
                     PW_LATENCY.lock()[q.min(256)] += 1;
                     if let Some(p) = prev {
                         let gap = now.duration_since(p).as_secs_f64();
                         let refresh = crate::displayclock::snapshot().map_or(1.0 / 60.0, |s| s.period.as_secs_f64());
+                        #[cfg(target_os = "linux")]
+                        let refresh = { let _ = refresh; 1.0 / crate::displayclock::nominal_refresh() };
                         let n = ((gap / refresh).round() as usize).clamp(1, 8);
                         let mut s = PW_STATS.lock();
                         s.0[n] += 1;
@@ -161,6 +165,8 @@ pub fn stats_line() -> String {
     }
     let pct = |n: u64| 100.0 * n as f64 / s.1 as f64;
     let refresh = crate::displayclock::snapshot().map_or(1000.0 / 60.0, |x| x.period.as_secs_f64() * 1e3);
+    #[cfg(target_os = "linux")]
+    let refresh = { let _ = refresh; 1000.0 / crate::displayclock::nominal_refresh() };
     format!(
         "    on screen (present waits): {} frame intervals; shown 1 refresh {:.1}%, 2 {:.1}%, 3 {:.1}%, 4 {:.1}%, 5+ {:.1}% (a refresh {:.2} ms); over 25 ms {}{}\n",
         s.1,
@@ -409,6 +415,16 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             vk::FullScreenExclusiveEXT::DISALLOWED
         });
         let mut fse_win = vk::SurfaceFullScreenExclusiveWin32InfoEXT::default().hmonitor(exclusive.unwrap_or(0) as vk::HMONITOR);
+        #[cfg(windows)]
+        let present_mode = vk::PresentModeKHR::FIFO;
+        #[cfg(target_os = "linux")]
+        let present_mode = {
+            let modes = c.surface_i.get_physical_device_surface_present_modes(c.pdev, p.surface).map_err(|e| format!("surface present modes: {e}"))?;
+            let requested = std::env::var("DS_LINUX_PRESENT_MODE").ok();
+            let mode = linux_present_mode(&modes, requested.as_deref());
+            crate::info!("Linux swapchain modes {modes:?}; requested {:?}, selected {mode:?}; title pacing uses its own timer (no compositor vblank clock)", requested.as_deref().unwrap_or("fifo"));
+            mode
+        };
         let mut sci = vk::SwapchainCreateInfoKHR::default()
             .surface(p.surface)
             .min_image_count(count)
@@ -420,7 +436,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(old);
         if c.fse.is_some() {
@@ -541,8 +557,7 @@ unsafe fn hidden_make() -> Result<Hidden, String> {
     let c = ctx();
     let (hwnd, hinstance) = window::create_hidden()?;
     unsafe {
-        let sci = vk::Win32SurfaceCreateInfoKHR::default().hinstance(hinstance).hwnd(hwnd);
-        let surface = c.win32_i.create_win32_surface(&sci, None).map_err(|e| format!("create surface: {e}"))?;
+        let surface = window::surface(c, hwnd, hinstance)?;
         if !c.surface_i.get_physical_device_surface_support(c.pdev, c.queue_family, surface).unwrap_or(false) {
             return Err("queue family cannot present".into());
         }
@@ -733,8 +748,7 @@ pub fn init(title: &str) -> Result<(), String> {
     let w = window::create(title, 1280, 720)?;
     let c = ctx();
     unsafe {
-        let sci = vk::Win32SurfaceCreateInfoKHR::default().hinstance(w.hinstance).hwnd(w.hwnd);
-        let surface = c.win32_i.create_win32_surface(&sci, None).map_err(|e| format!("create surface: {e}"))?;
+        let surface = window::surface(c, w.hwnd, w.hinstance)?;
         let supported = c.surface_i.get_physical_device_surface_support(c.pdev, c.queue_family, surface).unwrap_or(false);
         if !supported {
             return Err("queue family cannot present".into());
@@ -798,6 +812,11 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
 
 /// Presents one frame. Returns false if presentation is not possible (minimized).
 pub fn present(src: Source) -> bool {
+    #[cfg(target_os = "linux")]
+    if !crate::gpu::framegen::bypass_present_hook() && ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(ok) = crate::gpu::framegen::adaptive_present(&src) { return ok; }
+        crate::gpu::framegen::present_pair(&src);
+    }
     let c = ctx();
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else {
@@ -829,12 +848,16 @@ pub fn present(src: Source) -> bool {
                 return false;
             }
         }
+        #[cfg(target_os = "linux")]
+        let frame_start = std::time::Instant::now();
         let f = p.frame % FRAMES;
         p.frame += 1;
         c.device.wait_for_fences(&[p.fences[f]], true, u64::MAX).ok();
         if let Some(w) = p.watch.as_mut() {
             w.collect(f);
         }
+        #[cfg(target_os = "linux")]
+        let acquire_start = std::time::Instant::now();
         let (idx, _) = match c.swapchain_d.acquire_next_image(p.swapchain, u64::MAX, p.acquire[f], vk::Fence::null()) {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
@@ -846,6 +869,8 @@ pub fn present(src: Source) -> bool {
                 return false;
             }
         };
+        #[cfg(target_os = "linux")]
+        let record_start = std::time::Instant::now();
         c.device.reset_fences(&[p.fences[f]]).ok();
         let cmd = p.cmds[f];
         c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -982,17 +1007,52 @@ pub fn present(src: Source) -> bool {
         };
         c.device.end_command_buffer(cmd).ok();
         let done = p.done[idx as usize];
-        if let Err(e) = c.submit(cmd, &[(p.acquire[f], vk::PipelineStageFlags::TRANSFER)], &[done], p.fences[f]) {
+        // The acquire orders the first layout transition as well as the blit.
+        #[cfg(target_os = "linux")]
+        let acquire_stage = vk::PipelineStageFlags::ALL_COMMANDS;
+        #[cfg(windows)]
+        let acquire_stage = vk::PipelineStageFlags::TRANSFER;
+        if let Err(e) = c.submit(cmd, &[(p.acquire[f], acquire_stage)], &[done], p.fences[f]) {
             crate::error!("{e}");
             return false;
         }
+        #[cfg(target_os = "linux")]
+        let ready_start = std::time::Instant::now();
+        // Earlier queue submissions can wait on cpu_done, signalled from the completion
+        // thread after their CPU effects. WSI binary waits cannot depend on a timeline
+        // signal that has not happened/submitted yet (VUID-03268). Wait outside the queue
+        // lock so the completion/submission threads can resolve those dependencies.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = c.device.wait_for_fences(&[p.fences[f]], true, u64::MAX) {
+            crate::error!("present completion fence: {e}");
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        let ready_end = std::time::Instant::now();
+        // The census used to drain only through optional framewatch. Instrumentation
+        // alone then logged shader identities but never any measured positions.
+        #[cfg(target_os = "linux")]
+        if p.watch.is_none() && crate::gpu::shaders::vs_outlier().is_some() {
+            crate::gpu::exec::outlier_note(crate::log::elapsed_ms(), crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+        }
         if let Some((buf, mem, ptr, w, h)) = shot {
+            #[cfg(windows)]
             c.device.wait_for_fences(&[p.fences[f]], true, 5_000_000_000).ok();
             let raw = std::slice::from_raw_parts(ptr, (w * h * 4) as usize).to_vec();
             if let Some(rgba) = crate::gpu::images::to_rgba8(p.format, &raw) {
                 if let Some(dir) = crate::run_dir() {
-                    let path = dir.join(format!("window-{}.png", p.frame));
-                    if std::fs::write(&path, crate::gpu::png::encode(w, h, &rgba)).is_ok() {
+                    #[cfg(target_os = "linux")]
+                    let prefix = if crate::gpu::framegen::presenting() { "generated" } else { "window" };
+                    #[cfg(windows)]
+                    let prefix = "window";
+                    let path = dir.join(format!("{prefix}-{}.png", p.frame));
+                    // Linux WSI uses OPAQUE composition. A generated image's alpha is
+                    // an SDK inpainting mask, not window transparency.
+                    #[cfg(target_os = "linux")]
+                    let png = crate::gpu::png::encode_opaque(w, h, &rgba);
+                    #[cfg(windows)]
+                    let png = crate::gpu::png::encode(w, h, &rgba);
+                    if std::fs::write(&path, png).is_ok() {
                         crate::info!("window shot of presented frame {}: {}", p.frame, path.display());
                     }
                 }
@@ -1017,6 +1077,8 @@ pub fn present(src: Source) -> bool {
         }
         let q = c.queue.lock();
         // (Through Streamline's present once DLSS runs: its per-frame bookkeeping.)
+        #[cfg(target_os = "linux")]
+        let present_start = std::time::Instant::now();
         let presented = match crate::gpu::upscale::present_hook() {
             Some(f) => {
                 let r = f(*q, &pi);
@@ -1030,6 +1092,26 @@ pub fn present(src: Source) -> bool {
             None => c.swapchain_d.queue_present(*q, &pi),
         };
         drop(q);
+        #[cfg(target_os = "linux")]
+        {
+            if presented.is_ok() {
+                crate::platform::present_timing::submit(if pw { p.present_id } else { p.frame as u64 }, [frame_start, acquire_start, record_start, ready_start, ready_end, present_start, std::time::Instant::now()]);
+            }
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            static NS: AtomicU64 = AtomicU64::new(0);
+            let elapsed = present_start.elapsed().as_nanos() as u64;
+            let n = CALLS.fetch_add(1, Relaxed) + 1;
+            let total = NS.fetch_add(elapsed, Relaxed) + elapsed;
+            if n <= 8 || n % 120 == 0 || presented.is_err() {
+                crate::info!("Linux present #{n}: result={presented:?}, call {:.3} ms, average {:.3} ms, image {}; slot {:.3} ms acquire {:.3} ms record/submit {:.3} ms ready {:.3} ms capture/queue {:.3} ms; {}", elapsed as f64 / 1e6, total as f64 / n as f64 / 1e6, idxs[0],
+                    (acquire_start - frame_start).as_secs_f64() * 1000.0,
+                    (record_start - acquire_start).as_secs_f64() * 1000.0,
+                    (ready_start - record_start).as_secs_f64() * 1000.0,
+                    (ready_end - ready_start).as_secs_f64() * 1000.0,
+                    (present_start - ready_end).as_secs_f64() * 1000.0, stats_line());
+            }
+        }
         if pw && presented.is_ok() {
             use ash::vk::Handle;
             let mut tx = PW_TX.lock();
@@ -1205,5 +1287,34 @@ mod tests {
         // Under 1% off: the whole window, no 1-pixel bars.
         assert_eq!(fit(3840, 2160, 1366, 768), (0, 0, 1366, 768));
         assert_eq!(fit(0, 0, 800, 600), (0, 0, 800, 600));
+    }
+}
+
+// FIFO gave the most consistent warm movement intervals on the Linux relay.
+// MAILBOX remains available explicitly; both are synchronized to the compositor.
+// FIFO is mandatory and is also the fallback for unsupported requests.
+#[cfg(target_os = "linux")]
+fn linux_present_mode(modes: &[vk::PresentModeKHR], requested: Option<&str>) -> vk::PresentModeKHR {
+    let want = match requested {
+        Some("fifo") => vk::PresentModeKHR::FIFO,
+        Some("mailbox") => vk::PresentModeKHR::MAILBOX,
+        Some("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        _ => vk::PresentModeKHR::FIFO,
+    };
+    if modes.contains(&want) { want } else { vk::PresentModeKHR::FIFO }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    #[test]
+    fn present_mode_is_supported_and_fifo_falls_back() {
+        use vk::PresentModeKHR as M;
+        assert_eq!(linux_present_mode(&[M::FIFO], None), M::FIFO);
+        assert_eq!(linux_present_mode(&[M::FIFO, M::MAILBOX], None), M::FIFO);
+        assert_eq!(linux_present_mode(&[M::FIFO, M::MAILBOX], Some("fifo")), M::FIFO);
+        assert_eq!(linux_present_mode(&[M::FIFO, M::MAILBOX], Some("mailbox")), M::MAILBOX);
+        assert_eq!(linux_present_mode(&[M::FIFO, M::MAILBOX], Some("immediate")), M::FIFO);
+        assert_eq!(linux_present_mode(&[M::FIFO, M::IMMEDIATE], Some("immediate")), M::IMMEDIATE);
     }
 }

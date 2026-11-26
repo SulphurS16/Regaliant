@@ -193,6 +193,7 @@ pub fn unmap_then_map(guest: u64, len: u64, maps: &[(u64, u64, u64)]) {
 /// after batch `cwait` of the compute family's queue (ordered async
 /// compute: its shaders read the old entries; 0: none).
 pub(super) fn submit_pending(c: &Ctx, cwait: u64) -> Result<(), String> {
+    let _trace = super::timeline::section("submit pagetable");
     if !made() {
         return Ok(());
     }

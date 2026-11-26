@@ -32,6 +32,39 @@ use std::ptr::null;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// Diagnostic only: sample 1/64 actual driver calls, rotating the sample across lists.
+// Clean relay measurements leave this off. Counts include all replayed commands; wall
+// and scheduled CPU times describe only sampled calls (no scaling of rare commands).
+const RECORD_CLASSES: [&str; 10] = ["begin/end", "pipeline", "descriptors", "draw", "dispatch", "transfer/clear", "barrier", "rendering", "dynamic-state", "other"];
+static RECORD_STATS: [[AtomicU64; 4]; 10] = [const { [const { AtomicU64::new(0) }; 4] }; 10];
+fn record_profile() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_RECORD_PROFILE").ok().as_deref() == Some("1"))
+}
+fn record_class(op: &Op) -> usize {
+    match op {
+        Op::Begin(_) | Op::End => 0,
+        Op::BindPipeline(..) => 1,
+        Op::PushDescriptors(..) | Op::BindSets(..) | Op::PushConstants(..) => 2,
+        Op::Draw(..) | Op::DrawIndexed(..) | Op::DrawIndirect(..) | Op::DrawIndexedIndirect(..) | Op::DrawIndirectCount(..) | Op::DrawIndexedIndirectCount(..) => 3,
+        Op::Dispatch(..) | Op::DispatchBase(..) | Op::DispatchIndirect(..) => 4,
+        Op::CopyBuffer(..) | Op::CopyImage(..) | Op::BlitImage(..) | Op::CopyBufferToImage(..) | Op::CopyImageToBuffer(..) | Op::UpdateBuffer(..) | Op::FillBuffer(..) | Op::ClearColorImage(..) | Op::ClearDepthStencilImage(..) | Op::ClearAttachments(..) => 5,
+        Op::Barrier(..) => 6,
+        Op::BeginRendering(..) | Op::EndRendering => 7,
+        Op::Viewports(..) | Op::Scissors(..) | Op::LineWidth(..) | Op::DepthBias(..) | Op::DepthBounds(..) | Op::BlendConstants(..) | Op::StencilCompareMask(..) | Op::StencilWriteMask(..) | Op::StencilReference(..) | Op::CullMode(..) | Op::FrontFace(..) | Op::Topology(..) | Op::DepthTestEnable(..) | Op::DepthWriteEnable(..) | Op::DepthCompareOp(..) | Op::DepthBoundsTestEnable(..) | Op::StencilTestEnable(..) | Op::StencilOp(..) | Op::RasterizerDiscardEnable(..) | Op::DepthBiasEnable(..) | Op::PrimitiveRestartEnable(..) => 8,
+        _ => 9,
+    }
+}
+fn record_report() -> String {
+    if !record_profile() { return String::new(); }
+    let mut out = String::new();
+    for (i, name) in RECORD_CLASSES.iter().enumerate() {
+        let [calls, samples, wall, cycles] = RECORD_STATS[i].each_ref().map(|n| n.load(Ordering::Relaxed));
+        out += &format!("    driver-call sample {name}: {calls} calls, {samples} samples, {wall} wall ns, {cycles} CPU ns\n");
+    }
+    out
+}
+
 /// A command's array in its list's arena: offset in 8-byte words, items
 /// (bytes for byte data).
 #[derive(Clone, Copy)]
@@ -430,6 +463,7 @@ impl Lists {
     /// Records the lists into their command buffers through the driver (the
     /// submission thread, just before the batch is submitted).
     pub fn replay(self) {
+        let _trace = super::super::timeline::section("replay commands");
         let t = std::time::Instant::now();
         let (ops, words) = self.play();
         STATS[S_BATCHES].fetch_add(1, Ordering::Relaxed);
@@ -539,6 +573,7 @@ impl Lists {
     /// `into` (None: its own buffer) with `skip` (`SKIP_BEGIN`,
     /// `SKIP_END`), without the marked parts `cuts` name.
     pub fn play_part(&mut self, which: usize, into: Option<vk::CommandBuffer>, skip: u8, cuts: &[Cut]) {
+        let _trace = super::super::timeline::section("replay commands");
         let (raw, slot) = &mut self.0[which];
         let Some(mut l) = slot.take() else { return };
         let t = std::time::Instant::now();
@@ -603,6 +638,10 @@ unsafe fn play_list_cut(cb: vk::CommandBuffer, l: &mut List, skip: u8, cuts: &[(
     let base = l.arena.as_mut_ptr();
     let at = move |s: Span| -> *const u64 { if s.n == 0 { null() } else { unsafe { base.add(s.at as usize).cast_const() } } };
     let one = move |i: u32| -> *const u64 { if i == NONE { null() } else { unsafe { base.add(i as usize).cast_const() } } };
+    let profile = record_profile();
+    let mut counts = [[0u64; 4]; 10];
+    thread_local! { static SAMPLE: Cell<usize> = const { Cell::new(0) }; }
+    let phase = if profile { SAMPLE.with(|n| { let v = n.get(); n.set((v+1)&63); v }) } else { 0 };
     for (k, op) in l.ops.iter().enumerate() {
         if !cuts.is_empty() {
             let k = k as u32;
@@ -613,6 +652,10 @@ unsafe fn play_list_cut(cb: vk::CommandBuffer, l: &mut List, skip: u8, cuts: &[(
                 continue;
             }
         }
+        let class = if profile { record_class(op) } else { 0 };
+        let sampled = profile && k & 63 == phase;
+        let start = sampled.then(|| (std::time::Instant::now(), crate::platform::thread_times::own_ns()));
+        if profile { counts[class][0] += 1; }
         unsafe {
             match *op {
                 Op::Begin(flags) => {
@@ -721,6 +764,15 @@ unsafe fn play_list_cut(cb: vk::CommandBuffer, l: &mut List, skip: u8, cuts: &[(
                 }
             }
         }
+        if let Some((time, cpu)) = start {
+            let end = crate::platform::thread_times::own_ns();
+            counts[class][1] += 1;
+            counts[class][2] += time.elapsed().as_nanos() as u64;
+            counts[class][3] += end.saturating_sub(cpu);
+        }
+    }
+    if profile {
+        for (i, values) in counts.iter().enumerate() { for (j, &v) in values.iter().enumerate() { RECORD_STATS[i][j].fetch_add(v, Ordering::Relaxed); } }
     }
 }
 
@@ -1151,5 +1203,5 @@ pub fn status() -> String {
         s(S_FOREIGN),
         MERGED_BARRIERS.load(Ordering::Relaxed),
         if CHECK.load(Ordering::Relaxed) { " (checked)" } else { "" }
-    )
+    ) + &record_report()
 }

@@ -30,6 +30,28 @@ pub const MAX_KEY: usize = 32;
 /// VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR.
 pub const CAPTURE_DATA: u64 = 0x8000_0000;
 
+/// Keep the flags2 node on both capture and replay. Only CAPTURE_DATA may differ;
+/// dropping the entire node changes the pNext chain recorded by the driver.
+pub fn creation_flags(flags: vk::PipelineCreateFlags, capture: bool) -> vk::PipelineCreateFlags2CreateInfoKHR<'static> {
+    vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(flags.as_raw() as u64 | if capture { CAPTURE_DATA } else { 0 }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn capture_and_replay_flags_differ_only_by_capture_bit() {
+        for flags in [vk::PipelineCreateFlags::empty(), vk::PipelineCreateFlags::DISPATCH_BASE] {
+            let a = creation_flags(flags, true);
+            let b = creation_flags(flags, false);
+            assert_eq!(a.s_type, b.s_type);
+            assert_eq!(a.flags.as_raw() ^ b.flags.as_raw(), CAPTURE_DATA);
+            assert_eq!(b.flags.as_raw(), flags.as_raw() as u64);
+            assert!(!b.flags.intersects(vk::PipelineCreateFlags2KHR::FAIL_ON_PIPELINE_COMPILE_REQUIRED));
+        }
+    }
+}
+
 /// VkPipelineBinaryKHR (a non-dispatchable handle).
 pub type Binary = u64;
 
@@ -144,7 +166,7 @@ type ReleaseFn = unsafe extern "system" fn(vk::Device, *const ReleaseInfo, *cons
 
 /// The extension's commands on the device, and the store's compatibility
 /// key (binaries stored under another one are not used): the device's
-/// pipeline cache UUID, driver version, vendor and device ids.
+/// pipeline cache UUID, driver version, vendor/device ids and enabled device contract.
 pub struct Fns {
     device: vk::Device,
     create: CreateFn,
@@ -196,7 +218,7 @@ pub unsafe fn supported(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> b
 
 impl Fns {
     /// The commands (None: not all found) and the global key.
-    pub unsafe fn load(instance: &ash::Instance, pdev: vk::PhysicalDevice, device: vk::Device) -> Option<Fns> {
+    pub unsafe fn load(instance: &ash::Instance, pdev: vk::PhysicalDevice, device: vk::Device, compatibility: &[u8]) -> Option<Fns> {
         let get = |n: &CStr| unsafe { instance.get_device_proc_addr(device, n.as_ptr()) };
         let create = get(c"vkCreatePipelineBinariesKHR")?;
         let destroy = get(c"vkDestroyPipelineBinaryKHR")?;
@@ -210,6 +232,8 @@ impl Fns {
         for v in [props.driver_version, props.vendor_id, props.device_id] {
             global.extend_from_slice(&v.to_le_bytes());
         }
+        let contract = compatibility.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        global.extend_from_slice(&contract.to_le_bytes());
         Some(Fns { device, create, destroy, data, release, global, shared: parking_lot::Mutex::new(Vec::new()) })
     }
 

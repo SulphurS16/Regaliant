@@ -17,7 +17,7 @@
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use windows_sys::Win32::System::Memory::*;
+use crate::platform::os::Win32::System::Memory::*;
 
 pub const GUEST_BASE: u64 = 0x4_0000_0000; // 16 GiB
 pub const GUEST_END: u64 = 0x800_0000_0000; // 8 TiB (the title reserves ~1 TiB for virtual textures)
@@ -903,7 +903,7 @@ pub fn mapped(a: u64, len: u64) -> bool {
 /// `os_readable` asks the operating system, from the table (bulk readers
 /// under `GUEST_READERS` use it from before the lock: `table_view_held`).
 pub fn host_readable(a: u64, len: u64) -> bool {
-    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    use crate::platform::os::Win32::System::Memory::PAGE_NOACCESS;
     let st = MEM.lock();
     let end = a.saturating_add(len.max(1));
     let mut p = a;
@@ -960,7 +960,7 @@ pub fn win_prot(prot: u32) -> u32 {
 }
 
 fn last_error() -> u32 {
-    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+    unsafe { crate::platform::os::Win32::Foundation::GetLastError() }
 }
 
 static RESERVED_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -972,7 +972,7 @@ static WRITE_WATCH_ERROR: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// Whether environment variable `name` (ASCII) equals `value`, read without
 /// allocating (the heap may not be set up yet).
 pub fn env_is(name: &str, value: &str) -> bool {
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    use crate::platform::os::Win32::System::Environment::GetEnvironmentVariableW;
     let mut n = [0u16; 64];
     if name.len() >= n.len() {
         return false;
@@ -1028,7 +1028,7 @@ fn reserve_guest_range_once() {
     // status 10, naming the region.)
     if env_is("DS_SIM_OCCUPIED", "1") {
         unsafe { VirtualAlloc((GUEST_BASE + 0x1000_0000) as _, 0x1_0000, MEM_RESERVE, PAGE_NOACCESS) };
-        sim_module();
+        crate::platform::memory_diagnostics::sim_module();
     }
     // Section-backed guest memory (no write watching: views have none).
     if env_is("DS_SECTIONS", "1") && crate::sections::reserve(GUEST_BASE, size as u64, DMEM_SIZE, ANON_SIZE).is_ok() {
@@ -1061,30 +1061,6 @@ fn reserve_guest_range_once() {
     let p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE, PAGE_NOACCESS) };
     if !p.is_null() {
         RESERVED_EARLY.store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// `DS_SIM_MODULE=<dll path>` (a test, with `DS_SIM_OCCUPIED=1`): that module loaded before the
-/// reservation, as a tool another program puts into every process would be, for the failed
-/// start's list of such modules (`foreign_modules`). Read without allocating (the heap may not be
-/// set up yet).
-fn sim_module() {
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
-    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
-    const NAME: [u16; 14] = {
-        let b = b"DS_SIM_MODULE\0";
-        let mut a = [0u16; 14];
-        let mut i = 0;
-        while i < a.len() {
-            a[i] = b[i] as u16;
-            i += 1;
-        }
-        a
-    };
-    let mut buf = [0u16; 520];
-    let len = unsafe { GetEnvironmentVariableW(NAME.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    if len > 0 && len < buf.len() {
-        unsafe { LoadLibraryW(buf.as_ptr()) };
     }
 }
 
@@ -1141,7 +1117,7 @@ fn mixed_window() -> u64 {
 /// Environment variable `name` (ASCII) as a decimal number, read without
 /// allocating (`env_is`).
 fn env_u32(name: &str) -> Option<u32> {
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
+    use crate::platform::os::Win32::System::Environment::GetEnvironmentVariableW;
     let mut n = [0u16; 64];
     if name.len() >= n.len() {
         return None;
@@ -1779,7 +1755,7 @@ fn take_written_census(base: u64, size: u64, out: &mut Vec<u64>, who: usize) -> 
     use std::sync::atomic::Ordering::Relaxed;
     if crate::sections::on() {
         let inflight = InFlight::new();
-        let t = std::time::Instant::now();
+        let t = crate::gpu::record_opts::Timer::start();
         let r = crate::gpu::resident::take_written(base, size, out);
         let ns = t.elapsed().as_nanos() as u64;
         ww_note(who, size.div_ceil(4096), ns, out.is_empty(), inflight.others);
@@ -1812,7 +1788,7 @@ fn take_written_inner(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Optio
                 if view_window(a) {
                     // (Views have no write watching: their pages are armed
                     // through the host and faults tell their writes.)
-                    let (first, t) = (out.len(), std::time::Instant::now());
+                    let (first, t) = (out.len(), crate::gpu::record_opts::Timer::start());
                     crate::gpu::resident::take_written(a, e - a, out)?;
                     VIEW_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     VIEW_STATS[5].fetch_add((out.len() - first) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1874,7 +1850,7 @@ pub fn query_written(lo: u64, hi: u64) -> Option<(u64, u64)> {
 fn take_written_query(lo: u64, hi: u64, out: &mut Vec<u64>, who: usize) -> Option<()> {
     use std::sync::atomic::Ordering::Relaxed;
     let inflight = InFlight::new();
-    let t = std::time::Instant::now();
+    let t = crate::gpu::record_opts::Timer::start();
     let mut addrs = [std::ptr::null_mut::<std::ffi::c_void>(); 256];
     let mut at = lo;
     if crate::gpu::tune::ww_probe() {
@@ -1940,17 +1916,12 @@ pub fn reserve_guest_range() -> Result<(), String> {
             }
             if info.State != MEM_FREE && busy.len() < 16 {
                 let kind = match info.Type {
-                    MEM_IMAGE => "a module",
+                    0x0100_0000 => "a module",
                     MEM_MAPPED => "a mapped file",
                     _ => "private memory",
                 };
-                let mut name = [0u16; 512];
-                let len = if info.Type == MEM_IMAGE || info.Type == MEM_MAPPED {
-                    unsafe { windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW(windows_sys::Win32::System::Threading::GetCurrentProcess(), info.BaseAddress, name.as_mut_ptr(), name.len() as u32) as usize }
-                } else {
-                    0
-                };
-                let file = if len > 0 { format!(" {}", users_folder_hidden(&crate::log::redact(&String::from_utf16_lossy(&name[..len.min(name.len())])))) } else { String::new() };
+                let file = crate::platform::files::mapped_file_name(info.BaseAddress as u64);
+                let file = if file.is_empty() { file } else { format!(" {}", users_folder_hidden(&crate::log::redact(&file))) };
                 busy.push(format!("{:#x}+{:#x} {kind}{file}", info.BaseAddress as u64, info.RegionSize));
             }
             addr = info.BaseAddress as u64 + info.RegionSize as u64;
@@ -1959,65 +1930,17 @@ pub fn reserve_guest_range() -> Result<(), String> {
         // before it reserved the range are its likely owners, issue #15. Listed only then: a
         // module or mapped file names its own, and a bystander listed beside it would be blamed;
         // the review of 2026-11-25 evening.)
-        let others = if private { foreign_modules() } else { Vec::new() };
+        let others = if private { crate::platform::memory_diagnostics::foreign_modules() } else { Vec::new() };
         let others = if others.is_empty() { String::new() } else { format!("; private memory names no owner, other programs' modules loaded then: {}", others.join(", ")) };
         return Err(format!("reserving guest range failed (error {err}); occupied: {}{others}", busy.join("; ")));
     }
     Ok(())
 }
 
-/// The modules loaded in this process that are neither Windows' own (under its folder) nor this
-/// program's (its folder): on a failed start, the likely owners of private memory in the guest
-/// range, such as a tool another program puts into every process (issue #15). At most 16.
-fn foreign_modules() -> Vec<String> {
-    use windows_sys::Win32::Foundation::HMODULE;
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetModuleFileNameExW};
-    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let proc = unsafe { GetCurrentProcess() };
-    // (The program itself, by its handle: its folder may be a drive's root, which the folder test
-    // below leaves out, or unknown.)
-    let exe = unsafe { GetModuleHandleW(std::ptr::null()) };
-    let mut mods: [HMODULE; 512] = [std::ptr::null_mut(); 512];
-    let mut needed = 0u32;
-    if unsafe { K32EnumProcessModules(proc, mods.as_mut_ptr(), std::mem::size_of_val(&mods) as u32, &mut needed) } == 0 {
-        return Vec::new();
-    }
-    let n = (needed as usize / std::mem::size_of::<HMODULE>()).min(mods.len());
-    let mut wdir = [0u16; 260];
-    let wl = unsafe { GetSystemWindowsDirectoryW(wdir.as_mut_ptr(), wdir.len() as u32) } as usize;
-    let windows = if wl > 0 && wl < wdir.len() { format!("{}\\", String::from_utf16_lossy(&wdir[..wl]).trim_end_matches('\\').to_ascii_lowercase()) } else { String::new() };
-    // (The program's folder, unless it is a drive's root: then every module on that drive would
-    // be left out; the review of 2026-11-25 evening.)
-    let own = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| format!("{}\\", d.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase()))).filter(|d| d.len() > 3);
-    let mut out = Vec::new();
-    for &m in &mods[..n] {
-        if m == exe {
-            continue;
-        }
-        let mut name = [0u16; 512];
-        let len = unsafe { K32GetModuleFileNameExW(proc, m, name.as_mut_ptr(), name.len() as u32) } as usize;
-        if len == 0 || len >= name.len() {
-            continue;
-        }
-        let path = String::from_utf16_lossy(&name[..len]);
-        let low = path.to_ascii_lowercase();
-        if (!windows.is_empty() && low.starts_with(&windows)) || own.as_deref().is_some_and(|d| low.starts_with(d)) {
-            continue;
-        }
-        out.push(users_folder_hidden(&crate::log::redact(&path)));
-        if out.len() == 16 {
-            break;
-        }
-    }
-    out
-}
-
 /// `path` with the folder after `\Users\` shown as `<user>`: a mapped file's name comes as a
 /// device path (`\Device\HarddiskVolumeN\...`), which the log's own rule for the profile folder
 /// does not meet (the review of 2026-11-25).
-fn users_folder_hidden(path: &str) -> String {
+pub(crate) fn users_folder_hidden(path: &str) -> String {
     let low = path.to_ascii_lowercase();
     let Some(i) = low.find("\\users\\") else { return path.to_string() };
     let start = i + "\\users\\".len();
@@ -2043,10 +1966,10 @@ fn note_host_call(k: usize, t0: std::time::Instant) {
 
 /// This process's page faults so far.
 fn page_faults() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use crate::platform::os::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    let ok = unsafe { GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb) };
+    let ok = unsafe { GetProcessMemoryInfo(crate::platform::os::Win32::System::Threading::GetCurrentProcess(), &mut c, c.cb) };
     if ok != 0 { c.PageFaultCount as u64 } else { 0 }
 }
 
@@ -2284,7 +2207,7 @@ pub fn table_view_held_for(g0: u64, start: u64, end: u64) -> bool {
 /// Whether every page of [a, a+len) is committed and readable now (operating
 /// system query; takes none of our locks).
 pub fn os_readable(a: u64, len: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    use crate::platform::os::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     let end = a.saturating_add(len.max(1));
     let mut p = a;
     while p < end {
@@ -2313,7 +2236,7 @@ pub fn os_readable(a: u64, len: u64) -> bool {
 /// The operating system's regions over [a, a+len): one clause each
 /// (state, protection, type), at most `max` (diagnostics of failed imports).
 pub fn os_regions(a: u64, len: u64, max: usize) -> String {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use crate::platform::os::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let end = a.saturating_add(len.max(1));
     let mut p = a;
     let mut out = Vec::new();
@@ -2368,12 +2291,12 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
         if let Some(p) = traced {
             crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it begins (try {tries}, into guest {into_guest}): {} ({base:#x}+{len:#x})", what()));
         }
-        let r = op();
+        let r = crate::platform::file_hooks::with_kernel_io_pages(base, len, into_guest, &mut op);
         if let Some(p) = traced {
             crate::gpu::fe2::trace_event(p, &format!("kernel I/O over it ended (try {tries}): {}", if r.is_ok() { "ok".to_string() } else { format!("{:?}", r.as_ref().err().and_then(|e| e.raw_os_error())) }));
         }
         match &r {
-            Err(e) if matches!(e.raw_os_error(), Some(998 | 1784)) && tries < TRIES => {
+            Err(e) if crate::platform::file_hooks::is_memory_fault(e) && tries < TRIES => {
                 if tries == 0 && KERNEL_IO[0].fetch_add(1, Relaxed) < 32 {
                     crate::warn!("{}: {e}; retrying ({})", what(), describe_host(base, len));
                 }
@@ -2401,6 +2324,40 @@ pub fn kernel_io<T>(what: &dyn Fn() -> String, base: u64, len: u64, into_guest: 
         }
         return r;
     }
+}
+
+/// [positive short syscalls, EOF results, terminal read errors].
+pub static KERNEL_READ_STATUS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A positional file read into guest memory. Short successful reads advance both the
+/// destination and file offset; EFAULT retries repeat only the unfinished suffix. EOF is
+/// returned as a short total (APR requires the full total; ordinary reads may return EOF).
+pub fn kernel_read_at(what: &dyn Fn(u64) -> String, buf: &mut [u8], offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>) -> std::io::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        let at = offset.checked_add(done as u64).ok_or_else(|| std::io::Error::other("file offset overflow"))?;
+        let base = buf.as_ptr() as u64 + done as u64;
+        let len = buf.len() - done;
+        let label = || what(done as u64);
+        let result = kernel_io(&label, base, len as u64, true, || read(&mut buf[done..], at));
+        crate::platform::file_hooks::note_kernel_read(base, len as u64, at, &result, &label);
+        match result {
+            Ok(0) => { KERNEL_READ_STATUS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed); break; }
+            Ok(n) if n <= len => {
+                if n < len { KERNEL_READ_STATUS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                done += n;
+            }
+            Ok(_) => return Err(std::io::Error::other("file read exceeded destination")),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                KERNEL_READ_STATUS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::warn!("{}: file read failed after {done} of {} bytes: {e}", what(done as u64), buf.len());
+                return Err(e);
+            }
+        }
+    }
+    Ok(done)
 }
 
 /// What guest [base, base+len) looks like now (diagnostics): its mappings,
@@ -3201,6 +3158,26 @@ mod tests {
     use super::*;
 
     /// Cached readable runs survive mapping changes that do not touch them.
+    #[test]
+    fn positional_read_eof_and_error_are_not_full_completion() {
+        let mut out = [0u8; 16];
+        let mut calls = 0;
+        let n = kernel_read_at(&|_| "EOF test".into(), &mut out, 41, |buf, off| {
+            calls += 1;
+            if calls == 1 { assert_eq!(off, 41); buf[..7].fill(0x5a); Ok(7) }
+            else { assert_eq!(off, 48); Ok(0) }
+        }).unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(&out[..7], &[0x5a; 7]);
+        assert_eq!(&out[7..], &[0; 9]);
+        calls = 0;
+        let r = kernel_read_at(&|_| "error test".into(), &mut out, 0, |_, off| {
+            calls += 1;
+            if calls == 1 { Ok(7) } else { assert_eq!(off, 7); Err(std::io::Error::other("read failed")) }
+        });
+        assert!(r.is_err());
+    }
+
     #[test]
     fn readable_runs_survive_unrelated_changes() {
         let g0 = MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);

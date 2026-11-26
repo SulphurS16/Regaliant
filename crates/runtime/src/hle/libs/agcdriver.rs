@@ -102,28 +102,28 @@ sysv! {
         if packet.is_null() { return ERR_EINVAL; }
         let addr = *packet;
         let size = *(packet as *const u32).add(2);
-        crate::gpu::submit(crate::gpu::GFX, vec![(addr, size)]);
+        crate::platform::graphics::submit(crate::platform::graphics::GFX, vec![(addr, size)]);
         0
     }
     fn sceAgcDriverSubmitMultiDcbs(addrs: *const u64, sizes: *const u32, count: u32) -> i32 {
         if count == 0 { return 0; }
         if addrs.is_null() || sizes.is_null() { return ERR_EINVAL; }
         let v: Vec<(u64, u32)> = (0..count as usize).map(|i| (*addrs.add(i), *sizes.add(i))).filter(|(a, s)| *a != 0 && *s != 0).collect();
-        crate::gpu::submit(crate::gpu::GFX, v);
+        crate::platform::graphics::submit(crate::platform::graphics::GFX, v);
         0
     }
     fn sceAgcDriverSubmitAcb(queue: u32, packet: *const u64) -> i32 {
         if packet.is_null() { return ERR_EINVAL; }
         let addr = *packet;
         let size = *(packet as *const u32).add(2);
-        crate::gpu::submit(queue, vec![(addr, size)]);
+        crate::platform::graphics::submit(queue, vec![(addr, size)]);
         0
     }
     fn sceAgcDriverSubmitMultiAcbs(queue: u32, addrs: *const u64, sizes: *const u32, count: u32) -> i32 {
         if count == 0 { return 0; }
         if addrs.is_null() || sizes.is_null() { return ERR_EINVAL; }
         let v: Vec<(u64, u32)> = (0..count as usize).map(|i| (*addrs.add(i), *sizes.add(i))).filter(|(a, s)| *a != 0 && *s != 0).collect();
-        crate::gpu::submit(queue, v);
+        crate::platform::graphics::submit(queue, v);
         0
     }
 

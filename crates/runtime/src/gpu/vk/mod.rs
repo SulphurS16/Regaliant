@@ -5,7 +5,13 @@ pub mod framewatch;
 pub mod pbin;
 pub mod present;
 pub mod sharpen;
+#[cfg_attr(target_os = "linux", path = "../../platform/linux/window.rs")]
 pub mod window;
+
+// Preserve the existing presence switch, but an explicit zero disables validation.
+fn validation_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v != "0")
+}
 
 use ash::vk;
 use parking_lot::Mutex;
@@ -27,6 +33,7 @@ pub struct Ctx {
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
     pub surface_i: ash::khr::surface::Instance,
+    #[cfg(windows)]
     pub win32_i: ash::khr::win32_surface::Instance,
     pub swapchain_d: ash::khr::swapchain::Device,
     pub push_desc: ash::khr::push_descriptor::Device,
@@ -181,7 +188,17 @@ pub fn subgroup_modes_checked() -> bool {
 }
 
 fn modes_checked_on(vendor: u32, device: u32) -> bool {
-    vendor == 0x10de && device < 0x2b80
+    // On Linux the subgroup modes were also checked on a Blackwell card (an RTX PRO 6000,
+    // 10de:2bb1, driver 615.78): with them and rdna's NaN handling the tutorial and the tunnel
+    // render right, while the portable translation drew the 3D scene as scattered coloured
+    // specks. So NVIDIA keeps the modes on Linux whatever the design (DS_PLAIN_MODES overrides).
+    vendor == 0x10de && (device < 0x2b80 || cfg!(target_os = "linux"))
+}
+
+// Subgroup control flow and floating-point preservation are independent policies. Linux
+// validates NVIDIA subgroup modes even on Blackwell; that must not disable its NaN guard.
+fn nan_preserve_default(vendor: u32, device: u32) -> bool {
+    vendor != 0x10de || device >= 0x2b80
 }
 
 /// Translated shaders declare maximal reconvergence (`exec::module_code`); set when the device is
@@ -216,7 +233,7 @@ static NAN_PRESERVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// tests held without the declaration; before that guard the RTX 4090 drew those primitives as
 /// streaks across the tutorial's opening tunnel, and on the RTX 50 series (driver 621.24 and
 /// 621.35) players see that tunnel black with "vertex explosions" (issues #4 and #6, 2026-11-24):
-/// on the designs the translation was not checked on (`subgroup_modes_checked`) shaders declare it
+/// on Blackwell, AMD and Intel (`nan_preserve_default`) shaders declare it
 /// since then, for the widths the device allows (the RTX 4090 and 5090 report all three).
 /// `DS_NAN_PRESERVE=1` / `0` forces it on or off where the device allows it.
 pub fn nan_preserve() -> bool {
@@ -354,7 +371,7 @@ fn init_inner() -> Result<(), String> {
         // DS_VK_VALIDATION without a layer path of its own: the project's
         // SDK copy (`local_layer_dir`), for the loader to find (set before it
         // loads; this diagnosis only).
-        if std::env::var_os("DS_VK_VALIDATION").is_some() && std::env::var_os("VK_ADD_LAYER_PATH").is_none() {
+        if validation_requested(std::env::var_os("DS_VK_VALIDATION").as_deref()) && std::env::var_os("VK_ADD_LAYER_PATH").is_none() {
             if let Some(dir) = local_layer_dir() {
                 crate::info!("Vulkan validation layer from {}", dir.display());
                 std::env::set_var("VK_ADD_LAYER_PATH", &dir);
@@ -368,7 +385,7 @@ fn init_inner() -> Result<(), String> {
             .engine_name(app_name)
             .api_version(vk::API_VERSION_1_3);
         let layers_avail = entry.enumerate_instance_layer_properties().unwrap_or_default();
-        let want_validation = std::env::var_os("DS_VK_VALIDATION").is_some();
+        let want_validation = validation_requested(std::env::var_os("DS_VK_VALIDATION").as_deref());
         let validation_name = c"VK_LAYER_KHRONOS_validation";
         let has_validation = layers_avail.iter().any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
         let validation = want_validation && has_validation;
@@ -376,7 +393,8 @@ fn init_inner() -> Result<(), String> {
             crate::warn!("DS_VK_VALIDATION set but the Khronos validation layer is not installed");
         }
         let layers: Vec<*const c_char> = if validation { vec![validation_name.as_ptr()] } else { vec![] };
-        let mut exts = vec![ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];
+        let surface_extensions = window::instance_extensions()?;
+        let mut exts: Vec<_> = surface_extensions.iter().map(|s| s.as_ptr()).collect();
         let inst_exts = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
         let inst_has = |n: &CStr| inst_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
         // Display modes and HDR (`present`): surface queries with chained structures (exclusive
@@ -385,7 +403,7 @@ fn init_inner() -> Result<(), String> {
         if surface_caps2 {
             exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
         }
-        let colorspaces = inst_has(ash::ext::swapchain_colorspace::NAME);
+        let colorspaces = cfg!(windows) && inst_has(ash::ext::swapchain_colorspace::NAME);
         if colorspaces {
             exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
         }
@@ -473,7 +491,9 @@ fn init_inner() -> Result<(), String> {
                         vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
                         _ => 0,
                     };
-                    let rank = if layered { 0 } else { 10 } + kind;
+                    // Preserve Linux's NVIDIA preference among usable native devices.
+                    let rank = if layered { 0 } else { 20 } + kind * 2
+                        + i32::from(cfg!(target_os = "linux") && props.vendor_id == 0x10de);
                     if rank > chosen_rank || (rank == chosen_rank && discrete) {
                         chosen_rank = rank;
                         chosen = Some((pd, qf as u32, props));
@@ -483,7 +503,7 @@ fn init_inner() -> Result<(), String> {
         }
         // (Every card Vulkan lists, for a player's report: a laptop with two graphics chips.)
         crate::info!(
-            "Vulkan devices: {} (taken: a usable one, a native driver before a translation layer, then discrete, integrated, virtual, the CPU's, among equals the last discrete one, else the first; none usable: the last discrete one, else the first)",
+            "Vulkan devices: {} (taken: a usable one, a native driver before a translation layer, then discrete, integrated, virtual, the CPU's (Linux prefers NVIDIA within a kind), among equals the last discrete one, else the first; none usable: the last discrete one, else the first)",
             seen.join(", ")
         );
         let (pdev, qf, props) = chosen.or(fallback).ok_or("no Vulkan device with graphics+compute")?;
@@ -550,7 +570,7 @@ fn init_inner() -> Result<(), String> {
         // driver may not turn into exclusive mode (`present`); HDR metadata for HDR10 output.
         let dev_exts = instance.enumerate_device_extension_properties(pdev).unwrap_or_default();
         let dev_has = |n: &CStr| dev_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
-        let has_fse = surface_caps2 && dev_has(ash::ext::full_screen_exclusive::NAME) && std::env::var("DS_NO_FSE").is_err();
+        let has_fse = cfg!(windows) && surface_caps2 && dev_has(ash::ext::full_screen_exclusive::NAME) && std::env::var("DS_NO_FSE").is_err();
         if has_fse {
             dexts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
         }
@@ -599,7 +619,7 @@ fn init_inner() -> Result<(), String> {
             .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::calibrated_timestamps::NAME)
             && ash::ext::calibrated_timestamps::Instance::new(&entry, &instance)
                 .get_physical_device_calibrateable_time_domains(pdev)
-                .is_ok_and(|d| d.contains(&vk::TimeDomainEXT::DEVICE) && d.contains(&vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER));
+                .is_ok_and(|d| d.contains(&vk::TimeDomainEXT::DEVICE) && d.contains(&window::time_domain()));
         if calibrated {
             dexts.push(ash::ext::calibrated_timestamps::NAME.as_ptr());
         }
@@ -727,6 +747,9 @@ fn init_inner() -> Result<(), String> {
             dexts.push(ash::khr::shader_maximal_reconvergence::NAME.as_ptr());
         }
         MAX_RECONV.store(max_reconv, std::sync::atomic::Ordering::Relaxed);
+        crate::info!("effective translation policy: source={} portable={} maximal_reconvergence={} per_lane={} (DS_PLAIN_MODES={:?}, DS_MAX_RECONV={:?}); pipeline binaries verify SPIR-V plus reconvergence fingerprint",
+            rdna::SOURCE_HASH, super::shaders::plain_modes(), max_reconv, super::tune::per_lane(),
+            std::env::var("DS_PLAIN_MODES").ok(), std::env::var("DS_MAX_RECONV").ok());
         crate::info!(
             "Vulkan: maximal reconvergence {} (offered {mr_offered}, wanted {mr_wanted}: {}; DS_MAX_RECONV=1 or 0 overrides)",
             if max_reconv { "on: every translated shader declares it" } else { "off" },
@@ -786,15 +809,17 @@ fn init_inner() -> Result<(), String> {
                 Some("0") => Some(false),
                 _ => None,
             };
-            let on = forced.unwrap_or(!checked) && widths & 2 != 0;
+            // Float preservation is independent of Linux's validated NVIDIA subgroup modes.
+            let preserve_default = nan_preserve_default(props.vendor_id, props.device_id);
+            let on = forced.unwrap_or(preserve_default) && widths & 2 != 0;
             NAN_PRESERVE.store(if on { widths } else { 0 }, std::sync::atomic::Ordering::Relaxed);
             crate::info!(
                 "Vulkan: NaN, infinity and signed-zero preservation {} ({}; DS_NAN_PRESERVE=1 or 0 overrides)",
                 if on { "declared by every translated shader" } else { "not declared" },
                 match forced {
                     Some(_) => "DS_NAN_PRESERVE",
-                    None if checked => "a design the translation was checked on",
-                    None => "a design the translation was not checked on",
+                    None if !preserve_default => "a design whose float behavior was checked",
+                    None => "explicit float preservation for this design",
                 }
             );
             crate::info!(
@@ -966,7 +991,23 @@ fn init_inner() -> Result<(), String> {
         let mut pb_feat = pbin::Features { s_type: pbin::ST_FEATURES, p_next: std::ptr::null_mut(), pipeline_binaries: 1 };
         let mut pb_cache = pbin::CacheControl { s_type: pbin::ST_CACHE_CONTROL, p_next: std::ptr::null(), disable_internal_cache: 1 };
         crate::gpu::upscale::apply_features(&mut features, &mut f11, &mut f12, &mut f13, &up_dev);
+        #[cfg(target_os = "linux")]
+        crate::gpu::framegen::apply_features(&core, &mut features);
+        crate::info!("Vulkan enabled extensions: {}", dexts.iter().map(|&p| CStr::from_ptr(p).to_string_lossy()).collect::<Vec<_>>().join(", "));
+        crate::info!("Vulkan enabled features: synchronization2={} timelineSemaphore={} dynamicRendering={} bufferDeviceAddress={} subgroupSizeControl={}; queues: {}",
+            f13.synchronization2, f12.timeline_semaphore, f13.dynamic_rendering, f12.buffer_device_address, f13.subgroup_size_control,
+            qci.iter().map(|q| format!("family {} count {}", q.queue_family_index, q.queue_count)).collect::<Vec<_>>().join(", "));
+        crate::info!("Vulkan renderer paths: push descriptors; device-local images and FE2 sparse mirror; host imports feed mirror uploads. Descriptor buffer, host image copy and pageable device-local memory are not renderer paths on either platform.");
         let mut mutable = vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default().mutable_descriptor_type(true);
+        // Value-only compatibility identity, before push_next links these feature structs.
+        // Driver UUID/version alone does not distinguish enabled robustness/subgroup features.
+        let mut binary_extensions: Vec<_> = dexts.iter().map(|&p| CStr::from_ptr(p).to_string_lossy().into_owned()).collect();
+        binary_extensions.sort();
+        let binary_present_wait = has_pw;
+        let binary_features = format!("{features:?}|{f11:?}|{f12:?}|{f13:?}|{}|{:?}|{barycentric}|{max_reconv}|{}|{pbins}|{binary_present_wait}|{has_fault}|{has_stats}",
+            has_robust2, if has_robust2 { Some(r2) } else { None }, up_dev.mutable_descriptor);
+        let binary_compatibility = format!("contract1|{binary_extensions:?}|{binary_features}");
+        crate::info!("Vulkan pipeline compatibility: {binary_compatibility}");
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
@@ -1082,7 +1123,7 @@ fn init_inner() -> Result<(), String> {
             let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
             device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci), None).map_err(|e| format!("effects timeline semaphore: {e}"))?
         };
-        let pbin = if pbins { pbin::Fns::load(&instance, pdev, device.handle()) } else { None };
+        let pbin = if pbins { pbin::Fns::load(&instance, pdev, device.handle(), binary_compatibility.as_bytes()) } else { None };
         if pbins {
             match &pbin {
                 Some(_) => crate::info!("Vulkan pipeline binaries: on"),
@@ -1094,6 +1135,7 @@ fn init_inner() -> Result<(), String> {
             batches,
             cpu_done,
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),
+            #[cfg(windows)]
             win32_i: ash::khr::win32_surface::Instance::new(&entry, &instance),
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
@@ -1332,10 +1374,13 @@ pub fn note_alloc(what: &str, size: u64, t0: std::time::Instant) {
 /// stalled while the driver compiles).
 pub fn note_submit(what: &'static str, t0: std::time::Instant, t1: std::time::Instant) {
     let all = t0.elapsed();
+    let lock = t1 - t0;
+    if super::timeline::on() {
+        super::timeline::split_back(&format!("Vulkan / {}", crate::log::thread_name()), lock, all.saturating_sub(lock), what);
+    }
     if all.as_micros() < 2000 {
         return;
     }
-    let lock = t1 - t0;
     // (`DS_IMPORT_LOG=1`: each such call logged, to line up with the imports logged beside it.)
     static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *LOG.get_or_init(|| std::env::var("DS_IMPORT_LOG").ok().as_deref() == Some("1")) {
@@ -2257,7 +2302,7 @@ impl Ctx {
     /// without VK_EXT_calibrated_timestamps).
     pub fn calibrate(&self) -> Option<(u64, i64)> {
         let cal = self.calibrated.as_ref()?;
-        let info = [vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::DEVICE), vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::QUERY_PERFORMANCE_COUNTER)];
+        let info = [vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::DEVICE), vk::CalibratedTimestampInfoEXT::default().time_domain(window::time_domain())];
         let (t, _) = unsafe { cal.get_calibrated_timestamps(&info) }.ok()?;
         Some((t[0], t[1] as i64))
     }
@@ -2436,5 +2481,33 @@ impl Ctx {
         ss.extend(self.progress_signal());
         let si = vk::SubmitInfo2::default().command_buffer_infos(&cbs).wait_semaphore_infos(&ws).signal_semaphore_infos(&ss);
         unsafe { self.device.queue_submit2(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit2: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod validation_switch_tests {
+    #[test]
+    fn subgroup_policy_includes_blackwell_boundary() {
+        assert!(super::modes_checked_on(0x10de, 0x2684));
+        assert!(super::modes_checked_on(0x10de, 0x2b7f));
+        assert_eq!(super::modes_checked_on(0x10de, 0x2b80), cfg!(target_os = "linux"));
+        assert_eq!(super::modes_checked_on(0x10de, 0x2bb1), cfg!(target_os = "linux"));
+        assert!(!super::modes_checked_on(0x1002, 0x744c));
+        assert!(!super::modes_checked_on(0x8086, 0x56a0));
+        // Linux NVIDIA subgroup support must not opt Blackwell out of float preservation.
+        assert!(!super::nan_preserve_default(0x10de, 0x2684));
+        assert!(super::nan_preserve_default(0x10de, 0x2b80));
+        assert!(super::nan_preserve_default(0x10de, 0x2bb1));
+        assert!(super::nan_preserve_default(0x1002, 0x744c));
+        assert!(super::nan_preserve_default(0x8086, 0x56a0));
+    }
+
+    #[test]
+    fn explicit_zero_disables_validation() {
+        use std::ffi::OsStr;
+        assert!(!super::validation_requested(None));
+        assert!(!super::validation_requested(Some(OsStr::new("0"))));
+        assert!(super::validation_requested(Some(OsStr::new("1"))));
+        assert!(super::validation_requested(Some(OsStr::new(""))));
     }
 }

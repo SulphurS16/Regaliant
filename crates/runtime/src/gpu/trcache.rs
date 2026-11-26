@@ -24,7 +24,7 @@ const MAGIC: &[u8; 8] = b"DSTRANS4";
 
 /// Environment switches the translator reads (`rdna`; the dumps write files
 /// while translating): any of them set keeps the store off.
-const TRANSLATOR_ENV: [&str; 17] = [
+pub(crate) const TRANSLATOR_ENV: [&str; 17] = [
     "DS_EXEC_PARTIAL",
     "DS_LOOP_LIMIT",
     "DS_LOCKSTEP",
@@ -51,6 +51,7 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// Translations waiting for the `trcache-write` thread: (file, encoded).
 static QUEUE: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
 static QUEUED: Condvar = Condvar::new();
+static PENDING: AtomicU64 = AtomicU64::new(0);
 
 /// The first translator switch set in the environment (`TRANSLATOR_ENV`):
 /// translations then differ from the stores' under the same keys, so the
@@ -139,7 +140,9 @@ pub fn store(plan_key: u64, spec_hash: u64, out: &Output) {
     STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("trcache-write".into()).spawn(writer);
     });
-    QUEUE.lock().push((p, encode(out, plan_key, spec_hash)));
+    let bytes = encode(out, plan_key, spec_hash);
+    PENDING.fetch_add(1, Ordering::Release);
+    QUEUE.lock().push((p, bytes));
     QUEUED.notify_one();
 }
 
@@ -155,15 +158,28 @@ fn writer() {
         for (p, bytes) in items {
             let z = miniz_oxide::deflate::compress_to_vec(&bytes, 1);
             // (A temporary name first: two threads may make the same one.)
-            let tmp = p.with_extension("tmp");
+            let tmp = p.with_extension(format!("{}.tmp", std::process::id()));
             if std::fs::write(&tmp, &z).and_then(|_| std::fs::rename(&tmp, &p)).is_ok() {
                 STATS[2].fetch_add(1, Ordering::Relaxed);
                 STATS[3].fetch_add(z.len() as u64, Ordering::Relaxed);
             } else {
                 let _ = std::fs::remove_file(&tmp);
             }
+            PENDING.fetch_sub(1, Ordering::Release);
         }
     }
+}
+
+/// Drain queued AND in-flight writes before Linux's process-lifetime workers end.
+/// Work still translating may enqueue later; a bounded shutdown never waits forever.
+#[cfg(target_os = "linux")]
+pub fn flush() {
+    let start = std::time::Instant::now();
+    while PENDING.load(Ordering::Acquire) != 0 && start.elapsed() < std::time::Duration::from_secs(5) {
+        QUEUED.notify_one();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    crate::info!("translation store shutdown: {} writes pending after {}ms", PENDING.load(Ordering::Acquire), start.elapsed().as_millis());
 }
 
 /// `verify`: the translation loaded against the one made again.
@@ -211,6 +227,7 @@ fn kind_code(k: BindingKind) -> (u8, usize) {
         BindingKind::LodStats => (13, 0),
         BindingKind::Address(i) => (14, i),
         BindingKind::Marks => (15, 0),
+        BindingKind::CubeFaces(i) => (16, i),
     }
 }
 
@@ -232,6 +249,7 @@ fn kind_of(tag: u8, i: usize) -> Option<BindingKind> {
         13 => BindingKind::LodStats,
         14 => BindingKind::Address(i),
         15 => BindingKind::Marks,
+        16 => BindingKind::CubeFaces(i),
         _ => return None,
     })
 }
@@ -407,7 +425,7 @@ mod tests {
     fn round_trip() {
         let o = Output {
             spirv: vec![0x0723_0203, 1, 2, 3, 0xFFFF_FFFF],
-            bindings: vec![Binding { binding: 0, kind: BindingKind::SgprData }, Binding { binding: 3, kind: BindingKind::Buffer(7) }, Binding { binding: 9, kind: BindingKind::CompareSampler(2) }],
+            bindings: vec![Binding { binding: 0, kind: BindingKind::SgprData }, Binding { binding: 3, kind: BindingKind::Buffer(7) }, Binding { binding: 9, kind: BindingKind::CompareSampler(2) }, Binding { binding: 10, kind: BindingKind::CubeFaces(4) }],
             params: 4,
             mrt_mask: 0b101,
             param_mask: 0xF0,

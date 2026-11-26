@@ -55,3 +55,5 @@ mod tests {
         assert_eq!(super::stamp_text("other"), "other");
     }
 }
+
+pub mod files;

@@ -10,12 +10,14 @@
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use windows_sys::Win32::Devices::Display::*;
-use windows_sys::Win32::Foundation::{LPARAM, RECT};
-use windows_sys::Win32::Graphics::Gdi::*;
 
 pub use dsconfig::display::{Mode, Monitor, current_mode, modes, monitors};
-use dsconfig::display::{devmode, registry_mode, targets};
+use dsconfig::display::registry_mode;
+
+#[cfg_attr(windows, path = "platform/windows/display.rs")]
+#[cfg_attr(target_os = "linux", path = "platform/linux/display.rs")]
+mod host;
+pub use host::{set_mode, restore, restore_on_exit, hdr_now};
 
 #[derive(Default)]
 struct Choice {
@@ -37,10 +39,6 @@ struct Lists {
 }
 
 static LISTS: OnceLock<Lists> = OnceLock::new();
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 /// The chosen monitor (display.txt), else the primary one; None without any monitor.
 pub fn target() -> Option<Monitor> {
@@ -113,53 +111,6 @@ fn paced_rate(at: &[Mode]) -> Option<u32> {
         return None;
     }
     at.iter().map(|m| m.hz).filter(|&r| r >= 59 && ((r as f64 / 60.0) - (r as f64 / 60.0).round()).abs() < 0.02).max()
-}
-
-/// Sets `device` to `mode` for exclusive fullscreen (until `restore`); false when Windows
-/// refuses it.
-pub fn set_mode(device: &str, mode: Mode) -> bool {
-    if current_mode(device) == Some(mode) {
-        return true;
-    }
-    let dev = wide(device);
-    let mut dm = devmode();
-    dm.dmPelsWidth = mode.w;
-    dm.dmPelsHeight = mode.h;
-    dm.dmDisplayFrequency = mode.hz;
-    dm.dmBitsPerPel = 32;
-    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
-    let r = unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), &dm, std::ptr::null_mut(), CDS_FULLSCREEN, std::ptr::null()) };
-    if r == DISP_CHANGE_SUCCESSFUL {
-        *CHANGED.lock() = Some(device.to_string());
-        crate::info!("display: {device} set to {}x{} at {} Hz", mode.w, mode.h, mode.hz);
-        true
-    } else {
-        crate::warn!("display: {device} refused {}x{} at {} Hz (code {r})", mode.w, mode.h, mode.hz);
-        false
-    }
-}
-
-/// Puts back the desktop's mode on the monitor `set_mode` changed (exclusive fullscreen ends,
-/// the game loses focus or quits); from any thread.
-pub fn restore() {
-    // (A test's rate stays for the run: `restore_on_exit` puts the desktop's back.)
-    if test_hz().is_some() {
-        return;
-    }
-    let Some(device) = CHANGED.lock().take() else { return };
-    let dev = wide(&device);
-    let r = unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null()) };
-    crate::info!("display: {device} back to its desktop mode{}", if r == DISP_CHANGE_SUCCESSFUL { String::new() } else { format!(" (code {r})") });
-}
-
-/// `restore` on the way out of the process (a quit or a fatal error): waits at most 200 ms for
-/// the lock (a thread that died holding it must not keep the process alive).
-pub fn restore_on_exit() {
-    let Some(mut g) = CHANGED.try_lock_for(std::time::Duration::from_millis(200)) else { return };
-    let Some(device) = g.take() else { return };
-    drop(g);
-    let dev = wide(&device);
-    unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null()) };
 }
 
 /// Whether the port changed a monitor's mode (exclusive fullscreen holds it).
@@ -313,11 +264,6 @@ pub fn set_refresh_index(i: u32) {
     }
     save();
     crate::gpu::vk::window::reapply_mode();
-}
-
-/// Whether the monitor the window is on has Windows' HDR turned on now, and its SDR white.
-pub fn hdr_now(device: &str) -> Option<f32> {
-    targets().into_iter().find(|t| t.0.eq_ignore_ascii_case(device)).filter(|t| t.3).map(|t| t.4)
 }
 
 #[cfg(test)]

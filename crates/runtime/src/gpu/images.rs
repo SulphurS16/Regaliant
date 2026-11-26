@@ -85,9 +85,52 @@ static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// `DS_TRACE_CLEARS=1` (diagnosis): fast clears made pending and applied, with the flip and
 /// thread (`trace clears` lines).
+pub(crate) static CLEAR_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn trace_clears() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
+    static FLIPS: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    CLEAR_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+        || *ON.get_or_init(|| std::env::var("DS_TRACE_CLEARS").is_ok_and(|v| v == "1"))
+        || FLIPS.get_or_init(|| {
+            let value = std::env::var("DS_TRACE_CLEARS_FLIPS").ok()?;
+            let (a, b) = value.split_once(':')?;
+            let (a, b) = (a.parse::<u64>().ok()?, b.parse::<u64>().ok()?);
+            (a <= b && b - a <= 8).then_some((a, b))
+        }).is_some_and(|(a, b)| {
+            let flip = crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1;
+            (a..=b).contains(&flip)
+        })
+}
+
+/// Bisect the metadata handoff added upstream: bit 0 colour targets, bit 1 depth targets.
+/// 3 is unchanged behaviour; 0 restores the old bind/resolve path, not a rendering fix.
+fn meta_claim_kind(mask: u8, format: vk::Format) -> bool {
+    mask & if is_depth(format) { 2 } else { 1 } != 0
+}
+
+pub(crate) fn meta_claim_enabled(format: vk::Format) -> bool {
+    static MASK: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mask = *MASK.get_or_init(|| {
+        // On Linux the colour handoff overexposed the scene (mean brightness of the saved
+        // tunnel scene 0.60 with it, 0.07 without; depth handoff alone is fine), so Linux
+        // claims depth only until the colour case is understood. Windows keeps upstream's 3.
+        let default = if cfg!(target_os = "linux") { 2 } else { 3 };
+        let mask = std::env::var("DS_META_CLAIMS").ok().and_then(|v| v.parse::<u8>().ok()).filter(|&v| v <= 3).unwrap_or(default);
+        crate::info!("images: metadata claim mask {mask} (1 colour, 2 depth; 3 upstream default, 2 the Linux default); claim rebind invalidation {}", meta_claim_rebind());
+        mask
+    });
+    meta_claim_kind(mask, format)
+}
+
+/// Diagnostic candidate: use the attachment-binding generation protocol on a claim too.
+/// The upstream claim updates NOTE_GEN but bypasses bind_clear_metadata's LOOKUP_GEN.
+fn meta_claim_rebind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_META_CLAIM_REBIND").ok().as_deref() == Some("1"))
+}
+
+fn bind_claim_metadata(map: &mut std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>, meta: u64, binding: (ImageKey, [u32; 2]), invalidate: bool) -> bool {
+    if invalidate { bind_clear_metadata(map, meta, binding) } else { map.insert(meta, binding) != Some(binding) }
 }
 
 /// A pending fast clear: its metadata address, the value a fill gave it (None: a write of
@@ -200,6 +243,56 @@ mod clear_tests {
 
     fn key(base: u64) -> ImageKey {
         ImageKey { base, format: vk::Format::R8_UNORM, width: 512, height: 512, layers: 1, levels: 1, ty3d: false, cube: false }
+    }
+
+    #[test]
+    fn metadata_claim_controls_separate_colour_and_depth() {
+        for (mask, colour, depth) in [(0, false, false), (1, true, false), (2, false, true), (3, true, true)] {
+            assert_eq!(meta_claim_kind(mask, vk::Format::R16G16B16A16_SFLOAT), colour);
+            assert_eq!(meta_claim_kind(mask, vk::Format::D32_SFLOAT_S8_UINT), depth);
+        }
+    }
+
+    #[test]
+    fn fractional_ui_clear_after_metadata_rebind() {
+        // CPU offscreen model: 240x135 logical at 1.6 density, two moving UI rectangles.
+        // Vulkan is deliberately not needed; exercise the real attachment memo invalidation
+        // and pending-clear routing. Merely repainting the new rectangle leaves a trail.
+        let mut a = key(0x1000); a.width = 384; a.height = 216;
+        let mut b = a; b.width = 240; b.height = 135;
+        let surface = Surface { base: a.base, format: a.format, width: a.width, height: a.height,
+            layers: 1, levels: 1, ty3d: false, mip: 0, slice: 0, stencil_base: 0, meta: 0x8000, clear: [0; 2] };
+        let target = Target { key: a, image: vk::Image::null(), view: vk::ImageView::null(),
+            used: UseStamp::new(0), format: a.format, width: a.width, height: a.height };
+        let mut metadata = std::collections::BTreeMap::new();
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [0; 2])));
+        tls(|m| { m.targets.insert(surface_key(&surface), target); });
+        let mut pixels = vec![0u8; 384 * 216];
+        for x in 32..64 { pixels[32 * 384 + x] = 255; }
+        // A differently sized incarnation is bound between frames.
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (b, [0; 2])));
+        let cached = tls(|m| m.targets.get(&surface_key(&surface)).copied());
+        assert!(cached.is_none(), "stale attachment would leave the clear routed to the other image");
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [0; 2])));
+        let mut pending = std::collections::HashMap::new();
+        merge_clear(&mut pending, metadata[&surface.meta].0, surface.meta, Some(0), 0);
+        if pending.remove(&a).is_some() { pixels.fill(0); }
+        for x in 48..80 { pixels[48 * 384 + x] = 255; }
+        assert!(pixels[32 * 384 + 32..32 * 384 + 64].iter().all(|v| *v == 0));
+        assert!(pixels[48 * 384 + 48..48 * 384 + 80].iter().all(|v| *v == 255));
+        let generation = LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire);
+        assert!(!bind_clear_metadata(&mut metadata, surface.meta, (a, [0; 2])));
+        assert_eq!(LOOKUP_GEN.load(std::sync::atomic::Ordering::Acquire), generation);
+        // Same image with different clear words must invalidate too.
+        assert!(bind_clear_metadata(&mut metadata, surface.meta, (a, [1; 2])));
+        // Upstream's new claim path can change the binding without expiring a cached target.
+        // The opt-in rebind candidate follows the existing attachment protocol instead.
+        tls(|m| { m.targets.insert(surface_key(&surface), target); });
+        assert!(bind_claim_metadata(&mut metadata, surface.meta, (b, [0; 2]), false));
+        assert!(tls(|m| m.targets.contains_key(&surface_key(&surface))));
+        assert!(bind_claim_metadata(&mut metadata, surface.meta, (a, [0; 2]), true));
+        assert!(tls(|m| m.targets.get(&surface_key(&surface)).is_none()));
+        assert_eq!(metadata[&surface.meta], (a, [0; 2]));
     }
 
     #[test]
@@ -444,6 +537,23 @@ fn surface_key(s: &Surface) -> SurfaceKey {
     (s.base, s.format.as_raw(), s.width, s.height, s.layers, s.levels, s.ty3d, s.mip, s.slice, s.stencil_base, s.meta, s.clear)
 }
 
+/// Register a target's clear-metadata binding. Attachment and fixed-draw memos must not
+/// hide a later rebind after another layout/image used the same metadata allocation.
+/// NOTE_GEN alone invalidates write notes, not those attachment lookups.
+pub(crate) static METADATA_REBINDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn bind_clear_metadata(map: &mut std::collections::BTreeMap<u64, (ImageKey, [u32; 2])>, meta: u64, binding: (ImageKey, [u32; 2])) -> bool {
+    let previous = map.insert(meta, binding);
+    if previous == Some(binding) { return false; }
+    if previous.is_some() {
+        METADATA_REBINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+        if trace_clears() {
+            crate::info!("trace clears: metadata {meta:#x} rebound from {:?} to {:?}; attachment memos invalidated", previous, binding);
+        }
+    }
+    true
+}
+
 /// Entries the memos of T# lookups hold before they are emptied (the
 /// per-thread `Tls::keys` and `Tls::views`, the cache's `key_memo` and
 /// `view_memo`); they are made with room for that many, so an insert never
@@ -670,6 +780,7 @@ pub fn key_hit(t: &Tsharp, storage: bool) -> Option<Option<ImageKey>> {
 
 /// `Images::target`, from this thread's memo when it holds.
 pub fn target(s: &Surface) -> Result<Target, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ImageLookup);
     let k = surface_key(s);
     if let Some(t) = tls(|m| m.targets.get(&k).copied()) {
         t.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
@@ -1091,7 +1202,8 @@ pub fn float_stats(format: vk::Format, raw: &[u8]) -> Option<String> {
             format!("{n} [{:.4}, {:.4}] mean {mean:.4} nan {} inf {}", s.0, s.1, s.4, s.5)
         })
         .collect();
-    Some(parts.join("; "))
+    let prefix = if matches!(format, F::R32_UINT | F::R32_SINT) { "integer target interpreted as f32 bits: " } else { "" };
+    Some(format!("{prefix}{}", parts.join("; ")))
 }
 
 /// A render target or depth/stencil attachment.
@@ -1922,6 +2034,7 @@ fn record_batched(staging: (vk::Buffer, vk::DeviceMemory), bytes: u64, f: &dyn F
 /// open (`tune upload_batch`: ahead of every batch, `exec::submit_batch`,
 /// and of the cache's own submissions), and frees what completed ones held.
 pub fn flush_uploads() {
+    let _trace = super::timeline::section("submit uploads");
     if BATCHED_LIVE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return;
     }
@@ -3026,6 +3139,20 @@ fn record_upload(cmd: vk::CommandBuffer, image: vk::Image, first: bool, buf: vk:
     }
 }
 
+fn partial_residency_note(key: ImageKey, skipped: usize, first: bool) -> String {
+    PARTIAL_NOTES[usize::from(!first)].fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
+    format!("partially resident texture: {skipped} (mip, layer) not mapped, {}; image {:#x} {}x{} layers {} levels {} {:?}",
+        if first { "zero-filled" } else { "left as they were" }, key.base, key.width, key.height, key.layers, key.levels, key.format)
+}
+// Counts unavailable subresources reported by upload jobs, not distinct resident textures.
+static PARTIAL_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(target_os = "linux")]
+pub fn play_counters() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [PARTIAL_NOTES[0].load(Relaxed), PARTIAL_NOTES[1].load(Relaxed), GPU_DETILE[2].load(Relaxed),
+        GPU_DETILE[5].load(Relaxed), REMAP_UPLOADS.iter().map(|v| v[0].load(Relaxed)).sum()]
+}
+
 /// A texture's re-upload left by `refresh` for after the image cache's lock
 /// (since 2026-11-01): its write marks taken and re-armed under the lock,
 /// its parts chosen and detiled outside it by the thread that took them, its
@@ -3293,7 +3420,7 @@ fn prepare_reupload(job: &RefreshJob) -> Result<Prepared, String> {
     }
     push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
     if skipped > 0 {
-        notes.push(format!("partially resident texture: {skipped} (mip, layer) not mapped, {}", if job.first { "zero-filled" } else { "left as they were" }));
+        notes.push(partial_residency_note(job.key, skipped, job.first));
     }
     Ok(Prepared { copy: Some((st, regions, total)), size, notes })
 }
@@ -3337,7 +3464,7 @@ pub fn with<R>(f: impl FnOnce(&mut Images) -> R) -> R {
     if holder_trace() {
         let l = std::panic::Location::caller();
         *HOLDER_AT.lock() = (crate::log::thread_name(), l.file(), l.line());
-        HOLDER.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
+        HOLDER.store(unsafe { crate::platform::os::Win32::System::Threading::GetCurrentThreadId() }, std::sync::atomic::Ordering::Release);
     }
     let held_from = holds_on().then(std::time::Instant::now);
     if let (Some(a), Some(b)) = (asked, held_from) {
@@ -4415,7 +4542,7 @@ impl Images {
                         PART_UPLOADS[3].fetch_add(bytes, Relaxed);
                     }
                     if skipped > 0 {
-                        self.report(format!("partially resident texture: {skipped} (mip, layer) not mapped, {}", if first { "zero-filled" } else { "left as they were" }));
+                        self.report(partial_residency_note(key, skipped, first));
                     }
                     self.uploads += 1;
                     return Ok((t.base, size));
@@ -4476,10 +4603,7 @@ impl Images {
             push_zero_regions(&lay, block, zero_off as u64, &zeroed, &mut regions);
         }
         if skipped > 0 {
-            self.report(format!(
-                "partially resident texture: {skipped} (mip, layer) not mapped, {}",
-                if first { "zero-filled" } else { "left as they were" }
-            ));
+            self.report(partial_residency_note(key, skipped, first));
         }
         let t_stage = std::time::Instant::now();
         let (buf, mem) = (st.buf, st.mem);
@@ -5476,6 +5600,9 @@ impl Images {
         let others: Vec<ImageKey> = self.pending_clears.iter().filter(|(k, v)| **k != key && v.0 == meta && v.3 == 0).map(|(k, _)| *k).collect();
         for &o in &others {
             if let Some(e) = self.pending_clears.remove(&o) {
+                if trace_clears() {
+                    crate::info!("trace clears: claim transfer {o:?} -> {key:?}, metadata {meta:#x}, pending {e:?}, previous binding {:?}, destination words {clear:08x?}", self.meta_of.get(&meta));
+                }
                 merge_pending(&mut self.pending_clears, key, e);
                 META_CLAIMS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if trace_clears() {
@@ -5494,7 +5621,7 @@ impl Images {
                 }
             }
         }
-        if self.meta_of.insert(meta, (key, clear)) != Some((key, clear)) {
+        if bind_claim_metadata(&mut self.meta_of, meta, (key, clear), meta_claim_rebind()) {
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
@@ -6528,7 +6655,7 @@ impl Images {
                 crate::info!("layer bind: {:#x} {}x{} {:?} slice {} of {} (image {} layers), metadata {:#x}, flip {}", s.base, s.width, s.height, s.format, s.slice, s.layers, k.layers, s.meta, super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
             }
         }
-        if s.meta != 0 && self.meta_of.insert(s.meta, (k, s.clear)) != Some((k, s.clear)) {
+        if s.meta != 0 && bind_clear_metadata(&mut self.meta_of, s.meta, (k, s.clear)) {
             self.note_gen += 1;
             NOTE_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
@@ -6540,6 +6667,7 @@ impl Images {
 
     /// Attachment for a color or depth/stencil surface (one mip level, one layer).
     pub fn target(&mut self, s: &Surface) -> Result<Target, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ImageLookup);
         let k = self.surface_image(s)?;
         let img = self.map.get_mut(&k).unwrap();
         img.used.stamp(super::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
@@ -6902,6 +7030,12 @@ impl Images {
 
     /// `read_back_aspect` of one mip level (`width`, `height`: that level's size).
     pub fn read_back_level(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32, level: u32) -> Result<Vec<u8>, String> {
+        self.read_back_slice(image, format, aspect, width, height, level, 0, 1, 1)
+    }
+
+    /// Readback of consecutive array layers, or a whole 3D mip (depth > 1).
+    #[allow(clippy::too_many_arguments)]
+    fn read_back_slice(&mut self, image: vk::Image, format: vk::Format, aspect: vk::ImageAspectFlags, width: u32, height: u32, level: u32, layer: u32, depth: u32, layers: u32) -> Result<Vec<u8>, String> {
         let bpp = if aspect == vk::ImageAspectFlags::STENCIL {
             1
         } else if aspect == vk::ImageAspectFlags::DEPTH {
@@ -6909,15 +7043,15 @@ impl Images {
         } else {
             texel_bytes(format) as u64
         };
-        let size = bpp * width as u64 * height as u64;
+        let size = bpp * width as u64 * height as u64 * depth as u64 * layers as u64;
         let c = ctx();
         let (buf, mem, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
         self.one_shot(|cmd| unsafe {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             let region = vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: level, base_array_layer: 0, layer_count: 1 })
-                .image_extent(vk::Extent3D { width, height, depth: 1 });
+                .image_subresource(vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: level, base_array_layer: layer, layer_count: layers })
+                .image_extent(vk::Extent3D { width, height, depth });
             c.device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buf, &[region]);
             let hb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[hb], &[], &[]);
@@ -6929,6 +7063,24 @@ impl Images {
             c.device.free_memory(mem, None);
         }
         Ok(out)
+    }
+
+    /// Read an existing cache incarnation only: observing a draw must not create a new
+    /// target, upload guest bytes or change alias ownership. Return the actual selected key.
+    pub fn diagnostic_read(&mut self, wanted: ImageKey, level: u32, slice: u32, attachment: bool, storage: bool) -> Result<(ImageKey, Vec<u8>), String> {
+        let key = if attachment {
+            if self.map.contains_key(&wanted) { Some(wanted) } else { self.alias(&wanted, false) }
+        } else { self.lookup(&wanted, storage).map(|(k, _)| k) }.ok_or("no cached image (not created/uploaded yet)")?;
+        if level >= key.levels || (!key.ty3d && slice >= key.layers) { return Err("subresource outside cached image".into()); }
+        let (w, h) = ((key.width >> level).max(1), (key.height >> level).max(1));
+        let depth = if key.ty3d { (key.layers >> level).max(1) } else { 1 };
+        // Sampled/storage array views can read/write every layer, not only layer zero.
+        let layers = if !attachment && !key.ty3d { key.layers - slice } else { 1 };
+        let aspect = if is_depth(key.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+        if is_compressed(key.format) || texel_bytes(key.format) == 0 { return Err("compressed/unknown-format diagnostic read skipped".into()); }
+        if w as u64 * h as u64 * depth as u64 * layers as u64 * texel_bytes(key.format) as u64 > 64 << 20 { return Err("diagnostic image exceeds 64 MiB limit".into()); }
+        let raw = self.read_back_slice(self.map[&key].image, key.format, aspect, w, h, level, if key.ty3d { 0 } else { slice }, depth, layers)?;
+        Ok((key, raw))
     }
 
     /// Share of zero bytes in the cached image a T# resolves to, at the T#'s
@@ -7230,15 +7382,40 @@ impl Images {
     /// Writes the GPU-written color images (mip 0, layer 0) to `dir` as PNG
     /// files named <address>_<width>x<height>_<format>.png (frame captures).
     pub fn dump_targets(&mut self, dir: &std::path::Path) -> usize {
-        let mut keys: Vec<ImageKey> = self.map.values().filter(|i| i.gpu_written && !is_depth(i.key.format)).map(|i| i.key).collect();
+        self.dump_targets_inner(dir, None)
+    }
+
+    /// Targets bound for writing in one captured frame, including raw texels and a manifest.
+    /// No address-sorted cap: it could exclude the scene while retaining old menu targets.
+    pub fn dump_frame_targets(&mut self, dir: &std::path::Path, bases: &std::collections::BTreeSet<u64>) -> usize {
+        self.dump_targets_inner(dir, Some(bases))
+    }
+
+    fn dump_targets_inner(&mut self, dir: &std::path::Path, bases: Option<&std::collections::BTreeSet<u64>>) -> usize {
+        let selected = |i: &&Image| i.gpu_written && bases.is_none_or(|b| b.contains(&i.key.base));
+        let mut keys: Vec<ImageKey> = self.map.values().filter(selected).filter(|i| !is_depth(i.key.format)).map(|i| i.key).collect();
         keys.sort_by_key(|k| (k.base, k.format.as_raw()));
         let _ = std::fs::create_dir_all(dir);
         let mut n = 0;
-        let mut stats = String::new();
-        for k in keys.into_iter().take(256) {
+        let mut stats = String::from("Snapshots at frame end, mip 0 / layer 0. Raw files: little-endian u32 width,height then native-format texels. Match addresses to cb/depth/written image bindings in capture-<flip>.txt; targets may be reused within a frame.
+");
+        for k in keys.into_iter().take(if bases.is_some() { usize::MAX } else { 256 }) {
             let image = self.map[&k].image;
-            let Ok(raw) = self.read_back(image, k.format, k.width, k.height) else { continue };
-            let name = format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format);
+            let name = if bases.is_some() {
+                format!("{:010x}_{}x{}_{:?}_levels{}_layers{}_3d{}_cube{}", k.base, k.width, k.height, k.format, k.levels, k.layers, k.ty3d, k.cube)
+            } else { format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format) };
+            let raw = match self.read_back(image, k.format, k.width, k.height) {
+                Ok(raw) => raw,
+                Err(e) => { stats.push_str(&format!("{name}: readback failed: {e}\n")); continue; }
+            };
+            if bases.is_some() {
+                let mut bytes = Vec::with_capacity(8 + raw.len());
+                bytes.extend_from_slice(&k.width.to_le_bytes());
+                bytes.extend_from_slice(&k.height.to_le_bytes());
+                bytes.extend_from_slice(&raw);
+                if let Err(e) = std::fs::write(dir.join(format!("{name}.raw")), bytes) { stats.push_str(&format!("{name}: write failed: {e}\n")); }
+                stats.push_str(&format!("{name}: {} bytes, {} nonzero bytes, {} levels, {} layers\n", raw.len(), raw.iter().filter(|&&b| b != 0).count(), k.levels, k.layers));
+            }
             if let Some(s) = float_stats(k.format, &raw) {
                 stats.push_str(&format!("{name}: {s}\n"));
             }
@@ -7248,13 +7425,22 @@ impl Images {
             }
         }
         // Depth surfaces: depth statistics and the stencil values present.
-        let mut dkeys: Vec<ImageKey> = self.map.values().filter(|i| i.gpu_written && is_depth(i.key.format)).map(|i| i.key).collect();
+        let mut dkeys: Vec<ImageKey> = self.map.values().filter(selected).filter(|i| is_depth(i.key.format)).map(|i| i.key).collect();
         dkeys.sort_by_key(|k| k.base);
-        for k in dkeys.into_iter().take(64) {
+        for k in dkeys.into_iter().take(if bases.is_some() { usize::MAX } else { 64 }) {
             let image = self.map[&k].image;
-            let name = format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format);
+            let name = if bases.is_some() {
+                format!("{:010x}_{}x{}_{:?}_levels{}_layers{}_3d{}_cube{}", k.base, k.width, k.height, k.format, k.levels, k.layers, k.ty3d, k.cube)
+            } else { format!("{:010x}_{}x{}_{:?}", k.base, k.width, k.height, k.format) };
             if aspects(k.format).contains(vk::ImageAspectFlags::DEPTH) {
                 if let Ok(raw) = self.read_back_aspect(image, k.format, vk::ImageAspectFlags::DEPTH, k.width, k.height) {
+                    if bases.is_some() {
+                        let mut bytes = Vec::with_capacity(8 + raw.len());
+                        bytes.extend_from_slice(&k.width.to_le_bytes());
+                        bytes.extend_from_slice(&k.height.to_le_bytes());
+                        bytes.extend_from_slice(&raw);
+                        if let Err(e) = std::fs::write(dir.join(format!("{name}_depth.raw")), bytes) { stats.push_str(&format!("{name}: depth write failed: {e}\n")); }
+                    }
                     if raw.len() as u64 == 4 * k.width as u64 * k.height as u64 {
                         if let Some(s) = float_stats(vk::Format::R32_SFLOAT, &raw) {
                             stats.push_str(&format!("{name} depth: {s}\n"));
@@ -7434,6 +7620,7 @@ impl Images {
     }
 
     pub fn view(&mut self, t: &Tsharp, storage: bool, frame: u64) -> Result<(vk::ImageView, vk::Image), String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ImageLookup);
         self.view_as(t, storage, frame, None)
     }
 
@@ -7539,6 +7726,10 @@ impl Images {
         let _ = levels;
         let (vt, base_layer, layer_count) = if key.ty3d {
             (vk::ImageViewType::TYPE_3D, 0, 1)
+        } else if t.ty == 11 && want == Some(vk::ImageViewType::TYPE_2D_ARRAY) {
+            // Exact cube texel loads: the same image, format, mip range and swizzle, with
+            // one array layer per face. Integer coordinates are relative to BASE_ARRAY.
+            (vk::ImageViewType::TYPE_2D_ARRAY, t.base_array, t.depth.saturating_sub(t.base_array).max(1))
         } else if t.ty == 9 && want == Some(vk::ImageViewType::TYPE_2D_ARRAY) {
             (vk::ImageViewType::TYPE_2D_ARRAY, 0, 1)
         } else if t.ty == 13 && want == Some(vk::ImageViewType::TYPE_2D) {

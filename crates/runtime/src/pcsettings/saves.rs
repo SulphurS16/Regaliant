@@ -16,15 +16,23 @@ pub const FOLDERS: [&str; 3] = ["Game Folder", "Documents", "Saved Games"];
 /// The folder the import reads (`import_dir`).
 pub const IMPORT_DIR: &str = "PS5 Saves";
 
-/// Where the import looks: the checkout's root in development, else the settings' folder.
+/// Where the import looks: the settings folder (Windows development uses the checkout root).
 pub fn import_dir(paths: &dsconfig::paths::Paths) -> PathBuf {
-    paths.root.as_ref().unwrap_or(&paths.user).join(IMPORT_DIR)
+    import_root(paths).join(IMPORT_DIR)
 }
+#[cfg(windows)]
+fn import_root(paths: &dsconfig::paths::Paths) -> &Path {
+    paths.root.as_deref().unwrap_or(&paths.user)
+}
+#[cfg(target_os = "linux")]
+fn import_root(paths: &dsconfig::paths::Paths) -> &Path { &paths.user }
+
 /// The login user's directory (`savedata`: saves/<user>/<title>/).
 fn user() -> String {
     crate::hle::libs::app::USER_ID.to_string()
 }
 
+#[cfg(windows)]
 fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     unsafe {
@@ -37,6 +45,7 @@ fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
 
 /// The saves' folder of a Save Folder option (0, or a known folder Windows does not give: the
 /// port's own, `port`).
+#[cfg(windows)]
 pub fn folder(option: u32, port: &Path) -> PathBuf {
     use windows::Win32::UI::Shell::{FOLDERID_Documents, FOLDERID_SavedGames};
     let port = port.to_path_buf();
@@ -59,14 +68,15 @@ fn save_name(folder: &str) -> Option<&str> {
 /// Save directories (`SAVEDATA*` or `sdimg_SAVEDATA*` with a `USR-DATA` file) at most four levels
 /// under `dir`.
 fn save_dirs(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    if !crate::platform::files::import_file_type(dir).is_some_and(|t| t.is_dir()) { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if !p.is_dir() {
+        if !crate::platform::files::import_file_type(&p).is_some_and(|t| t.is_dir()) {
             continue;
         }
         let name = e.file_name().to_string_lossy().to_string();
-        if save_name(&name).is_some() && p.join("USR-DATA").is_file() {
+        if save_name(&name).is_some() && crate::platform::files::import_file_type(&p.join("USR-DATA")).is_some_and(|t| t.is_file()) {
             out.push(p);
         } else if depth > 0 && !name.starts_with('.') && !name.starts_with("sdimg_sce_bu_") {
             save_dirs(&p, depth - 1, out);
@@ -81,14 +91,20 @@ fn has_saves(saves: &Path) -> bool {
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<u64> {
+    if !crate::platform::files::import_file_type(from).is_some_and(|t| t.is_dir()) {
+        return Err(std::io::Error::other("save source is not a plain directory"));
+    }
+    crate::platform::files::save_output(to)?;
     std::fs::create_dir_all(to)?;
     let mut n = 0;
     for e in std::fs::read_dir(from)? {
         let e = e?;
+        let Some(ty) = crate::platform::files::import_file_type(&e.path()) else { continue };
         let target = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
+        crate::platform::files::save_output(&target)?;
+        if ty.is_dir() {
             n += copy_dir(&e.path(), &target)?;
-        } else {
+        } else if ty.is_file() {
             std::fs::copy(e.path(), &target)?;
             n += 1;
         }
@@ -100,7 +116,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<u64> {
 /// the saves of the folder used before copied in when it has none; then a pending import.
 pub fn start(paths: &dsconfig::paths::Paths, title: &str) -> PathBuf {
     let option = super::store::value("Setting_PC_SaveFolder").unwrap_or(0);
-    let dir = folder(option, &paths.saves());
+    let dir = crate::platform::file_hooks::save_root(folder(option, &paths.saves()));
     let record = paths.save_folder_record();
     let before = std::fs::read_to_string(&record).ok().map(|s| PathBuf::from(s.trim())).filter(|p| !p.as_os_str().is_empty());
     if let Some(prev) = before.filter(|p| *p != dir) {
@@ -116,7 +132,7 @@ pub fn start(paths: &dsconfig::paths::Paths, title: &str) -> PathBuf {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         crate::warn!("saves: cannot make the save folder {}: {e}", dir.display());
     }
-    let _ = std::fs::write(&record, format!("{}\n", dir.display()));
+    let _ = crate::platform::files::save_output(&record).and_then(|_| std::fs::write(&record, format!("{}\n", dir.display())));
     if super::store::value("Setting_PC_ImportSaves") == Some(1) {
         import(&import_dir(paths), &dir, title);
         super::store::set_value("Setting_PC_ImportSaves", 0);
@@ -127,6 +143,13 @@ pub fn start(paths: &dsconfig::paths::Paths, title: &str) -> PathBuf {
 /// Imports the save directories found in `from` into `saves` (the current ones kept in
 /// save-backups beside it first); `from` renamed when anything was imported.
 pub fn import(from: &Path, saves: &Path, title: &str) -> usize {
+    // The source is renamed after import, so it too must be outside protected trees.
+    for path in [from, saves] {
+        if let Err(e) = crate::platform::files::save_output(path) {
+            crate::warn!("saves: PS5 import: {} refused: {e}", path.display());
+            return 0;
+        }
+    }
     let mut found = Vec::new();
     save_dirs(from, 4, &mut found);
     if found.is_empty() {
@@ -149,6 +172,10 @@ pub fn import(from: &Path, saves: &Path, title: &str) -> usize {
         }
         let name = name.as_os_str();
         let dst = base.join(name);
+        if let Err(e) = crate::platform::files::save_output(&dst) {
+            crate::warn!("saves: PS5 import: {} refused: {e}", dst.display());
+            continue;
+        }
         if dst.is_dir() {
             let keep = saves.parent().unwrap_or(saves).join("save-backups").join(user()).join(title).join(name).join(format!("{stamp}-before-import"));
             if let Err(e) = copy_dir(&dst, &keep) {
@@ -164,8 +191,12 @@ pub fn import(from: &Path, saves: &Path, title: &str) -> usize {
         if let Ok(rd) = std::fs::read_dir(src) {
             for e in rd.flatten() {
                 let p = e.path();
+                let Some(ty) = crate::platform::files::import_file_type(&p) else { continue };
+                if !ty.is_dir() && !ty.is_file() { continue; }
                 let target = dst.join(e.file_name());
-                let r = if p.is_dir() {
+                let r = if let Err(e) = crate::platform::files::save_output(&target) {
+                    Err(e)
+                } else if ty.is_dir() {
                     if e.file_name() == "sce_sys" && target.is_dir() {
                         continue;
                     }
@@ -189,7 +220,7 @@ pub fn import(from: &Path, saves: &Path, title: &str) -> usize {
     }
     if done > 0 {
         let to = from.with_file_name(format!("{} (imported {stamp})", from.file_name().unwrap_or_default().to_string_lossy()));
-        match std::fs::rename(from, &to) {
+        match crate::platform::files::save_output(&to).and_then(|_| std::fs::rename(from, &to)) {
             Ok(()) => crate::info!("saves: PS5 import: {} renamed to {}", from.display(), to.display()),
             Err(e) => crate::warn!("saves: PS5 import: renaming {} failed: {e}", from.display()),
         }
@@ -258,6 +289,77 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn import_skips_links_in_scan_and_copy() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("dsport-ps5import-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let from = base.join(IMPORT_DIR);
+        let outside = base.join("outside/SAVEDATA0PlayerProfile0");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("USR-DATA"), "outside").unwrap();
+        std::fs::create_dir_all(&from).unwrap();
+        symlink(outside.parent().unwrap(), from.join("escaped")).unwrap();
+        symlink(&outside, from.join("SAVEDATA1PlayerProfile0")).unwrap();
+        let invalid = from.join("SAVEDATA2PlayerProfile0");
+        std::fs::create_dir_all(&invalid).unwrap();
+        symlink(outside.join("USR-DATA"), invalid.join("USR-DATA")).unwrap();
+        let saves = base.join("saves");
+        assert_eq!(import(&from, &saves, "PPSA01341"), 0);
+        let valid = from.join("sdimg_SAVEDATA0PlayerProfile0");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(valid.join("USR-DATA"), "ours").unwrap();
+        symlink(&outside, valid.join("linked-directory")).unwrap();
+        symlink(outside.join("USR-DATA"), valid.join("linked-file")).unwrap();
+        assert_eq!(import(&from, &saves, "PPSA01341"), 1);
+        let dst = saves.join(user()).join("PPSA01341/SAVEDATA0PlayerProfile0");
+        assert_eq!(std::fs::read(dst.join("USR-DATA")).unwrap(), b"ours");
+        assert!(!dst.join("linked-directory").exists());
+        assert!(!dst.join("linked-file").exists());
+        assert_eq!(std::fs::read(outside.join("USR-DATA")).unwrap(), b"outside");
+        let linked_root = base.join("linked-root");
+        symlink(outside.parent().unwrap(), &linked_root).unwrap();
+        assert_eq!(import(&linked_root, &saves, "PPSA01341"), 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn import_respects_read_only_roots() {
+        if std::env::var_os("REGALIANT_IMPORT_POLICY_TEST").is_none() {
+            let base = std::env::temp_dir().join(format!("dsport-ps5import-policy-{}", std::process::id()));
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pcsettings::saves::tests::import_respects_read_only_roots", "--nocapture"])
+                .env("REGALIANT_IMPORT_POLICY_TEST", &base).env("DS_READONLY_ROOTS", base.join("protected"))
+                .output().unwrap();
+            assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        let base = PathBuf::from(std::env::var_os("REGALIANT_IMPORT_POLICY_TEST").unwrap());
+        let from = base.join(IMPORT_DIR);
+        let src = from.join("SAVEDATA0PlayerProfile0");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("USR-DATA"), "import").unwrap();
+        let protected = base.join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        assert_eq!(import(&from, &protected.join("saves"), "PPSA01341"), 0);
+        assert!(from.exists());
+        assert!(!protected.join("saves").exists());
+        let saves = base.join("saves");
+        let dst = saves.join(user()).join("PPSA01341/SAVEDATA0PlayerProfile0");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(protected.join("original"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(protected.join("original"), dst.join("USR-DATA")).unwrap();
+        assert_eq!(import(&from, &saves, "PPSA01341"), 0);
+        assert_eq!(std::fs::read(protected.join("original")).unwrap(), b"unchanged");
+        assert!(from.exists());
+        std::fs::rename(&from, protected.join(IMPORT_DIR)).unwrap();
+        assert_eq!(import(&protected.join(IMPORT_DIR), &saves, "PPSA01341"), 0);
+        assert!(protected.join(IMPORT_DIR).exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn import_without_saves_changes_nothing() {
         let base = std::env::temp_dir().join(format!("dsport-ps5import-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -268,3 +370,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+#[cfg(target_os = "linux")]
+pub fn folder(_option: u32, port: &Path) -> PathBuf { port.to_path_buf() }

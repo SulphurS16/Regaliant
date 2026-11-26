@@ -23,7 +23,7 @@ use crate::{reg, sysv};
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::os::windows::fs::FileExt;
+use crate::platform::files::FileExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -221,7 +221,7 @@ fn resolve_path(guest: &str) -> Result<(u32, u64), i32> {
     if md.is_dir {
         return Err(EISDIR);
     }
-    let mem = crate::pcsettings::generated(guest);
+    let mem = crate::platform::file_hooks::generated(guest);
     let mut g = FILES.lock();
     let t = g.get_or_insert_with(Default::default);
     // Another thread may have registered the path meanwhile.
@@ -374,7 +374,7 @@ fn submit(cb: u64, prio: u32, result: u64) -> Result<u32, i32> {
 
 fn worker(n: usize, q: &'static Queue) {
     crate::log::set_thread_name(&format!("apr{n}"));
-    crate::exception::arm_watch_current_thread(false);
+    crate::platform::loader_hooks::arm_watch_current_thread(false);
     loop {
         let s = {
             let mut g = q.pending.lock();
@@ -414,14 +414,15 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
         return Err(EINVAL);
     }
     if let Some(d) = &f.mem {
-        let _w = crate::gpu::track::host_write(dest, size);
+        let _w = crate::platform::file_hooks::host_write(dest, size);
         let what = || format!("apr: read {} [{offset:#x}] into {dest:#x} (memory)", f.path);
         let src = &d[offset as usize..(offset + size) as usize];
-        crate::mem::kernel_io(&what, dest, size, true, || {
+        let result = crate::mem::kernel_io(&what, dest, size, true, || {
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dest as *mut u8, src.len()) };
-            Ok(())
-        })
-        .map_err(|_| EIO)?;
+            Ok(src.len())
+        });
+        crate::platform::file_hooks::note_kernel_read(dest, size, offset, &result, &what);
+        result.map_err(|_| EIO)?;
         STATS[1].fetch_add(1, Ordering::Relaxed);
         STATS[2].fetch_add(size, Ordering::Relaxed);
         return Ok(());
@@ -444,19 +445,19 @@ fn read_into(file_id: u32, dest: u64, size: u64, offset: u64) -> Result<(), i32>
         crate::info!("apr: read {} [{offset:#x}+{size:#x}] -> {dest:#x}", f.path);
     }
     // The kernel writes the buffer: write-tracked pages cannot fault.
-    let _w = crate::gpu::track::host_write(dest, size);
-    crate::gpu::exec::trace_writes(|| format!("apr read of {} [{offset:#x}]", f.path), dest, size);
+    let _w = crate::platform::file_hooks::host_write(dest, size);
+    crate::platform::file_hooks::trace_writes(|| format!("apr read of {} [{offset:#x}]", f.path), dest, size);
     let buf = unsafe { std::slice::from_raw_parts_mut(dest as *mut u8, size as usize) };
-    let mut done = 0usize;
-    while done < buf.len() {
-        let what = || format!("apr: read {} [{:#x}] into {:#x}", f.path, offset + done as u64, dest + done as u64);
-        match crate::mem::kernel_io(&what, dest + done as u64, (buf.len() - done) as u64, true, || h.seek_read(&mut buf[done..], offset + done as u64)) {
-            Ok(0) => return Err(EIO),
-            Ok(n) => done += n,
-            Err(e) => {
-                crate::warn!("apr: read {} failed: {e}", f.path);
-                return Err(EIO);
-            }
+    let what = |done| format!("apr: read {} [{:#x}] into {:#x}", f.path, offset + done, dest + done);
+    match crate::mem::kernel_read_at(&what, buf, offset, |buf, at| h.seek_read(buf, at)) {
+        Ok(n) if n == buf.len() => {}
+        Ok(n) => {
+            crate::warn!("apr: read {} reached EOF after {n} of {} bytes", f.path, buf.len());
+            return Err(EIO);
+        }
+        Err(e) => {
+            crate::warn!("apr: read {} failed: {e}", f.path);
+            return Err(EIO);
         }
     }
     STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -496,7 +497,7 @@ fn execute(s: &Submission) -> (i32, u32) {
                 op::READ => {
                     let ext = r[pos + 1] & 1 != 0;
                     let len = if ext { REC_READ_EXT } else { REC_READ };
-                    let mut b = BitReader { buf: take(len)?, pos: 16 };
+                    let mut b = BitReader { buf: take(len)?, pos: 9 };
                     let size = b.get(33);
                     let dest = b.get(48);
                     let file = b.get(32) as u32;
@@ -508,7 +509,7 @@ fn execute(s: &Submission) -> (i32, u32) {
                 op::GATHER => {
                     let ext = r[pos + 1] & 1 != 0;
                     let len = if ext { REC_GATHER_EXT } else { REC_GATHER };
-                    let mut b = BitReader { buf: take(len)?, pos: 16 };
+                    let mut b = BitReader { buf: take(len)?, pos: 9 };
                     let size = b.get(33);
                     let offset = b.get(if ext { 40 } else { 18 });
                     read_into(gs.file, gs.dest, size, offset)?;
@@ -517,7 +518,7 @@ fn execute(s: &Submission) -> (i32, u32) {
                     Ok(len)
                 }
                 op::SCATTER => {
-                    let mut b = BitReader { buf: take(REC_SCATTER)?, pos: 16 };
+                    let mut b = BitReader { buf: take(REC_SCATTER)?, pos: 9 };
                     let dest = b.get(48);
                     let size = b.get(33);
                     read_into(gs.file, dest, size, gs.offset)?;
@@ -528,7 +529,7 @@ fn execute(s: &Submission) -> (i32, u32) {
                 op::GATHER_SCATTER => {
                     let ext = r[pos + 1] & 1 != 0;
                     let len = if ext { REC_GS_EXT } else { REC_GS };
-                    let mut b = BitReader { buf: take(len)?, pos: 16 };
+                    let mut b = BitReader { buf: take(len)?, pos: 9 };
                     let dest = b.get(48);
                     let size = b.get(33);
                     let offset = b.get(if ext { 40 } else { 32 });
@@ -667,10 +668,13 @@ fn fixed(cb: u64, opc: u8, b1: u8, b2: u8, b3: u8, addr: u64, value: u64, extra:
     append(cb, &rec)
 }
 
+// Read records reserve one flag bit after the opcode, not an entire byte. With
+// eight flag bits even READ needs 161 bits in its 160-bit record (GATHER needs 67
+// in 64); the last field overflowed. Keep all 33 size bits and the measured sizes.
 fn read_rec(file: u32, dest: u64, size: u64, offset: u64) -> Vec<u8> {
     let ext = offset >> 32 != 0;
     let mut b = Bits::new(if ext { REC_READ_EXT } else { REC_READ }, op::READ);
-    b.put(8, ext as u64);
+    b.put(1, ext as u64);
     b.put(33, size);
     b.put(48, dest);
     b.put(32, file as u64);
@@ -835,7 +839,7 @@ sysv! {
         if !gs_state_ok(cb) { return sce(EPERM); }
         let ext = offset > 0x3_FFFF;
         let mut b = Bits::new(if ext { REC_GATHER_EXT } else { REC_GATHER }, op::GATHER);
-        b.put(8, ext as u64);
+        b.put(1, ext as u64);
         b.put(33, size);
         b.put(if ext { 40 } else { 18 }, offset);
         append(cb, &b.buf)
@@ -844,7 +848,7 @@ sysv! {
         if !valid_range(dest, size) { return sce(EINVAL); }
         if !gs_state_ok(cb) { return sce(EPERM); }
         let mut b = Bits::new(REC_SCATTER, op::SCATTER);
-        b.put(8, 0);
+        b.put(1, 0);
         b.put(48, dest);
         b.put(33, size);
         append(cb, &b.buf)
@@ -854,7 +858,7 @@ sysv! {
         if !gs_state_ok(cb) { return sce(EPERM); }
         let ext = offset >> 32 != 0;
         let mut b = Bits::new(if ext { REC_GS_EXT } else { REC_GS }, op::GATHER_SCATTER);
-        b.put(8, ext as u64);
+        b.put(1, ext as u64);
         b.put(48, dest);
         b.put(33, size);
         b.put(if ext { 40 } else { 32 }, offset);
@@ -1037,3 +1041,99 @@ pub fn stats_line() -> String {
 
 #[allow(dead_code)]
 fn _assert_send(_: OnceLock<()>) {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_tests {
+    use super::*;
+    use crate::platform::os::*;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
+
+    #[test]
+    fn read_records_fit_measured_sizes_and_preserve_high_bits() {
+        unsafe {
+            let mut storage = [0u8; 64];
+            let mut header = [0u64; 5];
+            let cb = header.as_mut_ptr() as u64;
+            wr32(cb + OFF_TYPE, TYPE_GS_VALID);
+            wr32(cb + OFF_SIZE, storage.len() as u32);
+            wr64(cb + OFF_DATA, storage.as_mut_ptr() as u64);
+            let dest = MAX_ADDRESS - MAX_READ;
+            let size = MAX_READ;
+            for offset in [0, 0xffff, 0x3ffff, 0x40000, 0x80000000, 0xffffffff, MAX_FILE_OFFSET - 1] {
+                let rec = read_rec(u32::MAX, dest, size, offset);
+                assert_eq!(rec.len() as u64, sceAmprMeasureCommandSizeReadFile(u32::MAX, dest, size, offset));
+                let mut b = BitReader { buf: &rec, pos: 9 };
+                assert_eq!(b.get(33), size);
+                assert_eq!(b.get(48), dest);
+                assert_eq!(b.get(32), u32::MAX as u64);
+                assert_eq!(b.get(if rec[1] & 1 != 0 { 40 } else { 32 }), offset);
+                wr32(cb + OFF_OFFSET, 0);
+                assert_eq!(sceAmprAprCommandBufferReadFileGather(cb, 0, 0, size, offset), 0);
+                let n = rd32(cb + OFF_OFFSET) as usize;
+                assert_eq!(n as u64, sceAmprMeasureCommandSizeReadFileGather(size, offset));
+                let mut b = BitReader { buf: &storage[..n], pos: 9 };
+                assert_eq!(b.get(33), size);
+                assert_eq!(b.get(if storage[1] & 1 != 0 { 40 } else { 18 }), offset);
+                // Use a destination with room for the full 4 GiB read within MAX_ADDRESS.
+                let dest = MAX_ADDRESS - MAX_READ;
+                wr32(cb + OFF_OFFSET, 0);
+                assert_eq!(sceAmprAprCommandBufferReadFileGatherScatter(cb, 0, 0, dest, size, offset), 0);
+                let n = rd32(cb + OFF_OFFSET) as usize;
+                assert_eq!(n as u64, sceAmprMeasureCommandSizeReadFileGatherScatter(dest, size, offset));
+                let mut b = BitReader { buf: &storage[..n], pos: 9 };
+                assert_eq!(b.get(48), dest);
+                assert_eq!(b.get(33), size);
+                assert_eq!(b.get(if storage[1] & 1 != 0 { 40 } else { 32 }), offset);
+            }
+            wr32(cb + OFF_OFFSET, 0);
+            let dest = MAX_ADDRESS - MAX_READ;
+            assert_eq!(sceAmprAprCommandBufferReadFileScatter(cb, 0, 0, dest, size), 0);
+            assert_eq!(rd32(cb + OFF_OFFSET) as u64, sceAmprMeasureCommandSizeReadFileScatter(dest, size));
+            let mut b = BitReader { buf: &storage[..REC_SCATTER as usize], pos: 9 };
+            assert_eq!(b.get(48), dest);
+            assert_eq!(b.get(33), size);
+        }
+    }
+
+    #[test]
+    fn apr_completion_follows_full_read_and_is_not_emitted_after_eof() {
+        crate::hle::kernel::time::init();
+        unsafe {
+            let fd = libc::memfd_create(c"regaliant-apr-completion-test".as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0);
+            let file = Arc::new(File::from_raw_fd(fd));
+            let bytes: Vec<u8> = (0..16384 + 19).map(|i| (i * 73 + (i >> 8)) as u8).collect();
+            assert_eq!(file.write_at(&bytes, 0).unwrap(), bytes.len());
+            let id = {
+                let mut g = FILES.lock();
+                let t = g.get_or_insert_with(Default::default);
+                t.files.push(Arc::new(AprFile { path: "apr-completion-test".into(),
+                    at: crate::hle::kernel::fs::Found::Host(std::path::PathBuf::new()),
+                    size: bytes.len() as u64, handle: Mutex::new(Some(file.clone())), mem: None }));
+                t.files.len() as u32
+            };
+            let p = VirtualAlloc(std::ptr::null(), 24576, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+            assert!(!p.is_null());
+            let destination = p as u64 + 31;
+            let mut marker = 0u64;
+            let mut records = read_rec(id, destination, bytes.len() as u64, 0);
+            let mut end = [0u8; REC_FIXED as usize];
+            end[0] = op::WRITE_ADDR;
+            end[8..16].copy_from_slice(&(&mut marker as *mut u64 as u64).to_le_bytes());
+            end[16..24].copy_from_slice(&1u64.to_le_bytes());
+            records.extend_from_slice(&end);
+            let submission = Submission { id: 1, cb: 0, records, result: 0 };
+            assert_eq!(execute(&submission), (0, 0));
+            assert_eq!(marker, 1);
+            assert_eq!(std::slice::from_raw_parts(destination as *const u8, bytes.len()), bytes);
+            // Metadata still advertises the original length; the actual file ends early.
+            // APR must fail the read and leave the following completion marker untouched.
+            marker = 0;
+            file.set_len(4097).unwrap();
+            assert_eq!(execute(&submission), (sce(EIO), 0));
+            assert_eq!(marker, 0);
+            assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+        }
+    }
+}

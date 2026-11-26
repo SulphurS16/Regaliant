@@ -717,6 +717,8 @@ pub enum BindingKind {
     /// The 2D variable of an `ImageDim::D3OrD2` resource (`Image` holds
     /// its 3D one).
     ImageAlt(usize),
+    /// Cube faces as a 2D-array sampled view for integer texel loads (SPIR-V forbids cube fetch).
+    CubeFaces(usize),
     StorageImage(usize),
     /// MIP_VIEWS storage images, one view per mip level from the T#'s base
     /// level (views past its last level repeat the last): image_store_mip
@@ -792,7 +794,7 @@ impl Binding {
     /// Plan resource index of a resource binding.
     pub fn kind_resource(&self) -> Option<usize> {
         match self.kind {
-            BindingKind::Buffer(i) | BindingKind::Address(i) | BindingKind::Image(i) | BindingKind::ImageAlt(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
+            BindingKind::Buffer(i) | BindingKind::Address(i) | BindingKind::Image(i) | BindingKind::ImageAlt(i) | BindingKind::CubeFaces(i) | BindingKind::StorageImage(i) | BindingKind::StorageImageMips(i) | BindingKind::ImageArray(i) | BindingKind::Sampler(i) | BindingKind::CompareSampler(i) => Some(i),
             _ => None,
         }
     }
@@ -975,6 +977,7 @@ pub(crate) struct T<'a> {
     /// `ImageDim::D3OrD2` resources' 2D variables (`images` holds the 3D
     /// one).
     pub image_alts: HashMap<usize, ImageRes>,
+    pub cube_faces: HashMap<usize, ImageRes>,
     /// Image tables: resource -> pc of the load that reads its T#, and the
     /// byte offset each such load used (Function variables).
     pub image_tables: HashMap<usize, u32>,
@@ -2753,6 +2756,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         buffers: HashMap::default(),
         images: HashMap::default(),
         image_alts: HashMap::default(),
+        cube_faces: HashMap::default(),
         sampler_res: BTreeSet::new(),
         samplers: HashMap::default(),
         compare_sampler_vars: HashMap::default(),
@@ -5313,6 +5317,110 @@ mod tests {
         if let Ok(dir) = std::env::var("RDNA_D3OR2D_DUMP") {
             let bytes: Vec<u8> = o.spirv.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(std::path::Path::new(&dir).join("d3or2d.spv"), bytes).unwrap();
+        }
+    }
+
+    /// Integer loads use the cube's faces, not its sampling direction. Cover both
+    /// instruction/learned-spec mismatches found in the compiler crashes and real cube loads.
+    #[test]
+    fn cube_texel_loads_keep_class_lod_and_face_coordinates() {
+        use crate::tables::*;
+        use rspirv::spirv::Op;
+        let op = |t: &[(u16, &str)], n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        for dim in [1, 3, 5] {
+            for res in [ImageDim::Cube, ImageDim::CubeArray] {
+                for class in [NumClass::Float, NumClass::Sint, NumClass::Uint] {
+                    for name in ["image_load", "image_load_mip"] {
+                        let words = [
+                            (0x3C << 26) | (op(MIMG, name) << 18) | (0xF << 8) | (dim << 3), 4 << 8,
+                            (0x38 << 26) | (op(MUBUF, "buffer_store_dwordx4") << 18) | (1 << 13),
+                            4 << 8 | 2 << 16 | 0x80 << 24, 0xBF81_0000,
+                        ];
+                        let code = crate::decode_program(&words).unwrap();
+                        let plan = crate::analysis::analyze(&code, 12, 0);
+                        let mut spec = cs_spec([64, 1, 1]);
+                        spec.user_sgprs = 12;
+                        spec.resources = plan.resources.iter().map(|r| match r.kind {
+                            ResKind::Image => ResSpec::Image { dim: res, class, depth: false },
+                            _ => ResSpec::Buffer { format: 0, dst_sel: 0 },
+                        }).collect();
+                        let out = translate(&code, &plan, &spec).unwrap();
+                        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+                        assert_eq!(out.bindings.iter().filter(|b| matches!(b.kind, BindingKind::CubeFaces(_))).count(), 1);
+                        let m = rspirv::dr::load_words(&out.spirv).unwrap();
+                        let insts: Vec<_> = m.types_global_values.iter().chain(m.functions.iter().flat_map(|f| f.blocks.iter().flat_map(|b| b.instructions.iter()))).collect();
+                        let def = |id| *insts.iter().find(|i| i.result_id == Some(id)).unwrap();
+                        let fetch = insts.iter().find(|i| i.class.opcode == Op::ImageFetch).unwrap();
+                        let image = def(fetch.operands[0].unwrap_id_ref());
+                        let ty = def(image.result_type.unwrap());
+                        assert_eq!(ty.operands[1], rspirv::dr::Operand::Dim(spirv::Dim::Dim2D));
+                        assert_eq!(ty.operands[3].unwrap_literal_bit32(), 1); // arrayed
+                        let sampled = def(ty.operands[0].unwrap_id_ref());
+                        match class {
+                            NumClass::Float => assert_eq!(sampled.class.opcode, Op::TypeFloat),
+                            _ => {
+                                assert_eq!(sampled.class.opcode, Op::TypeInt);
+                                assert_eq!(sampled.operands[1].unwrap_literal_bit32(), u32::from(class == NumClass::Sint));
+                            }
+                        }
+                        let coord = def(fetch.operands[1].unwrap_id_ref());
+                        assert_eq!(coord.operands.len(), 3);
+                        let layer = def(coord.operands[2].unwrap_id_ref());
+                        if dim == 1 {
+                            assert_eq!(layer.class.opcode, Op::Constant);
+                            assert_eq!(layer.operands[0].unwrap_literal_bit32(), 0);
+                        } else {
+                            assert_ne!(layer.class.opcode, Op::Constant); // Preserve v2's face/layer.
+                        }
+                        assert_eq!(fetch.operands[2], rspirv::dr::Operand::ImageOperands(spirv::ImageOperands::LOD));
+                        let lod = def(fetch.operands[3].unwrap_id_ref());
+                        assert_eq!(lod.class.opcode == Op::Constant, name == "image_load");
+                        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+                            let p = std::path::Path::new(&dir).join(format!("cube-{dim}-{res:?}-{class:?}-{name}.spv"));
+                            std::fs::write(p, out.spirv.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cube_fetch_alias_does_not_change_following_cube_sample() {
+        use crate::tables::*;
+        use rspirv::spirv::Op;
+        let op = |t: &[(u16, &str)], n: &str| t.iter().find(|(_, x)| x.split('/').next() == Some(n)).unwrap().0 as u32;
+        let mut words = Vec::new();
+        for name in ["image_load_mip", "image_sample_lz"] {
+            words.extend([
+                (0x3C << 26) | (op(MIMG, name) << 18) | (0xF << 8) | (3 << 3), 4 << 8 | 2 << 21,
+                (0x38 << 26) | (op(MUBUF, "buffer_store_dwordx4") << 18) | (1 << 13),
+                4 << 8 | 3 << 16 | 0x80 << 24,
+            ]);
+        }
+        words.push(0xBF81_0000);
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 16, 0);
+        let mut spec = cs_spec([64, 1, 1]);
+        spec.user_sgprs = 16;
+        spec.resources = plan.resources.iter().map(|r| match r.kind {
+            ResKind::Image => ResSpec::Image { dim: ImageDim::CubeArray, class: NumClass::Float, depth: false },
+            ResKind::Sampler => ResSpec::Sampler,
+            _ => ResSpec::Buffer { format: 0, dst_sel: 0 },
+        }).collect();
+        let out = translate(&code, &plan, &spec).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.bindings.iter().filter(|b| matches!(b.kind, BindingKind::CubeFaces(_))).count(), 1);
+        let m = rspirv::dr::load_words(&out.spirv).unwrap();
+        let insts: Vec<_> = m.types_global_values.iter().chain(m.functions.iter().flat_map(|f| f.blocks.iter().flat_map(|b| b.instructions.iter()))).collect();
+        let def = |id| *insts.iter().find(|i| i.result_id == Some(id)).unwrap();
+        let sample = insts.iter().find(|i| i.class.opcode == Op::ImageSampleExplicitLod).unwrap();
+        let combined = def(sample.operands[0].unwrap_id_ref());
+        let image = def(combined.operands[0].unwrap_id_ref());
+        let ty = def(image.result_type.unwrap());
+        assert_eq!(ty.operands[1], rspirv::dr::Operand::Dim(spirv::Dim::DimCube));
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            std::fs::write(std::path::Path::new(&dir).join("cube-mixed.spv"), out.spirv.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         }
     }
 

@@ -106,7 +106,7 @@ fn half(h: u16) -> f32 {
 }
 
 fn readable(a: u64, n: u64) -> bool {
-    a >= 0x10000 && crate::gpu::cp::guest_readable(a, n)
+    a >= 0x10000 && crate::platform::loader_hooks::guest_readable(a, n)
 }
 
 unsafe fn rd64(a: u64) -> u64 {

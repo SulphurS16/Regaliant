@@ -585,6 +585,22 @@ struct PlanScan {
     run_end: u64,
 }
 
+impl PlanScan {
+    fn pure_direct(&self) -> bool {
+        self.args.is_empty() && self.passed.is_empty() && self.own_waits.is_empty()
+            && self.cp_writes.is_empty() && !self.sync
+    }
+}
+
+/// Keep the same number of chunks, but queue the main CP's share too. No empty chunks.
+fn recording_split(n: usize, chunks: usize, min: usize, weight: f64, whole: bool) -> (usize, usize) {
+    if whole { (0, chunks) }
+    else {
+        let workers = chunks - 1;
+        (((n as f64 * weight / (weight + workers as f64)).round() as usize).clamp(min, n - workers * min), workers)
+    }
+}
+
 /// A split run's chunks (`Cp::plan_chunks`): the main command processor's command count,
 /// each worker chunk's first command and start, their start states, the state at the run's
 /// end (`tune past_runs`) with the SH registers its indirect draws set, and the signature
@@ -961,6 +977,7 @@ fn held_runs_line() -> String {
 /// Two command-processor states are the same (registers past the shorter
 /// one's held count zero), SH registers `sh_skip` left out.
 fn chunk_states_equal(a: &ChunkState, b: &ChunkState, sh_skip: &[u32]) -> bool {
+    let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::StateChange);
     let same = |x: &[u32], y: &[u32]| {
         let m = x.len().min(y.len());
         x[..m] == y[..m] && x[m..].iter().all(|&v| v == 0) && y[m..].iter().all(|&v| v == 0)
@@ -1040,6 +1057,7 @@ fn par_event(op: u32, compute: bool) -> bool {
 /// synchronization-free runs: four under front end 2 (+6-10% at the vista,
 /// FINDINGS.md 2026-10-28 night), none in the old front end (a loss there).
 fn compute_workers() -> usize {
+    if super::nan_probe::early_on() { return 0; }
     if !super::fe2::on() {
         return 0;
     }
@@ -1387,9 +1405,9 @@ fn note_write(queue: &str, addr: u64, value: u64, at: u64) {
                     h.pop_front();
                 }
                 h.push_back((Instant::now(), value));
-                LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
             }
         }
+        LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
     }
     {
         let mut g = LAST_WRITE.lock();
@@ -1420,6 +1438,23 @@ struct ActiveWait {
 }
 
 static ACTIVE_WAITS: parking_lot::Mutex<Vec<ActiveWait>> = parking_lot::Mutex::new(Vec::new());
+/// Linux watchdog: bounded registry read, no guest memory dereference or driver call.
+#[cfg(target_os = "linux")]
+pub fn hang_waits() -> String {
+    let mut out = String::new();
+    if let Some(waits) = ACTIVE_WAITS.try_lock() {
+        out.push_str(&format!("active label waits: {}\n", waits.len()));
+        for w in waits.iter() {
+            out.push_str(&format!("addr={:#x} wide={} func={} mask={:#x} ref={:#x} latched={}\n",
+                w.addr, w.wide, w.func, w.mask, w.reference, w.hit.load(Ordering::Acquire)));
+        }
+    } else { out.push_str("active label wait registry busy\n"); }
+    if let Some(states) = STATE.try_lock() {
+        for (q, state) in states.iter() { out.push_str(&format!("{q}: {state}\n")); }
+    } else { out.push_str("CP state registry busy\n"); }
+    out
+}
+
 /// Blocking waits in progress (cheap check before taking the lock).
 static ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1434,10 +1469,10 @@ fn wake_label(addr: u64, bytes: u8) {
     if ACTIVE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
-    unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll(addr as *const core::ffi::c_void) };
+    unsafe { crate::platform::os::Win32::System::Threading::WakeByAddressAll(addr as *const core::ffi::c_void) };
     if bytes >= 8 {
         // A 32-bit wait on its upper half.
-        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((addr + 4) as *const core::ffi::c_void) };
+        unsafe { crate::platform::os::Win32::System::Threading::WakeByAddressAll((addr + 4) as *const core::ffi::c_void) };
     }
 }
 
@@ -1500,9 +1535,9 @@ pub(super) fn gpu_label_written(queue: &str, addr: u64, value: u64, bytes: u8) {
                     h.pop_front();
                 }
                 h.push_back((Instant::now(), value));
-                LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
             }
         }
+        LABEL_WRITES_GEN.fetch_add(1, Ordering::Release);
     }
     let mut woke: Vec<u64> = Vec::new();
     {
@@ -3190,6 +3225,7 @@ impl Cp {
     }
 
     fn apply_state(st: &mut ChunkState, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::StateChange);
         let set = |v: &mut Vec<u32>, space: Space, cap: usize, first: u32| {
             for i in 1..n {
                 put_reg(v, space, cap, (first + (i - 1) as u32) as usize, p(i));
@@ -3491,12 +3527,10 @@ impl Cp {
     /// their start states and the run's end state (`tune past_runs`; not for a held run).
     /// `timing`: `tune cp_classes`' counters.
     #[allow(clippy::too_many_arguments)]
-    fn plan_chunks(&mut self, f: &Fetched, from: u64, ends: &[u64], run_end: u64, n: usize, chunks: usize, chunk_min: usize, sig: u64, held_run: bool, timing: bool) -> PlanChunks {
+    fn plan_chunks(&mut self, f: &Fetched, from: u64, ends: &[u64], run_end: u64, n: usize, chunks: usize, chunk_min: usize, sig: u64, held_run: bool, timing: bool, whole: bool) -> PlanChunks {
         // The main command processor's chunk first (`par::main_weight`
         // times a worker's), then equal ones for the workers' queue.
-        let m = chunks - 1;
-        let w = super::par::main_weight();
-        let main_n = ((n as f64 * w / (w + m as f64)).round() as usize).clamp(chunk_min, n - m * chunk_min);
+        let (main_n, m) = recording_split(n, chunks, chunk_min, super::par::main_weight(), whole);
         let per = (n - main_n) / m;
         // At equal recording cost when the run was measured before, else at
         // equal command counts.
@@ -3670,7 +3704,8 @@ impl Cp {
             return false;
         }
         let start = self.chunk_state();
-        let chunks = self.plan_chunks(f, from, &scan.ends, scan.run_end, n, chunks, chunk_min, scan.sig, false, false);
+        let whole = self.main_gfx && !self.compute && super::par::whole_run() && scan.pure_direct();
+        let chunks = self.plan_chunks(f, from, &scan.ends, scan.run_end, n, chunks, chunk_min, scan.sig, false, false, whole);
         self.pre_plan = Some(Box::new(PrePlan { from, end, buf: self.cur_buf, sub: self.sub_index, start, scan, chunks }));
         PLAN_AHEAD[0].fetch_add(1, Ordering::Relaxed);
         PLAN_AHEAD[3].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3698,6 +3733,8 @@ impl Cp {
             self.handshake_census(f, from, end);
         }
         // (Profile: `tune cp_classes`, `PLAN_PHASES`.)
+        let _cpu = super::cpu_profile::scope(super::cpu_profile::Part::Parallel);
+        let _detail = super::timeline::detail("record: parallel planning");
         let mut lap = PlanLaps(super::tune::cp_classes().then(Instant::now));
         let k = if self.compute { compute_workers() } else { super::par::workers() };
         // Inside a stretch past a label wait (`held_runs_ok`): a held run (`par::Run::held`).
@@ -3710,6 +3747,7 @@ impl Cp {
             }
             None => (self.plan_scan(f, from, end), None),
         };
+        let whole = self.main_gfx && !self.compute && !held_run && super::par::whole_run() && scan.pure_direct();
         let PlanScan { ends, mut args, passed, own_waits, cp_writes, sync, sig, why, run_end } = scan;
         let n = ends.len();
         super::par::note_run(n, why, self.compute);
@@ -3839,7 +3877,7 @@ impl Cp {
         // The chunks: planned ahead, else now.
         let pc = match ahead {
             Some(pc) => pc,
-            None => self.plan_chunks(f, from, &ends, run_end, n, chunks, chunk_min, sig, held_run, lap.0.is_some()),
+            None => self.plan_chunks(f, from, &ends, run_end, n, chunks, chunk_min, sig, held_run, lap.0.is_some(), whole),
         };
         let PlanChunks { main_n, firsts, starts, states, end_state, end_unknown, sig } = pc;
         lap.mark(4);
@@ -3854,6 +3892,10 @@ impl Cp {
             return;
         }
         self.drop_ahead();
+        if main_n == 0 {
+            super::par::WHOLE_RUNS.fetch_add(1, Ordering::Relaxed);
+            super::par::WHOLE_COMMANDS.fetch_add(n as u64, Ordering::Relaxed);
+        }
         // What this queue's batch being recorded writes: the workers cannot
         // see it unsubmitted, so a batch with writes is submitted before
         // they start and they wait for it like for any submitted work (the
@@ -3876,7 +3918,9 @@ impl Cp {
             // on as this command processor's own part of the run: a batch,
             // its submission and a batch start less; since 2026-11-07 night:
             // the vista x1.006, Doran x1.008, FINDINGS.md.)
-            if self.main_gfx && !self.compute && self.exec.as_ref().is_some_and(|e| e.only_effect_writes()) {
+            // A whole-run handoff has no local first chunk to own those effects. Publish
+            // them before any worker can read them, including label/stamp-only batches.
+            if main_n != 0 && self.main_gfx && !self.compute && self.exec.as_ref().is_some_and(|e| e.only_effect_writes()) {
                 PRE_RUN_KEPT.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.submit_gpu("parallel run");
@@ -5416,6 +5460,8 @@ impl Cp {
     }
 
     fn dispatch(&mut self, groups: [u32; 3], initiator: u32) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Dispatch);
+        let _detail = super::timeline::detail("record: dispatch wrapper");
         if super::frameprobe::on() && self.name == "gpu-gfx" {
             super::frameprobe::command();
         }
@@ -5602,6 +5648,8 @@ impl Cp {
     }
 
     fn draw(&mut self, args: super::exec::DrawArgs) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
+        let _detail = super::timeline::detail("record: draw wrapper");
         if super::frameprobe::on() && self.name == "gpu-gfx" {
             super::frameprobe::command();
         }
@@ -5666,6 +5714,7 @@ impl Cp {
     /// indirect draws, plain NOPs, and register writes and loads and index
     /// or base settings that only write the values already there.
     fn keeps_repeat(&self, opcode: u32, n: u64, p: &dyn Fn(u64) -> u32) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::StateChange);
         let same = |space: Space| {
             let first = p(0) & 0xFFFF;
             (1..n).all(|i| self.reg(space, first + (i - 1) as u32) == p(i))
@@ -5716,6 +5765,7 @@ impl Cp {
     /// recorded in full; a vertex stage that needs the word on the CPU gets
     /// it in its register as before. The outcome.
     fn draw_cpu_args_base(&mut self, w: [u32; 5], sz: u32, inst_loc: u32) -> String {
+        let _detail = super::timeline::detail("record: indirect draw arguments");
         const GS_USER_DATA: u32 = 0x8C;
         let index = (self.index_base + w[2] as u64 * sz as u64, sz);
         let laps = (!self.compute && super::tune::cp_classes()).then(Instant::now);
@@ -6092,6 +6142,7 @@ impl Cp {
     /// the GPU reaches the patched packets (copying them at submission broke
     /// rendering).
     pub fn run(&mut self, addr: u64, size: u32) {
+        let _cpu = super::cpu_profile::scope(super::cpu_profile::Part::PacketLoop);
         if self.depth > 8 {
             crate::error!("gpu[{}]: indirect buffer nesting too deep at {addr:#x}", self.name);
             return;
@@ -6114,6 +6165,8 @@ impl Cp {
         }
         let acb_ops = self.compute && super::tune::cp_classes() && self.name.strip_prefix("gpu-acb").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) == Some(super::tune::cp_classes_acb());
         loop {
+            let _cpu = super::cpu_profile::scope(super::cpu_profile::Part::PacketLoop);
+            let decode = super::timeline::detail("record: packet decode and scheduling");
             if cur >= end {
                 // Past a run, the buffer's end is a stop (what was recorded
                 // past it may be recorded again, from the run's end), unless
@@ -6224,6 +6277,11 @@ impl Cp {
                 let t = class_start(classes);
                 self.par_plan(&f, cur, end);
                 class_end(7, t);
+                // With a whole-run handoff the first packet belongs to worker 0. Return to
+                // the collect/look-ahead path before executing it here (never emit twice).
+                if self.par.as_ref().is_some_and(|p| p.starts[p.next] == cur) {
+                    continue;
+                }
                 // (Held: planning stopped the stretch before this command.)
                 if self.held.is_some() && self.par.is_none() && self.held_halted(cur) {
                     match self.settle_held() {
@@ -6423,6 +6481,7 @@ impl Cp {
                     break;
                 }
             }
+            drop(decode);
             let flow = self.packet(opcode, h, cur, n, &p);
             self.wait_ctx = None;
             self.compile_ctx.set(None);
@@ -6534,7 +6593,41 @@ impl Cp {
         }
     }
 
+    pub(crate) fn packet_address(&self) -> u64 { self.cur_packet }
+
     fn packet(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
+        let dispatch = matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT);
+        let draw = matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI);
+        let early = (draw || dispatch) && super::nan_probe::early(self, dispatch);
+        if (draw || dispatch) && (super::nan_probe::active() || early) {
+            // Capture disables parallel recording already. Complete this queue before and
+            // after the operation so diagnostics distinguish inherited NaNs from new ones.
+            self.sync();
+            let sz = self.index_size().unwrap_or(4) as u64;
+            let index = match opcode {
+                op::DRAW_INDEX_2 => (addr64(p(1), p(2)), p(3) as u64 * sz),
+                op::DRAW_INDEX_OFFSET_2 => (self.index_base + p(1) as u64 * sz, p(2) as u64 * sz),
+                _ => (self.index_base, self.index_count as u64 * sz),
+            };
+            let probe = super::nan_probe::before(self, dispatch, at, opcode, index, early);
+            let result = self.packet_inner(opcode, h, at, n, p);
+            self.sync();
+            super::nan_probe::after(self, probe);
+            result
+        } else { self.packet_inner(opcode, h, at, n, p) }
+    }
+
+    fn packet_inner(&mut self, opcode: u32, h: u32, at: u64, n: u64, p: &dyn Fn(u64) -> u32) -> Flow {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::PacketDispatch);
+        let _detail = super::timeline::detail(if is_state(opcode) { "record: state tracking" }
+            else if matches!(opcode, op::DRAW_INDEX_2 | op::DRAW_INDEX_AUTO | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT) { "record: draw" }
+            else if matches!(opcode, op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT) { "record: dispatch" }
+            else { match opcode {
+                op::WRITE_DATA => "record: write data", op::COPY_DATA => "record: copy data",
+                op::DMA_DATA => "record: dma data", op::RELEASE_MEM => "record: release memory",
+                op::WAIT_REG_MEM | op::WAIT_REG_MEM64 => "record: wait packet",
+                op::INDIRECT_BUFFER => "record: indirect buffer", _ => "record: memory and control packet",
+            } });
         crate::placement::note(&|| crate::log::thread_name());
         if self.repeat_ok && !self.keeps_repeat(opcode, n, p) {
             self.repeat_ok = false;
@@ -6769,7 +6862,7 @@ impl Cp {
                     let (a, initiator) = if n >= 3 { (addr64(p(0), p(1)), p(2)) } else { (self.dispatch_indirect_base + p(0) as u64, p(1)) };
                     // Arguments that GPU work still writes: the GPU reads them
                     // (captures and interpreter checks need the group counts).
-                    let gpu = valid(a, 12) && !super::capture::capturing() && !(super::exec::enabled() && super::emucheck::wanted(self)) && self.dispatch_gpu_indirect(a, initiator);
+                    let gpu = valid(a, 12) && !super::capture::capturing() && !super::nan_probe::early_on() && !(super::exec::enabled() && super::emucheck::wanted(self)) && self.dispatch_gpu_indirect(a, initiator);
                     gpu_read = gpu;
                     if !gpu {
                         // Arguments may have been written by earlier GPU work.
@@ -6955,6 +7048,7 @@ impl Cp {
     }
 
     fn set_range(&mut self, space: Space, first: u32, n: u64, p: &dyn Fn(u64) -> u32) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Registers);
         for i in 1..n {
             self.set_reg(space, first + (i - 1) as u32, p(i));
         }
@@ -6962,6 +7056,7 @@ impl Cp {
 
     /// Our indirect register packets: memory holds `n` {offset, value} pairs.
     fn load_pairs(&mut self, space: Space, a: u64, n: u32) {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Registers);
         if n == 0 {
             return;
         }
@@ -7498,6 +7593,8 @@ impl Cp {
         // game, 2026-11-23: compute queue 0x48 waited for 0xa20 with the counter at 0xa84).
         let counter_gen = std::cell::Cell::new(u64::MAX);
         let counter_moved = std::cell::Cell::new(false);
+        let history_moved = std::cell::Cell::new(false);
+        let submitted_at = self.submitted_at;
         let r = self.poll_until_wake(
             at,
             &what,
@@ -7505,13 +7602,19 @@ impl Cp {
                 hit.load(Ordering::SeqCst)
                     || compare(func, read() & mask, reference & mask)
                     || (use_promise && promises_moved() && promised(a, wide, func, mask, reference).is_some())
-                    || (func & 7 == 3 && {
+                    || {
                         let g = LABEL_WRITES_GEN.load(Ordering::Acquire);
-                        counter_gen.replace(g) != g && counter_passed(a, wide, func, mask, reference) && {
-                            counter_moved.set(true);
-                            true
+                        counter_gen.replace(g) != g && {
+                            // A write can land between the first missed_write check and
+                            // ACTIVE_WAITS registration, then be reset. Recheck history,
+                            // not only counters: a 0/1 flag is deliberately no counter.
+                            let missed = submitted_at.is_some_and(|since| missed_write(a, wide, func, mask, reference, since));
+                            history_moved.set(missed);
+                            let counter = !missed && counter_passed(a, wide, func, mask, reference);
+                            counter_moved.set(counter);
+                            missed || counter
                         }
-                    })
+                    }
             },
             &mut work,
             (gpu_label && a % if wide { 8 } else { 4 } == 0).then_some((a, wide)),
@@ -7547,6 +7650,9 @@ impl Cp {
                 PROMISED.fetch_add(1, Ordering::Relaxed);
                 kind = b'P';
                 self.last_wait_epoch = epoch;
+            } else if history_moved.get() {
+                MISSED.fetch_add(1, Ordering::Relaxed);
+                kind = b'M';
             } else if counter_moved.get() {
                 if COUNTER_PASSED.fetch_add(1, Ordering::Relaxed) < 20 {
                     crate::info!("gpu[{}]: WAIT_REG_MEM at {at:#x} for [{a:#x}] == {reference:#x} passed while waiting: the counter is at {:#x}", self.name, read());
@@ -7605,7 +7711,7 @@ impl Cp {
                     break;
                 }
                 WAKE_SLEEPS.fetch_add(1, Ordering::Relaxed);
-                unsafe { windows_sys::Win32::System::Threading::WaitOnAddress(a as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, if wide { 8 } else { 4 }, 1) };
+                unsafe { crate::platform::os::Win32::System::Threading::WaitOnAddress(a as *const core::ffi::c_void, &seen as *const u64 as *const core::ffi::c_void, if wide { 8 } else { 4 }, 1) };
             } else if spins < yields {
                 std::thread::yield_now();
             } else {
@@ -7678,6 +7784,7 @@ impl Cp {
                     Err(e) => crate::warn!("gpu[{}]: flip of buffer {index} (handle {handle:#x}) failed ({e:#x})", self.name),
                 }
                 let n = crate::gpu::FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                if super::capture::needs_boundary_sync(n) { self.sync(); }
                 super::capture::on_flip(n);
                 if !self.compute {
                     super::note_run_ahead();
@@ -7857,6 +7964,26 @@ mod tests {
         h.extend(values.iter().map(|&v| (Instant::now(), v)));
     }
 
+    #[test]
+    fn late_flag_write_between_check_and_registration_is_observable() {
+        let addr = 0x39003900;
+        WAITED.lock().get_or_insert_with(HashSet::new).insert(addr);
+        let since = Instant::now();
+        assert!(!missed_write(addr, false, 3, u32::MAX as u64, 1, since));
+        // No active waiter yet; the GPU writes and the title resets the word.
+        gpu_label_written("test-late-flag", addr, 1, 4);
+        assert!(missed_write(addr, false, 3, u32::MAX as u64, 1, since));
+        assert!(!counter_passed(addr, false, 3, u32::MAX as u64, 1));
+        // A second submission must not consume the earlier frame's flag. A repeated
+        // write refreshes the time AND generation so its poll sees this frame's write.
+        let later = Instant::now();
+        assert!(!missed_write(addr, false, 3, u32::MAX as u64, 1, later));
+        let before = LABEL_WRITES_GEN.load(Ordering::Acquire);
+        gpu_label_written("test-late-flag", addr, 1, 4);
+        assert!(LABEL_WRITES_GEN.load(Ordering::Acquire) > before);
+        assert!(missed_write(addr, false, 3, u32::MAX as u64, 1, later));
+    }
+
     /// Equality waits on frame counters that moved on pass; waits on flags,
     /// on values not yet reached and on counters that jump do not.
     #[test]
@@ -7964,5 +8091,42 @@ mod tests {
             *x = 1.0;
         }
         assert_eq!(cost_firsts(&g, 4, 16, 3, 2), Some(vec![4, 8, 12]));
+    }
+}
+
+#[cfg(test)]
+mod whole_run_tests {
+    use super::*;
+    #[test]
+    fn whole_split_covers_commands_once_in_order() {
+        for n in 128..1024 {
+            for chunks in 2..=8 {
+                for whole in [false, true] {
+                    let (main, m) = recording_split(n, chunks, 16, 1.0, whole);
+                    let per = (n - main) / m;
+                    let starts: Vec<_> = (0..m).map(|i| main + i * per).collect();
+                    assert_eq!(starts[0], main);
+                    assert_eq!(main == 0, whole);
+                    let mut covered = main;
+                    for (i, &start) in starts.iter().enumerate() {
+                        let end = starts.get(i + 1).copied().unwrap_or(n);
+                        assert_eq!(covered, start);
+                        assert!(end - start >= 16);
+                        covered = end;
+                    }
+                    assert_eq!(covered, n);
+                }
+            }
+        }
+    }
+    #[test]
+    fn whole_run_excludes_each_ordering_hazard() {
+        let mut s = PlanScan { ends: vec![4, 8], args: vec![], passed: vec![], own_waits: vec![], cp_writes: vec![], sync: false, sig: 1, why: 0, run_end: 8 };
+        assert!(s.pure_direct());
+        s.args.push((1, 4)); assert!(!s.pure_direct()); s.args.clear();
+        s.passed.push((1, 2, false)); assert!(!s.pure_direct()); s.passed.clear();
+        s.own_waits.push(1); assert!(!s.pure_direct()); s.own_waits.clear();
+        s.cp_writes.push((1, 2, 4)); assert!(!s.pure_direct()); s.cp_writes.clear();
+        s.sync = true; assert!(!s.pure_direct());
     }
 }

@@ -105,7 +105,7 @@ fn dump_buffers(args: &[u64; 7], job: u64) {
     if !matches!(job, 50 | 2000 | 6000 | 9000) {
         return;
     }
-    let readable = |a: u64, n: u64| a >= 0x10000 && crate::gpu::cp::guest_readable(a, n);
+    let readable = |a: u64, n: u64| a >= 0x10000 && crate::platform::loader_hooks::guest_readable(a, n);
     let stats = |a: u64, bytes: u64| -> String {
         if !readable(a, bytes) {
             return format!("{a:#x} (not readable)");
@@ -201,7 +201,7 @@ fn half(h: u16) -> f32 {
 
 /// The reverb computed (`tune acm_reverb`, default on).
 fn reverb_on() -> bool {
-    crate::gpu::tune::acm_reverb()
+    crate::platform::loader_hooks::acm_reverb()
 }
 
 /// Computes a convolution job (builder arguments after the batch: convolver

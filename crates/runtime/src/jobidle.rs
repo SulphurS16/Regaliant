@@ -24,6 +24,21 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+// Linux timers provide a real sleep here. No permanent watcher: a ready job is polled
+// within a bounded sleep. Keep the Windows policy unchanged.
+#[cfg(windows)]
+pub const DEFAULT_IDLE: u64 = 50;
+#[cfg(target_os = "linux")]
+pub const DEFAULT_IDLE: u64 = 10;
+#[cfg(windows)]
+pub const DEFAULT_SLEEP: u64 = 200;
+#[cfg(target_os = "linux")]
+pub const DEFAULT_SLEEP: u64 = 500;
+#[cfg(windows)]
+pub const DEFAULT_WATCH: u64 = 2000;
+#[cfg(target_os = "linux")]
+pub const DEFAULT_WATCH: u64 = 0;
+
 /// The three hooks are in place (`titlefix::apply`).
 static READY: AtomicBool = AtomicBool::new(false);
 /// A worker is the watcher.
@@ -172,4 +187,35 @@ pub fn status() -> String {
         v[4],
         v[2]
     )
+}
+
+/// Relay-only snapshots: scheduled CPU seconds of BPE workers, not elapsed sleeps.
+#[cfg(target_os = "linux")]
+pub fn relay_snapshot() -> serde_json::Value {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let mut workers = serde_json::Map::new();
+    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+        for task in tasks.flatten() {
+            if !std::fs::read_to_string(task.path().join("comm")).unwrap_or_default().starts_with("BPE JobWorker") { continue; }
+            let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else { continue };
+            let Some((_, rest)) = stat.rsplit_once(')') else { continue };
+            let fields: Vec<_> = rest.split_whitespace().collect();
+            let value = |i: usize| fields.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            workers.insert(format!("{}:{}", task.file_name().to_string_lossy(), value(19)), serde_json::json!((value(11) + value(12)) as f64 / ticks));
+        }
+    }
+    serde_json::json!({"workers": workers, "failed_takes": STATS[3].load(Ordering::Relaxed),
+        "sleeps": STATS[0].load(Ordering::Relaxed), "jobs": STATS[5].load(Ordering::Relaxed),
+        "flips": crate::gpu::FRAMES.load(Ordering::Relaxed)})
+}
+
+#[cfg(target_os = "linux")]
+pub fn relay_delta(before: &serde_json::Value, after: &serde_json::Value, seconds: f64, policy: &str) -> serde_json::Value {
+    let workers = after["workers"].as_object().unwrap();
+    let cpu: f64 = workers.iter().filter_map(|(id, v)| Some((v.as_f64()? - before["workers"][id].as_f64()?).max(0.0))).sum();
+    let delta = |key: &str| after[key].as_u64().unwrap().saturating_sub(before[key].as_u64().unwrap());
+    serde_json::json!({"policy": policy, "seconds": seconds, "workers": workers.len(),
+        "worker_cpu_s": cpu, "worker_cpu_s_per_gameplay_s": cpu / seconds,
+        "flips_per_second": delta("flips") as f64 / seconds, "failed_takes": delta("failed_takes"),
+        "jobs": delta("jobs"), "sleeps": delta("sleeps")})
 }

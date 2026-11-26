@@ -256,6 +256,8 @@ fn vblank_thread() {
             None => {}
         }
         let grid = crate::gpu::tune::flip_grid() && !vrr;
+        #[cfg(target_os = "linux")]
+        let grid = grid && crate::displayclock::timer_grid();
         // The frame limit off the grid: the least time between flips (the title's flip rate
         // and `tune frame_cap` count there as on the timer's grid).
         let limit_gap = |flip_rate: u32| -> Duration {
@@ -267,6 +269,8 @@ fn vblank_thread() {
             if cap > 0 { own.max(Duration::from_secs_f64(1.0 / cap as f64)) } else { own }
         };
         let now = Instant::now();
+        let pace_mark = crate::gpu::timeline::mark();
+        let ready_at_wait = pace_mark.is_some() && PORT.lock().as_ref().is_some_and(|p| p.pending.front().is_some_and(|f| f.ready));
         if grid {
             if next > now {
                 crate::thread::short_sleep(next - now);
@@ -286,6 +290,7 @@ fn vblank_thread() {
                 crate::thread::sleep_or_wake(next - now, &FLIP_READY);
             }
         }
+        crate::gpu::timeline::end("vblank", pace_mark, || if ready_at_wait { "wait: pacing (ready frame)".into() } else { "idle: no ready frame".into() });
         let now = Instant::now();
         let tick = now >= next;
         // The tick's own time: the flip shown at it counts from there, not from this wake. A
@@ -416,14 +421,21 @@ fn vblank_thread() {
             crate::gpu::timeline::flipped(n as u64);
         }
         if let Some(b) = show {
+            let present_mark = crate::gpu::timeline::mark();
             let (n, attr) = PORT.lock().as_ref().map(|p| (p.count, p.sets.get(b.set as usize).copied().flatten())).unwrap_or((0, None));
             if let Some(a) = attr {
                 crate::gpu::capture::note_display_size(a.width, a.height);
             }
             maybe_screenshot(&b, n);
+            #[cfg(windows)]
             crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(target_os = "linux")]
+            if !crate::gpu::framegen::adaptive_mode() {
+                crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             crate::displayclock::note_present();
             present_buffer(&b);
+            crate::gpu::timeline::end("vblank", present_mark, || "present/readback/overlay".into());
         }
     }
 }
@@ -805,6 +817,21 @@ fn crop_rgba(rgba: &[u8], w: u32, h: u32, c: (u32, u32, u32, u32)) -> (Vec<u8>, 
 /// (`maybe_screenshot`); `wait_shots` waits for them at shutdown.
 static SHOTS_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Covers GPU readback as well as conversion/encoding. Transfer this guard to the
+// writer; all error paths (including failure to spawn it) release the count.
+struct PendingShot;
+impl PendingShot {
+    fn new() -> Self { SHOTS_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel); Self }
+}
+impl Drop for PendingShot {
+    fn drop(&mut self) { SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
+
+#[cfg(target_os = "linux")]
+pub fn shots_idle() -> bool {
+    SHOT_REQUEST.lock().is_none() && SHOTS_PENDING.load(std::sync::atomic::Ordering::Acquire) == 0
+}
+
 /// Waits (at most 10 s) for the screenshots still being written.
 pub fn wait_shots() {
     let t = std::time::Instant::now();
@@ -816,6 +843,26 @@ pub fn wait_shots() {
 /// `imgprobe <flips> <u> <v>` (diagnosis): flips left, and where every GPU-written image is read
 /// at each of them (`Images::probe_used`).
 pub static PROBE: Mutex<Option<(u32, f32, f32)>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+static RELATIVE_SHOTS: Mutex<Vec<(&'static str, u64, Vec<u64>)>> = Mutex::new(Vec::new());
+#[cfg(target_os = "linux")]
+static RELATIVE_SHOTS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+pub fn arm_relative_shots(kind: &'static str, variable: &str) {
+    let mut offsets: Vec<u64> = std::env::var(variable).unwrap_or_default().split(',')
+        .filter_map(|x| x.trim().parse().ok()).filter(|n| (1..=10000).contains(n)).take(8).collect();
+    offsets.sort_unstable(); offsets.dedup();
+    if offsets.is_empty() { return; }
+    let base = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    crate::info!("relay {kind} captures: base flip {base}, offsets {offsets:?}");
+    let mut g = RELATIVE_SHOTS.lock(); g.retain(|(k,_,_)| *k != kind); g.push((kind, base, offsets));
+    RELATIVE_SHOTS_ON.store(true, std::sync::atomic::Ordering::Release);
+}
+#[cfg(target_os = "linux")]
+fn load_offset(base: u64, flip: u64, offsets: &[u64]) -> Option<u64> {
+    flip.checked_sub(base).filter(|n| offsets.contains(n))
+}
 
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let probe = {
@@ -835,7 +882,12 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
             crate::info!("probe flip {flip}: {} image(s)\n    {}", lines.len(), lines.join("\n    "));
         }
     }
-    let mut requested = SHOT_REQUEST.lock().take();
+    let (mut requested, pending) = {
+        let mut request = SHOT_REQUEST.lock();
+        let taken = request.take();
+        let pending = taken.as_ref().map(|_| PendingShot::new());
+        (taken, pending)
+    };
     let mut crop = None;
     let mut half = false;
     if requested.is_none() {
@@ -851,10 +903,26 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    if RELATIVE_SHOTS_ON.load(std::sync::atomic::Ordering::Acquire) {
+        let g = RELATIVE_SHOTS.lock();
+        for (kind, base, offsets) in g.iter() {
+            if let Some(offset) = load_offset(*base, flip, offsets) {
+                crate::info!("relay {kind} checkpoint: +{offset} at flip {flip}");
+                if requested.is_none() { requested = Some(format!("after-{kind}-{offset:04}")); }
+                crate::gpu::framegen::request_dump();
+                if *kind == "measure" && Some(&offset) == offsets.first()
+                    && std::env::var("DS_CAPTURE_MEASURE").ok().as_deref() == Some("1") {
+                    crate::gpu::capture::arm_next();
+                }
+            }
+        }
+    }
     let listed = std::env::var("DS_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
     if requested.is_none() && !listed {
         return;
     }
+    let pending = pending.unwrap_or_else(PendingShot::new);
     // The buffer is read back here (as flipped); its conversion, PNG encoding
     // and write run on a thread of their own: on this thread they held the
     // flips ~0.5 s per 4K shot (the boss fights' worst frames, 2026-11-01
@@ -877,8 +945,8 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let addr = b.addr;
     match read() {
         Ok((raw, format, w, h, path)) => {
-            SHOTS_PENDING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let write = move || {
+                let _pending = pending;
                 let r = crate::gpu::images::to_rgba8(format, &raw).ok_or_else(|| format!("no RGBA8 conversion for {format:?}")).and_then(|rgba| {
                     let (rgba, w, h) = match crop {
                         Some(c) => crop_rgba(&rgba, w, h, c),
@@ -891,13 +959,35 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
                     Ok(()) => crate::info!("screenshot of flip {flip} (buffer {addr:#x}): {}", path.display()),
                     Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
                 }
-                SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             };
             if let Err(e) = std::thread::Builder::new().name("shot-write".into()).spawn(write) {
-                SHOTS_PENDING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: no writer thread ({e})");
             }
         }
         Err(e) => crate::warn!("screenshot of flip {flip} (buffer {addr:#x}) unavailable: {e}"),
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod shot_lifetime_tests {
+    #[test]
+    fn readback_and_failed_writer_remain_pending_until_drop() {
+        let pending = super::PendingShot::new();
+        assert!(!super::shots_idle()); // request already consumed, still reading GPU data
+        let writer = move || { let _guard = pending; };
+        assert!(!super::shots_idle()); // writer queued but has not started
+        drop(writer); // spawn failure also drops its closure
+        assert!(super::shots_idle());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod load_shot_tests {
+    #[test]
+    fn checkpoints_are_relative_to_observed_gameplay_not_startup() {
+        assert_eq!(super::load_offset(2400, 2700, &[300, 600]), Some(300));
+        assert_eq!(super::load_offset(2400, 300, &[300, 600]), None);
+        assert_eq!(super::load_offset(2400, 2701, &[300, 600]), None);
     }
 }

@@ -9,7 +9,7 @@ use std::alloc::{Layout, alloc_zeroed};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use windows_sys::Win32::System::Threading::{TlsAlloc, TlsGetValue, TlsSetValue};
+use crate::platform::tls as host;
 
 pub const STATIC_TLS_SIZE: u64 = 0x8000;
 pub const TCB_SIZE: u64 = 0x100;
@@ -34,10 +34,7 @@ thread_local! {
 }
 
 pub fn init_slot() -> Result<u32, String> {
-    let s = unsafe { TlsAlloc() };
-    if s == u32::MAX || s >= 64 {
-        return Err(format!("TlsAlloc returned {s}; need a direct TEB slot (<64)"));
-    }
+    let s = host::alloc_slot()?;
     SLOT.store(s, Ordering::SeqCst);
     Ok(s)
 }
@@ -104,13 +101,11 @@ pub fn alloc_thread_area(thread_ptr: u64) -> u64 {
 }
 
 pub fn set_current_tp(tp: u64) {
-    unsafe {
-        TlsSetValue(slot(), tp as *const _);
-    }
+    host::set(slot(), tp);
 }
 
 pub fn current_tp() -> u64 {
-    unsafe { TlsGetValue(slot()) as u64 }
+    host::get(slot())
 }
 
 /// Address of a TLS variable: module `index`, `offset` inside its block.

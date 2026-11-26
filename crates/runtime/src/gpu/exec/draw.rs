@@ -67,6 +67,7 @@ fn reads_nothing(p: &Prepared) -> bool {
 
 /// Whether two preparations of a stage are the same (`tune buffer_delta` 2).
 fn same_prepared(a: &Prepared, b: &Prepared) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::StateChange);
     a.addr == b.addr && std::sync::Arc::ptr_eq(&a.found.tr, &b.found.tr) && a.sgpr_data == b.sgpr_data && a.user == b.user && a.code_hash == b.code_hash && reads_nothing(b)
 }
 
@@ -1582,6 +1583,84 @@ const ATTACHLESS_AREA: u32 = 16384;
 /// Draws recorded without attachments (status).
 pub static ATTACHLESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// PerVertexKHR arrays in the fragment stage consume one vec4 per vertex at
+// each location. Supply the same zero fallback as the geometry-stage linkers.
+fn link_vertex_outputs(code: &[u32], missing: u32) -> Result<std::borrow::Cow<'_, [u32]>, String> {
+    use rspirv::{binary::Assemble, dr::{Builder, Instruction, Operand}, spirv::{Decoration, Op, StorageClass}};
+    if missing == 0 { return Ok(code.into()); }
+    let module = rspirv::dr::load_words(code).map_err(|e| format!("vertex link: {e}"))?;
+    let mut b = Builder::new_from_module(module);
+    let scalar = b.type_float(32, None);
+    let vec4 = b.type_vector(scalar, 4);
+    let ptr = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero = b.constant_null(vec4);
+    let entry = b.module_ref().entry_points.first().and_then(|ep| ep.operands.get(1)).and_then(|op|
+        if let Operand::IdRef(id) = op { Some(*id) } else { None }).ok_or("missing vertex entry")?;
+    let mut stores = Vec::new();
+    for location in 0..32 {
+        if missing & (1 << location) == 0 { continue; }
+        let var = b.variable(ptr, None, StorageClass::Output, None);
+        b.decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+        b.module_mut().entry_points[0].operands.push(Operand::IdRef(var));
+        stores.push(Instruction::new(Op::Store, None, None, vec![Operand::IdRef(var), Operand::IdRef(zero)]));
+    }
+    let main = b.module_mut().functions.iter_mut().find(|f| f.def.as_ref().and_then(|i| i.result_id) == Some(entry)).ok_or("missing vertex function")?;
+    for block in &mut main.blocks {
+        if block.instructions.last().is_some_and(|i| i.class.opcode == Op::Return) {
+            let at = block.instructions.len()-1;
+            block.instructions.splice(at..at, stores.iter().cloned());
+        }
+    }
+    Ok(b.module().assemble().into())
+}
+
+#[cfg(test)]
+#[test]
+fn link_missing_vertex_outputs() {
+    use rspirv::{binary::Assemble, dr::{Builder, Operand}, spirv::*};
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let ft = b.type_function(void, []);
+    let f = b.type_float(32, None);
+    let v = b.type_vector(f, 4);
+    let ptr = b.type_pointer(None, StorageClass::Output, v);
+    let pos = b.variable(ptr, None, StorageClass::Output, None);
+    b.decorate(pos, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
+    let zero = b.constant_null(v);
+    let main = b.begin_function(void, None, FunctionControl::NONE, ft).unwrap();
+    b.begin_block(None).unwrap();
+    b.store(pos, zero, None, []).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", [pos]);
+    let original = b.module().assemble();
+    assert!(matches!(link_vertex_outputs(&original, 0).unwrap(), std::borrow::Cow::Borrowed(_)));
+    let linked = link_vertex_outputs(&original, 7).unwrap();
+    let module = rspirv::dr::load_words(&linked).unwrap();
+    for loc in 0..3 {
+        let dec = module.annotations.iter().find(|i| i.operands.get(1..) == Some(&[
+            Operand::Decoration(Decoration::Location), Operand::LiteralBit32(loc)])).unwrap();
+        assert!(module.entry_points[0].operands[3..].contains(&dec.operands[0]));
+        assert!(module.functions[0].blocks[0].instructions.iter().any(|i|
+            i.class.opcode == Op::Store && i.operands[0] == dec.operands[0]));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::{io::Write, process::{Command, Stdio}};
+        match Command::new("spirv-val").args(["--target-env","vulkan1.1","-"]).stdin(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                child.stdin.take().unwrap().write_all(&linked.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => panic!("spirv-val: {e}"),
+        }
+    }
+}
+
 fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     // (A pipeline whose compile crashed this driver: refused before its layouts and modules are
@@ -1589,6 +1668,11 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
     if crate::gpu::pcache::crashed_skip('g', hkey) {
         return Err(format!("g{hkey:016x} left out: its compile crashed this graphics driver before (crashed.txt)"));
     }
+    let batch = if vs.0.out.batched { 1u32 << rdna::translate::BATCH_VARYING } else { 0 };
+    let missing = if key.rect_gs.is_none() && bary_gs_of(key, vs, ps).is_none() {
+        ps.map_or(0, |p| p.0.out.in_mask & !vs.0.out.param_mask & !batch)
+    } else { 0 };
+    let linked_vs = link_vertex_outputs(&vs.0.out.spirv, missing)?;
     unsafe {
         let mut stages_p = vec![(vs.0, vk::ShaderStageFlags::VERTEX)];
         if let Some(p) = ps {
@@ -1607,7 +1691,7 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             m
         };
         let g = super::super::vk::creating(|| format!("vs {:#x}", vs.1));
-        let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.0.out.spirv)?)];
+        let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&linked_vs)?)];
         drop(g);
         super::super::vk::name_object(modules[0].1, &format!("vs {:#x}", vs.1));
         if let Some(mask) = key.rect_gs {
@@ -1619,17 +1703,6 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             super::super::vk::name_object(modules[modules.len() - 1].1, &format!("barycentric gs for ps {:#x}", p.1));
         }
         if let Some(p) = ps {
-            let from_gs = if key.rect_gs.is_none() { bary_gs_of(key, vs, ps).map_or(0, |(io, _)| io.added()) } else { 0 };
-            // (A batched vertex stage writes the batch varying besides its parameters, which
-            // `param_mask` leaves out by design.)
-            let batch = if vs.0.out.batched { 1u32 << rdna::translate::BATCH_VARYING } else { 0 };
-            let missing = p.0.out.in_mask & !vs.0.out.param_mask & !from_gs & !batch;
-            if key.rect_gs.is_none() && missing != 0 {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
-                    crate::info!("gfx pipeline: ps {:#x} reads locations {missing:#x} vs {:#x} does not write (vs writes {:#x}, ps reads {:#x})", p.1, vs.1, vs.0.out.param_mask, p.0.out.in_mask);
-                }
-            }
             let g = super::super::vk::creating(|| format!("ps {:#x}", p.1));
             modules.push((vk::ShaderStageFlags::FRAGMENT, module(&p.0.out.spirv)?));
             drop(g);
@@ -1728,32 +1801,31 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             // (The barycentric geometry shader's version and inputs: pipelines
             // without one keep their fingerprints.)
             match bary_gs_of(key, vs, ps) {
-                Some((_, batch)) => crate::gpu::pcache::translated_fingerprint(&[&vs.0.out.spirv, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
-                None => crate::gpu::pcache::translated_fingerprint(&[&vs.0.out.spirv, &gs, ps_code]),
+                Some((_, batch)) => crate::gpu::pcache::translated_fingerprint(&[&linked_vs, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
+                None => crate::gpu::pcache::translated_fingerprint(&[&linked_vs, &gs, ps_code]),
             }
         };
         let _crumb = crate::gpu::pcache::Crumb::set(
             || format!("graphics pipeline g{hkey:016x}: vs {:#x} (translation {:016x}), ps {}, rect-list gs {:?}, barycentric gs {}", vs.1, vs.0.key, ps.map_or("none".to_string(), |p| format!("{:#x} (translation {:016x})", p.1, p.0.key)), key.rect_gs, bary_gs_of(key, vs, ps).is_some()),
             || {
                 // (The modules as the driver gets them: `module_code`'s declaration included.)
-                let mut v = vec![("vs", super::module_code(&vs.0.out.spirv).into_owned())];
+                let mut v = vec![("vs", super::module_code(&linked_vs).into_owned())];
                 if let Some(p) = ps {
                     v.push(("ps", super::module_code(&p.0.out.spirv).into_owned()));
                 }
                 v
             },
         );
-        let r = crate::gpu::pcache::create_with('g', hkey, fp, |via| {
+        let r = crate::gpu::pcache::create_with('g', hkey, crate::gpu::pcache::creation_fingerprint(fp, &bindings, &ranges, flags, gpci.flags, c.subgroup32 & (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::GEOMETRY | vk::ShaderStageFlags::FRAGMENT)), |via| {
             let mut gpci = gpci;
-            let mut f2 = vk::PipelineCreateFlags2CreateInfoKHR::default().flags(vk::PipelineCreateFlags2KHR::from_raw(gpci.flags.as_raw() as u64 | crate::gpu::vk::pbin::CAPTURE_DATA));
-            if via.capture {
-                gpci = gpci.push_next(&mut f2);
-            }
+            let mut f2 = crate::gpu::vk::pbin::creation_flags(gpci.flags, via.capture);
+            if via.capture || via.binaries.is_some() { gpci = gpci.push_next(&mut f2); }
             let bi;
             if let Some(b) = via.binaries {
                 bi = crate::gpu::vk::pbin::BinaryInfo { s_type: crate::gpu::vk::pbin::ST_BINARY_INFO, p_next: gpci.p_next, binary_count: b.len() as u32, p_binaries: b.as_ptr() };
                 gpci.p_next = &bi as *const crate::gpu::vk::pbin::BinaryInfo as *const std::ffi::c_void;
             }
+            let _permit = crate::gpu::compile::driver_permit();
             c.device.create_graphics_pipelines(via.cache, &[gpci], None).map(|v| v[0]).map_err(|(_, e)| format!("graphics pipeline: {e}"))
         });
         for (_, m) in modules {
@@ -1767,6 +1839,9 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
                 return Err(e);
             }
         };
+        if c.validation && missing != 0 {
+            crate::info!("vertex link: supplied mask {missing:#x} vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1));
+        }
         crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1)));
         Ok(Pipe { pipeline, layout, set_layout, push })
     }
@@ -1781,6 +1856,7 @@ impl Exec {
     /// Executes a draw with the graphics state of `cp`; returns what
     /// happened (frame captures).
     pub fn draw(&mut self, cp: &Cp, args: DrawArgs) -> std::borrow::Cow<'static, str> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
         if super::ballast_progs().is_empty() {
             super::ballast_cp(self.ballast_kind, cp.ballast_part());
         }
@@ -1824,7 +1900,7 @@ impl Exec {
         }
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
         set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
-        let r = self.draw_inner(cp, &args);
+        let r = self.draw_inner(cp, &args, false);
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
@@ -1893,6 +1969,8 @@ impl Exec {
     /// index size, the others its arguments. Its indices must lie in the
     /// home the draw before bound (bound again at their offset).
     pub fn draw_repeat_cpu(&mut self, index: (u64, u32), count: u32, instances: u32, base_vertex: i32, first_instance: u32) -> bool {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
+        let _detail = crate::gpu::timeline::detail("record: repeat draw");
         let Some(mut r) = self.repeat.take() else { return false };
         if DEVICE_LOST.load(Ordering::Relaxed) || !self.recording || self.stopped || self.batch_count != r.batch || self.cmd_uses.get() != r.uses || self.rendering.is_none() || index.1 != r.index.1 || sync_mode() {
             return false;
@@ -2166,10 +2244,12 @@ impl Exec {
     }
 
     /// Records the draw; Ok(false) when it has no effect here.
-    fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs) -> Result<bool, String> {
+    fn draw_inner(&mut self, cp: &Cp, a: &DrawArgs, fg_hudless: bool) -> Result<bool, String> {
         self.fe2_min_want = u32::MAX;
         let delta_at = self.delta.at.take();
         if a.count == 0 || a.instances == 0 {
+            #[cfg(target_os = "linux")]
+            if fg_hudless { crate::gpu::framegen::note("HUDless skip: zero draw count", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
             return Ok(false);
         }
         // A draw of absurd size is logged (the first 16 a boot): 2026-11-06,
@@ -2179,6 +2259,8 @@ impl Exec {
             self.note_huge_draw(cp, a);
             if a.count as u64 * a.instances as u64 >= ABSURD_DRAW {
                 ABSURD_DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(target_os = "linux")]
+                if fg_hudless { crate::gpu::framegen::note("HUDless skip: absurd draw dropped", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                 return Ok(false);
             }
         }
@@ -2198,10 +2280,14 @@ impl Exec {
             if cb_mode == 3 {
                 self.report("MSAA resolve pass not implemented (skipped)".into());
             }
+            #[cfg(target_os = "linux")]
+            if fg_hudless { crate::gpu::framegen::note("HUDless skip: metadata CB mode", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
             return Ok(false);
         }
         let clip = reg(0x28810);
         if clip & (1 << 22) != 0 {
+            #[cfg(target_os = "linux")]
+            if fg_hudless { crate::gpu::framegen::note("HUDless skip: rasterization disabled", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
             return Ok(false); // DX_RASTERIZATION_KILL
         }
         if SKIP_VS_ANY.load(Ordering::Relaxed) && SKIP_VS.lock().as_ref().is_some_and(|s| s.contains(&super::super::shaders::ngg_addr(cp))) {
@@ -2225,6 +2311,25 @@ impl Exec {
         }
         // Shader stages.
         let ps_addr = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+        #[cfg(target_os = "linux")]
+        let fg_composite = crate::gpu::framegen::composite(ps_addr);
+        #[cfg(windows)]
+        let fg_composite = { let _ = fg_hudless; false };
+        if fg_composite && self.held { self.stop("frame generation pre-UI snapshot"); return Err(super::STOPPED.into()); }
+        #[cfg(target_os = "linux")]
+        if fg_composite && !fg_hudless {
+            // The final SDR shader reads the scene AND the UI and applies gamma. With
+            // a transparent UI input it writes the exact HUDless display colour. The
+            // real draw below overwrites the temporary output in the same command order.
+            // Never interpolate stale display-buffer contents from before the composite.
+            match self.draw_inner(cp, a, true) {
+                Ok(true) => {},
+                Ok(false) => crate::gpu::framegen::note("HUDless draw skipped", "composite had no effect"),
+                Err(e) if e == super::STOPPED => return Err(e),
+                Err(e) => crate::gpu::framegen::note("HUDless draw failed", e),
+            }
+        }
+
         // Stages prepared ahead by the workers (`gpu::ahead`) when they still
         // hold, else here. A draw whose arguments the GPU reads takes the
         // start instance on the GPU (prepared here).
@@ -2239,7 +2344,7 @@ impl Exec {
         // GPU-resolved draws (`gpures`, stage G4): a pair whose per-item
         // chains the shaders resolve runs batched, its draws after a run's
         // first appended with their user data alone (no preparation).
-        let direct = ps_addr != 0 && !rect && self.recording && !sync_mode();
+        let direct = !fg_composite && ps_addr != 0 && !rect && self.recording && !sync_mode();
         let mut gpu_pair = if direct && matches!(super::super::tune::gpu_chains(), 1 | 3) && ctx().draw_indirect_count && ctx().device_addresses { super::super::gpures::draw_decided(vs_addr, ps_addr) } else { None };
         if gpu_pair.is_some() && self.draw_same {
             if let Some(drawn) = self.draw_gpu_append(cp, a, vs_addr, ps_addr)? {
@@ -2336,6 +2441,8 @@ impl Exec {
                             });
                             crate::info!("skiprw: draw {n} of flip {}: ps {:#x} record {:x?}", flip + 1, p.addr, rec);
                         }
+                        #[cfg(target_os = "linux")]
+                        if fg_hudless { crate::gpu::framegen::note("HUDless skip: diagnostic skiprw", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                         return Ok(false);
                     }
                 }
@@ -2532,7 +2639,7 @@ impl Exec {
         let delta_mode = super::super::tune::buffer_delta();
         let mut sig = std::mem::take(&mut self.delta_sig);
         let keys = [vs.tr.key, ps.as_ref().map_or(0, |p| p.tr.key)];
-        let has_sig = delta_mode != 0 && !batched && gpu_pair.is_none() && image_sig([Some(&vs), ps.as_ref()], &mut sig);
+        let has_sig = !fg_composite && delta_mode != 0 && !batched && gpu_pair.is_none() && image_sig([Some(&vs), ps.as_ref()], &mut sig);
         let mut delta = if has_sig { self.delta_check(delta_at, keys, &sig, a.index.is_some()) } else { None };
         if delta.is_some() && self.held {
             // A held executor's reads and its own clears and reloads, as the
@@ -2710,6 +2817,8 @@ impl Exec {
                 lap.mark(6);
                 let mem_writes = vs.tr.plan.resources.iter().any(|r| r.written) || ps.as_ref().is_some_and(|p| p.tr.plan.resources.iter().any(|r| r.written));
                 if colors.iter().all(Option::is_none) && !z_write && !s_write && !clear_z && !clear_s && !mem_writes {
+                    #[cfg(target_os = "linux")]
+                    if fg_hudless { crate::gpu::framegen::note("HUDless skip: no writable attachments", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                     return Ok(false);
                 }
                 let attachless = colors.iter().all(Option::is_none) && depth.is_none();
@@ -2729,6 +2838,8 @@ impl Exec {
                 }
                 let (x0, y0, x1, y1) = scissor(cp, area);
                 if x1 <= x0 || y1 <= y0 {
+                    #[cfg(target_os = "linux")]
+                    if fg_hudless { crate::gpu::framegen::note("HUDless skip: empty scissor", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                     return Ok(false);
                 }
                 // Pipeline.
@@ -2812,6 +2923,8 @@ impl Exec {
                                             }
                                             ASYNC_GFX_WAITED[3].fetch_add(1, Ordering::Relaxed);
                                         }
+                                        #[cfg(target_os = "linux")]
+                                        if fg_hudless { crate::gpu::framegen::note("HUDless skip: pipeline compiling asynchronously", format_args!("count {} instances {} cb_target {:#x} cb_shader {:#x}", a.count, a.instances, ctx_reg(cp, 0x28238), ctx_reg(cp, 0x2823c))); }
                                         return Ok(false);
                                     }
                                 }
@@ -2954,6 +3067,11 @@ impl Exec {
         }
         lap.mark(9);
         // The vector is kept for the next draw (empty: it drains at the end).
+        #[cfg(target_os = "linux")]
+        let fg_ui = if fg_hudless {
+            self.end_rendering();
+            Some(crate::gpu::framegen::transparent_ui(self.cmd())?)
+        } else { None };
         let mut bounds = std::mem::take(&mut self.draw_bounds);
         bounds.clear();
         let mut sgpr_at = [0u64; 2];
@@ -3006,6 +3124,16 @@ impl Exec {
             let (ring, at) = self.bind_sgpr(p, &mut b)?;
             sgpr_at[k] = at;
             sgpr_ring = ring;
+            #[cfg(target_os = "linux")]
+            if k == 1 {
+                if let Some(view) = fg_ui {
+                    let binding = p.tr.out.bindings.iter().find(|b| matches!(b.kind, BindingKind::Image(0)))
+                        .ok_or("FG composite missing sampled UI resource 0")?.binding;
+                    let image = b.imgs.iter_mut().find(|b| b.0 == binding)
+                        .ok_or("FG composite UI descriptor was not bound")?;
+                    image.2.image_view = view;
+                }
+            }
             bounds.push(b);
             lap.mark(10 + k.min(1));
         }
@@ -3037,6 +3165,7 @@ impl Exec {
         let t_bind = since(t0);
         // (A buffer-delta draw keeps the instance: the draw before it
         // neither sampled nor stored an attachment of it.)
+        if fg_composite { self.end_rendering(); }
         let mut touches = true;
         if delta.is_none() {
             // Rendering instance: reuse it while the attachments stay the same
@@ -3514,6 +3643,16 @@ impl Exec {
                 self.batch_shaders.push(super::DRAW_KEY | if ps_addr != 0 { ps_addr } else { vs.addr });
             }
         }
+        #[cfg(target_os = "linux")]
+        if fg_hudless {
+            self.end_rendering();
+            if let Some(target) = colors[0] {
+                crate::gpu::framegen::note("HUDless scheduled", format_args!("ps {ps_addr:#x}, target {:#x}, {}x{} {:?}", target.key.base, target.width, target.height, target.format));
+                crate::gpu::vk::defer::external(self.cmd(), Box::new(move |cmd| crate::gpu::framegen::capture_hudless(cmd, target)));
+            } else {
+                crate::gpu::framegen::note("HUDless draw skipped", "composite has no colour attachment 0");
+            }
+        }
         lap.mark(16);
         // Another draw like it can be recorded on the state this one left
         // (`draw_repeat`): GPU-read arguments, indices and arguments in
@@ -3522,7 +3661,7 @@ impl Exec {
         // (Not after a batched draw: its pipeline's vertex stage reads its
         // SGPR data from the run's table by draw index.)
         let repeat = match (&index_home, a.index) {
-            _ if batched => None,
+            _ if batched || fg_composite => None,
             (Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
                 Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1 })
             }
@@ -3972,6 +4111,8 @@ impl Exec {
     /// run, before any preparation: no stage is resolved, synced or bound on
     /// the CPU. None: the full path records it (a new run).
     pub(super) fn draw_gpu_append(&mut self, cp: &Cp, a: &DrawArgs, vs_addr: u64, ps_addr: u64) -> Result<Option<bool>, String> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::Draw);
+        let _detail = crate::gpu::timeline::detail("record: GPU draw append");
         let Some(mut run) = self.draw_run.take() else { return Ok(None) };
         let r = self.draw_gpu_append_to(&mut run, cp, a, vs_addr, ps_addr);
         self.draw_run = Some(run);

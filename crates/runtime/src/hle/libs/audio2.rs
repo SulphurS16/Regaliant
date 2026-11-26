@@ -120,7 +120,7 @@ unsafe fn haptics(p: &Port, n: usize) {
         r += (b * b) as f64;
     }
     let k = 1.0 / n.max(1) as f64;
-    crate::input::haptics((l * k).sqrt() as f32, (r * k).sqrt() as f32);
+    crate::platform::loader_hooks::haptics((l * k).sqrt() as f32, (r * k).sqrt() as f32);
 }
 
 /// The ambisonic channel (ACN index 0..35) an object port carries (its
@@ -195,7 +195,7 @@ fn note_balance(w: &[f32], y: &[f32], x: &[f32]) {
     }
     a.2 += 1;
     if a.2 >= 187 {
-        crate::info!("AudioOut2 ambisonic balance {:+.3} front {:+.3} (W energy {:.2e}; flip {})", a.0 / a.1.max(1e-12), a.3 / a.1.max(1e-12), a.1, crate::gpu::FRAMES.load(Ordering::Relaxed));
+        crate::info!("AudioOut2 ambisonic balance {:+.3} front {:+.3} (W energy {:.2e}; flip {})", a.0 / a.1.max(1e-12), a.3 / a.1.max(1e-12), a.1, crate::platform::loader_hooks::frame_count());
         *a = (0.0, 0.0, 0, 0.0);
     }
 }
@@ -773,7 +773,7 @@ sysv! {
                 if level == 0 && c.pushes > 100 {
                     static LATE: AtomicU32 = AtomicU32::new(0);
                     if LATE.fetch_add(1, Ordering::Relaxed) < 40 {
-                        crate::info!("AudioOut2: context {ctx} pushed into an empty queue {gap:.1} ms after its last push (thread {}, flip {})", crate::log::thread_name(), crate::gpu::FRAMES.load(Ordering::Relaxed));
+                        crate::info!("AudioOut2: context {ctx} pushed into an empty queue {gap:.1} ms after its last push (thread {}, flip {})", crate::log::thread_name(), crate::platform::loader_hooks::frame_count());
                     }
                 }
             }

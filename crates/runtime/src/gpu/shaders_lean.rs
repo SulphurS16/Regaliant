@@ -390,9 +390,16 @@ pub fn reset_cycles() {
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_with(addr: u64, insts: &Arc<Local<Vec<rdna::Inst>>>, code_hash: u64, user: &[u32], stage: Stage, user_sgprs: u16, user_base: u16, tkey: u64, specs: &mut Vec<ResSpec>) -> Option<Result<Prepared, String>> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::ShaderPrepare);
     let phases = twice_on() && PHASE_FIRST.with(|c| c.get());
     let mut tp = if phases { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
+    let mut detail = super::super::timeline::detail_mark();
     let mut mark = |k: usize| {
+        if detail.is_some() {
+            const NAMES: [&str; 5] = ["prepare/plan and reader", "prepare/resources", "prepare/depth and translation", "prepare/scalar loads", "prepare/result"];
+            super::super::timeline::detail_lap(detail, NAMES[k]);
+            detail = super::super::timeline::detail_mark();
+        }
         if phases {
             let t = unsafe { core::arch::x86_64::_rdtsc() };
             PHASE_LOCAL.with(|c| {

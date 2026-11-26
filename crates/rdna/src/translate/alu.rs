@@ -1340,62 +1340,63 @@ fn fcmp(tr: &mut T, a: Word, b: Word, c: &str) -> R<Option<Word>> {
     }))
 }
 
-/// v_cmp_class_f32: tests floating-point class bits.
-fn fclass(tr: &mut T, x: Word, mask: Word) -> R<Word> {
-    let bt = tr.t.bool_;
-    let u = tr.t.u32;
-    let bits_ = tr.to_u(x)?;
-    let abs = tr.glsl1(tr.t.f32, GLOp::FAbs, x)?;
-    let inf = tr.f(f32::INFINITY);
-    let minn = tr.f(f32::MIN_POSITIVE);
-    let zero = tr.f(0.0);
-    let s31 = tr.u(31);
-    let sign_b = e(tr.b.shift_right_logical(u, None, bits_, s31))?;
-    let one = tr.u(1);
-    let neg = e(tr.b.i_equal(bt, None, sign_b, one))?;
-    let pos = e(tr.b.logical_not(bt, None, neg))?;
-    let nan = e(tr.b.is_nan(bt, None, x))?;
-    let qbit = tr.u(1 << 22);
-    let qm = e(tr.b.bitwise_and(u, None, bits_, qbit))?;
-    let quiet = nonzero(tr, qm)?;
-    let snan = {
-        let nq = e(tr.b.logical_not(bt, None, quiet))?;
-        e(tr.b.logical_and(bt, None, nan, nq))?
+/// v_cmp_class_f32 inspects the encoding, including subnormals and both NaN
+/// classes. Floating comparisons can flush subnormals and, without float-controls
+/// preservation, need not distinguish NaNs. Do not implement a bit classification
+/// with floating arithmetic (the fog history rejection tests mask 56).
+fn fclass_bits(b: &mut rspirv::dr::Builder, u: Word, bt: Word, raw: Word, mask: Word) -> R<Word> {
+    let zero = b.constant_bit32(u, 0);
+    let sign = b.constant_bit32(u, 0x8000_0000);
+    let magnitude = b.constant_bit32(u, 0x7fff_ffff);
+    let inf = b.constant_bit32(u, 0x7f80_0000);
+    let min_normal = b.constant_bit32(u, 0x0080_0000);
+    let quiet_bit = b.constant_bit32(u, 0x0040_0000);
+    let abs = e(b.bitwise_and(u, None, raw, magnitude))?;
+    let sign = e(b.bitwise_and(u, None, raw, sign))?;
+    let neg = e(b.i_not_equal(bt, None, sign, zero))?;
+    let nan = e(b.u_greater_than(bt, None, abs, inf))?;
+    let isinf = e(b.i_equal(bt, None, abs, inf))?;
+    let iszero = e(b.i_equal(bt, None, abs, zero))?;
+    let small = e(b.u_less_than(bt, None, abs, min_normal))?;
+    let quiet = e(b.bitwise_and(u, None, raw, quiet_bit))?;
+    let quiet = e(b.i_not_equal(bt, None, quiet, zero))?;
+    // Pick one of the ten ISA class bits, then test the requested mask.
+    let mut class_bit = |negative, positive| {
+        let n = b.constant_bit32(u, 1u32 << negative);
+        let p = b.constant_bit32(u, 1u32 << positive);
+        e(b.select(u, None, neg, n, p))
     };
-    let qnan = e(tr.b.logical_and(bt, None, nan, quiet))?;
-    let isinf = e(tr.b.f_ord_equal(bt, None, abs, inf))?;
-    let iszero = e(tr.b.f_ord_equal(bt, None, abs, zero))?;
-    let normal = {
-        let ge = e(tr.b.f_ord_greater_than_equal(bt, None, abs, minn))?;
-        let ni = e(tr.b.logical_not(bt, None, isinf))?;
-        e(tr.b.logical_and(bt, None, ge, ni))?
-    };
-    let denorm = {
-        let lt = e(tr.b.f_ord_less_than(bt, None, abs, minn))?;
-        let nz = e(tr.b.logical_not(bt, None, iszero))?;
-        e(tr.b.logical_and(bt, None, lt, nz))?
-    };
-    let classes = [
-        snan,
-        qnan,
-        e(tr.b.logical_and(bt, None, neg, isinf))?,
-        e(tr.b.logical_and(bt, None, neg, normal))?,
-        e(tr.b.logical_and(bt, None, neg, denorm))?,
-        e(tr.b.logical_and(bt, None, neg, iszero))?,
-        e(tr.b.logical_and(bt, None, pos, iszero))?,
-        e(tr.b.logical_and(bt, None, pos, denorm))?,
-        e(tr.b.logical_and(bt, None, pos, normal))?,
-        e(tr.b.logical_and(bt, None, pos, isinf))?,
-    ];
-    let mut acc = tr.bool_c(false);
-    for (i, c) in classes.iter().enumerate() {
-        let bit = tr.u(1 << i);
-        let mb = e(tr.b.bitwise_and(u, None, mask, bit))?;
-        let on = nonzero(tr, mb)?;
-        let t = e(tr.b.logical_and(bt, None, on, *c))?;
-        acc = e(tr.b.logical_or(bt, None, acc, t))?;
-    }
-    Ok(acc)
+    let normal_class = class_bit(3, 8)?;
+    let denorm_class = class_bit(4, 7)?;
+    let zero_class = class_bit(5, 6)?;
+    let inf_class = class_bit(2, 9)?;
+    let snan = b.constant_bit32(u, 1);
+    let qnan = b.constant_bit32(u, 2);
+    let nan_class = e(b.select(u, None, quiet, qnan, snan))?;
+    let class = e(b.select(u, None, small, denorm_class, normal_class))?;
+    let class = e(b.select(u, None, iszero, zero_class, class))?;
+    let class = e(b.select(u, None, isinf, inf_class, class))?;
+    let class = e(b.select(u, None, nan, nan_class, class))?;
+    let selected = e(b.bitwise_and(u, None, mask, class))?;
+    e(b.i_not_equal(bt, None, selected, zero))
+}
+
+/// RDNA med3 returns min3 if ANY operand is NaN. The sorting network alone
+/// gives the wrong result when one of its NMin/NMax calls drops a NaN.
+fn fmed3(b: &mut rspirv::dr::Builder, f: Word, bt: Word, glsl: Word, a: Word, c: Word, d: Word) -> R<Word> {
+    use rspirv::dr::Operand::IdRef;
+    let an = e(b.is_nan(bt, None, a))?;
+    let cn = e(b.is_nan(bt, None, c))?;
+    let dn = e(b.is_nan(bt, None, d))?;
+    let nan = e(b.logical_or(bt, None, an, cn))?;
+    let nan = e(b.logical_or(bt, None, nan, dn))?;
+    let mut op = |which: GLOp, x, y| e(b.ext_inst(f, None, glsl, which as u32, [IdRef(x), IdRef(y)]));
+    let mn = op(GLOp::NMin, a, c)?;
+    let mx = op(GLOp::NMax, a, c)?;
+    let lo = op(GLOp::NMin, mn, d)?;
+    let mid = op(GLOp::NMin, mx, d)?;
+    let mid = op(GLOp::NMax, mn, mid)?;
+    e(b.select(f, None, nan, lo, mid))
 }
 
 /// Masks of the lanes below this one (lo, hi) for v_mbcnt.
@@ -1511,9 +1512,9 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         let (cmp, ty) = rest.rsplit_once('_').unwrap_or(("", ""));
         let c = match (cmp, ty) {
             ("class", "f32") => {
-                let a = fsrc(tr, ins, &v, 0)?;
+                let a = bsrc(tr, ins, &v, 0)?;
                 let m = usrc(tr, ins, &v, 1)?;
-                Some(fclass(tr, a, m)?)
+                Some(fclass_bits(&mut tr.b, u, bt, a, m)?)
             }
             (_, "f32") => {
                 let a = fsrc(tr, ins, &v, 0)?;
@@ -1824,10 +1825,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                     tr.glsl2(f, GLOp::NMax, m, c)?
                 }
                 _ => {
-                    let mn = tr.glsl2(f, GLOp::NMin, a, b)?;
-                    let mx = tr.glsl2(f, GLOp::NMax, a, b)?;
-                    let m2 = tr.glsl2(f, GLOp::NMin, mx, c)?;
-                    tr.glsl2(f, GLOp::NMax, mn, m2)?
+                    fmed3(&mut tr.b, f, bt, tr.glsl, a, b, c)?
                 }
             };
             fout(tr, &v, r)?;
@@ -2519,4 +2517,137 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         _ => unsupported(tr, ins),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rspirv::{
+        dr::{Builder, Operand},
+        spirv::{FunctionControl, Op},
+    };
+
+    // Execute the emitted integer expression, not a second copy of its algorithm.
+    // This needs neither a Vulkan device nor any title data.
+    #[test]
+    fn class_spirv_distinguishes_all_ieee_classes_and_nan_payloads() {
+        let mut b = Builder::new();
+        let u = b.type_int(32, 0);
+        let bt = b.type_bool();
+        let ty = b.type_function(bt, [u, u]);
+        b.begin_function(bt, None, FunctionControl::NONE, ty).unwrap();
+        let raw = b.function_parameter(u).unwrap();
+        let mask = b.function_parameter(u).unwrap();
+        b.begin_block(None).unwrap();
+        let result = fclass_bits(&mut b, u, bt, raw, mask).unwrap();
+        b.ret_value(result).unwrap();
+        b.end_function().unwrap();
+        let module = b.module();
+        let mut constants = std::collections::HashMap::new();
+        for i in &module.types_global_values {
+            if i.class.opcode == Op::Constant {
+                let Operand::LiteralBit32(v) = i.operands[0] else { panic!("constant") };
+                constants.insert(i.result_id.unwrap(), v);
+            }
+        }
+        let eval = |bits, m| {
+            let mut values = constants.clone();
+            values.insert(raw, bits);
+            values.insert(mask, m);
+            for i in &module.functions[0].blocks[0].instructions {
+                let args: Vec<u32> = i.operands.iter().map(|o| match o {
+                    Operand::IdRef(id) => values[id],
+                    _ => panic!("non-id operand: {o:?}"),
+                }).collect();
+                let x = match i.class.opcode {
+                    Op::BitwiseAnd => args[0] & args[1],
+                    Op::IEqual => (args[0] == args[1]) as u32,
+                    Op::INotEqual => (args[0] != args[1]) as u32,
+                    Op::UGreaterThan => (args[0] > args[1]) as u32,
+                    Op::ULessThan => (args[0] < args[1]) as u32,
+                    Op::Select => if args[0] != 0 { args[1] } else { args[2] },
+                    Op::ReturnValue => return args[0] != 0,
+                    op => panic!("classification must use integer operations, got {op:?}"),
+                };
+                values.insert(i.result_id.unwrap(), x);
+            }
+            panic!("no result")
+        };
+        let cases = [
+            (0x7f80_0001, 0), (0xffbf_ffff, 0),
+            (0x7fc0_0000, 1), (0xffff_ffff, 1), (0x7fff_e000, 1),
+            (0xff80_0000, 2), (0xbf80_0000, 3), (0x8080_0000, 3),
+            (0x8000_0001, 4), (0x807f_ffff, 4), (0x8000_0000, 5),
+            (0, 6), (1, 7), (0x007f_ffff, 7),
+            (0x0080_0000, 8), (0x7f7f_ffff, 8), (0x7f80_0000, 9),
+        ];
+        for (bits, class) in cases {
+            for mask in 0..1024 {
+                assert_eq!(eval(bits, mask), mask & (1 << class) != 0, "bits={bits:08x} mask={mask}");
+            }
+        }
+        // Every sign/quiet combination and a selection of payloads must be rejected
+        // by the scatter's negative-finite mask, including half NaNs widened to f32.
+        for sign in [0, 0x8000_0000] {
+            for payload in [1, 0x2000, 0x3f_ffff, 0x40_0000, 0x7f_ffff] {
+                assert!(!eval(sign | 0x7f80_0000 | payload, 56));
+            }
+        }
+    }
+    #[test]
+    fn med3_spirv_uses_minimum_for_every_nan_operand_position() {
+        let mut b = Builder::new();
+        let f = b.type_float(32, None);
+        let bt = b.type_bool();
+        let glsl = b.ext_inst_import("GLSL.std.450");
+        let ty = b.type_function(f, [f, f, f]);
+        b.begin_function(f, None, FunctionControl::NONE, ty).unwrap();
+        let args = std::array::from_fn::<_, 3, _>(|_| b.function_parameter(f).unwrap());
+        b.begin_block(None).unwrap();
+        let result = fmed3(&mut b, f, bt, glsl, args[0], args[1], args[2]).unwrap();
+        b.ret_value(result).unwrap();
+        b.end_function().unwrap();
+        let module = b.module();
+        let eval = |input: [f32; 3]| {
+            let mut values: std::collections::HashMap<_, _> = args.into_iter().zip(input.map(f32::to_bits)).collect();
+            for i in &module.functions[0].blocks[0].instructions {
+                let get = |n| match i.operands[n] {
+                    Operand::IdRef(id) => values[&id],
+                    _ => panic!("operand"),
+                };
+                let x = match i.class.opcode {
+                    Op::IsNan => f32::from_bits(get(0)).is_nan() as u32,
+                    Op::LogicalOr => get(0) | get(1),
+                    Op::Select => if get(0) != 0 { get(1) } else { get(2) },
+                    Op::ExtInst => {
+                        let Operand::LiteralExtInstInteger(op) = i.operands[1] else { panic!("ext op") };
+                        let (a, c) = (f32::from_bits(get(2)), f32::from_bits(get(3)));
+                        match op {
+                            x if x == GLOp::NMin as u32 => a.min(c).to_bits(),
+                            x if x == GLOp::NMax as u32 => a.max(c).to_bits(),
+                            _ => panic!("unexpected GLSL op {op}"),
+                        }
+                    }
+                    Op::ReturnValue => return f32::from_bits(get(0)),
+                    op => panic!("unexpected {op:?}"),
+                };
+                values.insert(i.result_id.unwrap(), x);
+            }
+            panic!("no result")
+        };
+        let cases = [f32::NEG_INFINITY, -3., -0., 0., 2., 5., f32::INFINITY, f32::NAN, f32::from_bits(0xffff_ffff)];
+        for a in cases {
+            for c in cases {
+                for d in cases {
+                    let input = [a, c, d];
+                    let mut finite: Vec<_> = input.into_iter().filter(|v| !v.is_nan()).collect();
+                    finite.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let want = match finite.len() { 0 => f32::NAN, 3 => finite[1], _ => finite[0] };
+                    let got = eval(input);
+                    assert!(if want.is_nan() { got.is_nan() } else { got == want }, "{input:?}: {got} != {want}");
+                }
+            }
+        }
+    }
+
 }

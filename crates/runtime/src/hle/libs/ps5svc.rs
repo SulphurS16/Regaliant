@@ -151,6 +151,7 @@ fn addon_labels() -> &'static Vec<String> {
 }
 
 fn scan_addons(top: &std::path::Path, dir: &std::path::Path, depth: u32, s: &mut AddonScan, budget: &mut usize) {
+    if !crate::platform::files::import_file_type(dir).is_some_and(|t| t.is_dir()) { return; }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<std::fs::DirEntry> = rd.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
@@ -159,7 +160,8 @@ fn scan_addons(top: &std::path::Path, dir: &std::path::Path, depth: u32, s: &mut
         let path = e.path();
         let rel = path.strip_prefix(top).unwrap_or(&path).display().to_string();
         // (Not into junctions or links: `file_type` does not follow them.)
-        let kind = e.file_type().ok();
+        let kind = crate::platform::files::import_file_type(&path);
+        if !kind.is_some_and(|t| t.is_file() || t.is_dir()) { continue; }
         if let Some(l) = addon_label(&e.file_name().to_string_lossy()) {
             s.labels.push((l, format!("the name {rel}")));
         } else if kind.is_some_and(|t| t.is_file()) {
@@ -575,6 +577,29 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::{addon_label, labels_in_bytes};
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn addon_scan_skips_symlinks() {
+        let base = std::env::temp_dir().join(format!("dsport-addons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("Add-ons");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("DEMONSSOULSGIFT2.pkg"), b"fixture").unwrap();
+        std::fs::write(dir.join("DEMONSSOULSGIFT1.pkg"), b"fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked-folder")).unwrap();
+        std::os::unix::fs::symlink(outside.join("DEMONSSOULSGIFT2.pkg"), dir.join("DEMONSSOULSGIFT2.pkg")).unwrap();
+        let mut got = super::AddonScan::default();
+        let mut budget = super::ADDON_READS;
+        super::scan_addons(&dir, &dir, 3, &mut got, &mut budget);
+        assert_eq!(got.labels.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["DEMONSSOULSGIFT1"]);
+        got.labels.clear();
+        super::scan_addons(&dir, &dir.join("linked-folder"), 3, &mut got, &mut budget);
+        assert!(got.labels.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     /// Add-on labels from package names as players have them (2026-11-24: the pre-order GIFT1
     /// and GIFT2 packages, as a .pkg file or the folders unpacked from it).

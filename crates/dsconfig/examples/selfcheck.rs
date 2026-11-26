@@ -14,10 +14,11 @@ fn sha(b: &[u8]) -> String {
 
 fn main() {
     let app = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: selfcheck <PPSA01341-app0 folder>"));
+    let source = dsconfig::zar::Source::Dir(app.clone());
     let mut failed = false;
     for rel in ["eboot.bin", "sce_module/libc.prx", "sce_module/libSceNpCppWebApi.prx"] {
-        let retail = std::fs::read(app.join(rel)).expect("the retail file");
-        let plain = std::fs::read(app.join("decrypted").join(rel)).expect("the decrypted file");
+        let retail = source.read(rel).expect("the retail file");
+        let plain = source.read(&format!("decrypted/{rel}")).expect("the decrypted file");
         print!("{rel}: the dump's container {} ({} bytes); ", if self_file::is_self(&retail) { "a SELF" } else { "not a SELF" }, retail.len());
         match self_file::decrypted_elf(&retail) {
             Ok(elf) => {

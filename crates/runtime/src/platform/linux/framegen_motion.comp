@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+// The guest texture is read-only. FSR cannot consume the title's undefined
+// previous-position divides: its nearest-depth dilation spreads NaNs to neighbours.
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0, rg16f) uniform readonly image2D rawMotion;
+layout(binding=1) uniform texture2D depth;
+layout(binding=2, rg16f) uniform writeonly image2D motion;
+layout(binding=3, r32ui) uniform writeonly uimage2D status;
+layout(push_constant) uniform Constants {
+    vec4 reprojection[4]; // row-major current unjittered clip -> previous clip
+    vec2 jitter;         // render pixels, x-right/y-down
+} c;
+bool finite2(vec2 v) { return !any(isnan(v)) && !any(isinf(v)); }
+bool valid(vec2 v) { return finite2(v) && all(lessThanEqual(abs(v),vec2(1))); }
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(rawMotion);
+    if (any(greaterThanEqual(p,size))) return;
+    vec2 mv=imageLoad(rawMotion,p).xy;
+    uint reason=0;
+    if (!valid(mv)) {
+        reason=finite2(mv)?512u:256u;
+        float d=texelFetch(depth,p,0).x;
+        // Borrow only from the same depth surface. Never blend across a silhouette
+        // or recursively spread repaired values: all reads use the raw title image.
+        float best=1e30;
+        vec2 replacement=vec2(0);
+        uint method=3;
+        for(int y=-1;y<=1;++y) for(int x=-1;x<=1;++x) {
+            ivec2 q=p+ivec2(x,y);
+            if(any(lessThan(q,ivec2(0))) || any(greaterThanEqual(q,size))) continue;
+            vec2 v=imageLoad(rawMotion,q).xy;
+            float dq=texelFetch(depth,q,0).x;
+            float error=abs(d-dq);
+            float score=error+float(x*x+y*y)*1e-8;
+            if(valid(v) && d>0 && error<=abs(d)*0.02 && score<best) {
+                best=score; replacement=v; method=1;
+            }
+        }
+        if(method==3) {
+            vec2 uv=(vec2(p)+0.5-c.jitter)/vec2(size);
+            vec4 clip=vec4(uv.x*2-1,1-uv.y*2,d,1);
+            vec4 prev=vec4(dot(c.reprojection[0],clip),dot(c.reprojection[1],clip),
+                           dot(c.reprojection[2],clip),dot(c.reprojection[3],clip));
+            // Homogeneous multiplication also works at depth zero/infinite sky.
+            if(prev.w>1e-8) {
+                vec2 camera=uv-(prev.xy/prev.w*vec2(0.5,-0.5)+0.5);
+                if(valid(camera)) { replacement=camera; method=2; }
+            }
+        }
+        mv=replacement; reason|=method;
+    }
+    imageStore(motion,p,vec4(mv,0,0));
+    imageStore(status,p,uvec4(reason,0,0,0));
+}

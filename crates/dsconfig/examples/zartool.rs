@@ -218,6 +218,8 @@ fn readall(paths: &[String]) -> i32 {
 }
 
 fn levels(folder: &Path, scratch: &Path, list: &str) -> i32 {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = dsconfig::files::archive_output(folder, scratch) { eprintln!("scratch directory: {e}"); return 1; }
     let _ = std::fs::create_dir_all(scratch);
     for l in list.split(',').filter_map(|v| v.trim().parse::<i32>().ok()) {
         let out: PathBuf = scratch.join(format!("level{l}.zar"));

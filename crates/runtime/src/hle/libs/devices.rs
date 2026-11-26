@@ -100,7 +100,7 @@ pub extern "sysv64" fn rad_speaker_hook(regs: *const u64, _arg: u32) {
             "RAD speaker gains: voice {voice:#x} ({ch} channels), {count} speakers, matrix [{}]{} (from {})",
             gains.join(" "),
             if fixed { ": the right channel added to the front right" } else { "" },
-            crate::exception::current_guest_frames(3).join(" <- ")
+            crate::platform::loader_hooks::current_guest_frames(3).join(" <- ")
         );
     }
 }
@@ -221,7 +221,7 @@ fn note_pad_buffer(data: *mut PadData, how: &str) {
     if (n >= 256 && n % 64 != 0) || SEEN.lock().len() >= 8 {
         return;
     }
-    let frames = crate::exception::current_guest_frames(4);
+    let frames = crate::platform::loader_hooks::current_guest_frames(4);
     let key = (data as u64, frames.first().cloned().unwrap_or_default());
     let mut g = SEEN.lock();
     if g.len() < 8 && !g.contains(&key) {
@@ -256,6 +256,7 @@ sysv! {
         let mut ports = PORTS.lock();
         let p = Port { kind, len, freq, format: param, next: Instant::now(), volume: [32768; 8], stream: crate::audio::new_stream() };
         let idx = match ports.iter().position(|p| p.is_none()) { Some(i) => { ports[i] = Some(p); i } None => { ports.push(Some(p)); ports.len() - 1 } };
+        crate::info!("AudioOut v1 queue: {} grains, {:.1} ms", crate::audio::legacy_queue_depth(len as usize), crate::audio::legacy_queue_depth(len as usize) as f64 * len as f64 * 1000.0 / freq as f64);
         crate::info!("sceAudioOutOpen type {kind} len {len} freq {freq} format {:#x} ({} ch) -> port {}", param, port_channels(param), idx + 1);
         idx as i32 + 1
     }
@@ -263,7 +264,7 @@ sysv! {
         let mut ports = PORTS.lock();
         match ports.get_mut((h - 1) as usize) { Some(p @ Some(_)) => { *p = None; 0 } _ => 0x8026_0004u32 as i32 }
     }
-    /// Routed ports feed the host mixer (blocking while 3 buffers are queued,
+    /// Routed ports feed the host mixer (blocking while the output-sized queue is full,
     /// which paces the caller by the output clock); others are paced sinks.
     fn sceAudioOutOutput(h: i32, ptr: *const u8) -> i32 {
         let (port, wait) = {
@@ -280,7 +281,7 @@ sysv! {
         }
         if routed(port.kind) {
             if !ptr.is_null() {
-                crate::audio::push_stream(port.stream, to_stereo(&port, ptr), 3);
+                crate::audio::push_stream(port.stream, to_stereo(&port, ptr), crate::audio::legacy_queue_depth(port.len as usize));
             }
             return 0;
         }

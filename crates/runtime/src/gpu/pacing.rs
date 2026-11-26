@@ -75,3 +75,11 @@ pub fn report_and_reset() -> String {
         worst.join(", ")
     )
 }
+
+/// Start/end an isolated relay interval, excluding the gap before its first flip.
+#[cfg(target_os = "linux")]
+pub fn take_intervals() -> Vec<(u32, u64)> {
+    let mut s = STATE.lock();
+    s.last = None;
+    std::mem::take(&mut s.intervals)
+}

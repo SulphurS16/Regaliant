@@ -7,7 +7,10 @@
 //! on the console. Dispatches run on Vulkan with `DS_GPU=1` (`exec`); draws
 //! are decoded but not rendered yet (docs/STATUS.md).
 
+pub mod cpu_profile;
+pub mod record_opts;
 pub mod capture;
+pub mod nan_probe;
 pub mod cp;
 pub mod desc;
 pub mod emucheck;
@@ -132,9 +135,9 @@ pub mod tune {
         Tunable { name: "skip_cmds", env: "DS_SKIP_CMDS", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "xwait_skip", env: "DS_XWAIT_SKIP", default: 0, value: AtomicU64::new(UNSET) },
         Tunable { name: "batch_cs", env: "DS_BATCH_CS", default: 1, value: AtomicU64::new(UNSET) },
-        Tunable { name: "job_idle", env: "DS_JOB_IDLE", default: 50, value: AtomicU64::new(UNSET) },
-        Tunable { name: "job_sleep", env: "DS_JOB_SLEEP", default: 200, value: AtomicU64::new(UNSET) },
-        Tunable { name: "job_watch", env: "DS_JOB_WATCH", default: 2000, value: AtomicU64::new(UNSET) },
+        Tunable { name: "job_idle", env: "DS_JOB_IDLE", default: crate::jobidle::DEFAULT_IDLE, value: AtomicU64::new(UNSET) },
+        Tunable { name: "job_sleep", env: "DS_JOB_SLEEP", default: crate::jobidle::DEFAULT_SLEEP, value: AtomicU64::new(UNSET) },
+        Tunable { name: "job_watch", env: "DS_JOB_WATCH", default: crate::jobidle::DEFAULT_WATCH, value: AtomicU64::new(UNSET) },
         Tunable { name: "sgpr_ubo", env: "DS_SGPR_UBO", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "power_optout", env: "DS_POWER_OPTOUT", default: 1, value: AtomicU64::new(UNSET) },
         Tunable { name: "flip_grid", env: "DS_FLIP_GRID", default: 1, value: AtomicU64::new(UNSET) },
@@ -1274,7 +1277,15 @@ pub mod tune {
     /// The title's game time follows real time, so its speed is kept.
     #[inline]
     pub fn frame_cap() -> u64 {
-        get(106)
+        let cap = get(106);
+        #[cfg(target_os = "linux")]
+        {
+            // Relay safety ceiling survives self-play changing the live frame_cap.
+            static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let limit = *LIMIT.get_or_init(|| std::env::var("DS_RELAY_FPS_LIMIT").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+            if limit > 0 { return if cap == 0 { limit } else { cap.min(limit) }; }
+        }
+        cap
     }
 
     /// The texture scrubber's sleep between passes in write-watch mode
@@ -2271,10 +2282,13 @@ pub mod track;
 pub mod shaders;
 pub mod swizzle_tables;
 pub mod tiling;
+#[cfg_attr(target_os = "linux", path = "../platform/linux/upscale.rs")]
 pub mod upscale;
 pub mod upmerge;
 pub mod uiscale;
 pub mod verify;
+#[cfg(target_os = "linux")]
+pub mod scatter_check;
 pub mod vk;
 pub mod xwait;
 pub mod census;
@@ -2824,7 +2838,7 @@ fn queue(id: u32) -> &'static Queue {
 
 fn worker(q: &'static Queue, name: &str) {
     crate::log::set_thread_name(name);
-    q.tid.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
+    q.tid.store(unsafe { crate::platform::os::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
     crate::exception::arm_watch_current_thread(false);
     let mut cp = cp::Cp::new(name, q.id != GFX);
     if q.id == GFX {
@@ -3333,8 +3347,8 @@ static PROFILE_ATOMIC_SITES: Mutex<Option<std::collections::HashMap<(&'static st
 /// memory, 2 right after one (with its address), 3 a spin-wait pause, 0 anything else.
 fn sampled_instruction(rip: u64) -> (u8, u64) {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use crate::platform::os::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use crate::platform::os::Win32::System::Threading::GetCurrentProcess;
     let mut buf = [0u8; 32];
     let mut n = 0usize;
     let ok = rip > 16 && unsafe { ReadProcessMemory(GetCurrentProcess(), (rip - 16) as *const core::ffi::c_void, buf.as_mut_ptr() as *mut core::ffi::c_void, 32, &mut n) } != 0 && n == 32;
@@ -3367,7 +3381,7 @@ static PROFILE_THREADS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new())
 
 /// Samples the calling thread as `kind` while profiling (`DS_PROFILE_GPU`).
 pub fn profile_this_thread(kind: &'static str) {
-    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let tid = unsafe { crate::platform::os::Win32::System::Threading::GetCurrentThreadId() };
     PROFILE_THREADS.lock().push((kind, tid));
 }
 
@@ -3814,3 +3828,7 @@ pub fn status_ex(with_stacks: bool) -> String {
     }
     s
 }
+
+#[cfg(target_os = "linux")]
+#[path = "../platform/linux/framegen.rs"]
+pub mod framegen;

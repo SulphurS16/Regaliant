@@ -13,7 +13,7 @@ use crate::{reg, sysv};
 use dsconfig::zar::{Archive, Source};
 use parking_lot::{Mutex, RwLock};
 use std::fs::{File, OpenOptions};
-use std::os::windows::fs::FileExt;
+use crate::platform::files::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -102,7 +102,7 @@ pub fn resolve(guest: &str) -> Option<Resolved> {
                 return Some(Resolved { candidates: Vec::new(), writable: false, zar: Some((a.clone(), rel)) });
             }
             let rel: PathBuf = comps[pre.len()..].iter().collect();
-            return Some(Resolved { candidates: m.layers.iter().map(|l| l.join(&rel)).collect(), writable: m.writable, zar: None });
+            return Some(Resolved { candidates: crate::platform::files::candidates(&m.layers, &rel, m.writable)?, writable: m.writable, zar: None });
         }
     }
     None
@@ -213,7 +213,7 @@ pub fn guest_meta(guest: &str) -> Option<(Found, CachedMeta)> {
     if r.writable {
         return found;
     }
-    match (found, crate::pcsettings::generated(guest)) {
+    match (found, crate::platform::file_hooks::generated(guest)) {
         // A title file the port extends: its extended size.
         (Some((p, m)), Some(d)) => Some((p, CachedMeta { size: d.len() as u64, ..m })),
         // A file the port adds (served from memory; its host path is never opened).
@@ -325,7 +325,7 @@ fn title_args() -> Option<String> {
         v.clear();
     }
     // The PC settings the title takes at boot (the SETTINGS screen's PC tab): the logos.
-    if crate::pcsettings::store::value("Setting_PC_SkipIntro") == Some(1) {
+    if crate::platform::file_hooks::setting("Setting_PC_SkipIntro") == Some(1) {
         v.push_str(" +cp11_debug_skipSplashScreens=1");
     }
     let v = v.trim();
@@ -358,7 +358,7 @@ pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
         }
     }
     if !wants_write && !r.writable {
-        if let Some(d) = crate::pcsettings::generated(path) {
+        if let Some(d) = crate::platform::file_hooks::generated(path) {
             crate::info!("open '{path}': the port's extended copy ({} bytes)", d.len());
             return alloc_fd(Fd { kind: Kind::Mem(d), pos: Mutex::new(0), path: path.to_string() });
         }
@@ -460,10 +460,11 @@ fn open_in_archive(path: &str, flags: i32, a: &Arc<Archive>, p: &str) -> i32 {
 pub fn read_archive_into(path: &str, a: &Archive, node: u32, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     let base = buf.as_ptr() as u64;
     let len = buf.len() as u64;
-    let _w = crate::gpu::track::host_write(base, len);
-    crate::gpu::exec::trace_writes(|| format!("archive read of '{path}' [{off:#x}]"), base, len);
+    let _w = crate::platform::file_hooks::host_write(base, len);
+    crate::platform::file_hooks::trace_writes(|| format!("archive read of '{path}' [{off:#x}]"), base, len);
     let what = || format!("read of '{path}' [{off:#x}] into {base:#x} (archive)");
     let r = crate::mem::kernel_io(&what, base, len, true, || a.read_at(node, off, &mut *buf));
+    crate::platform::file_hooks::note_kernel_read(base, len, off, &r, &what);
     if let Err(e) = &r {
         crate::warn!("read of '{path}' [{off:#x}+{len:#x}] from the archive failed: {e}");
     }
@@ -485,42 +486,7 @@ fn console_write(fd: i32, data: &[u8]) {
     let s = String::from_utf8_lossy(data);
     for line in s.trim_end_matches('\n').split('\n') {
         crate::info!("[guest fd{fd}] {line}");
-        // The title loads a world (its own line at every level load): `maskwait subload`'s window.
-        if line.contains("Loading world") {
-            crate::cullread::note_level_load();
-        }
-        // Developer automation (tools/tour.py) asks for a screenshot by
-        // printing `dsport-shot: <name>` (taken at the next flip).
-        if let Some(rest) = line.split("dsport-shot:").nth(1) {
-            let name: String = rest.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
-            if !name.is_empty() {
-                *crate::hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);
-            }
-        }
-        // `dsport-frames: reset` starts a frame-time window, `dsport-frames:
-        // <name>` logs it (tools/tour.py --frames: each location's frame
-        // rate at the developer camera).
-        if let Some(rest) = line.split("dsport-frames:").nth(1) {
-            let rest = rest.trim();
-            let report = crate::gpu::pacing::report_and_reset();
-            if rest != "reset" {
-                crate::info!("frames at {rest}: {report}");
-            }
-        }
-        // `dsport-textreset` forgets the title's strings logged so far
-        // (`text:` lines come once per string: tools/devscript.sh scripts
-        // checking several bosses' banners in one run).
-        if line.contains("dsport-textreset") {
-            crate::exception::text_reset();
-        }
-        // `dsport-control: <line>` runs a control command (`press cross
-        // 200ms`, `audio capture 30`, ...) at the script's point.
-        if let Some(rest) = line.split("dsport-control:").nth(1) {
-            let rest = rest.trim();
-            if !rest.is_empty() && !crate::input::control_now(rest) {
-                crate::INJECTED.lock().push(rest.to_string());
-            }
-        }
+        crate::platform::file_hooks::console_line(line);
     }
 }
 
@@ -530,34 +496,33 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
         Kind::File { file, .. } => {
             let t0 = std::time::Instant::now();
             // The kernel writes the buffer: write-tracked pages cannot fault.
-            let _w = crate::gpu::track::host_write(buf.as_ptr() as u64, buf.len() as u64);
-            crate::gpu::exec::trace_writes(|| format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
-            let mut done = 0;
+            let _w = crate::platform::file_hooks::host_write(buf.as_ptr() as u64, buf.len() as u64);
+            crate::platform::file_hooks::trace_writes(|| format!("file read (fd {fd}) [{off:#x}]"), buf.as_ptr() as u64, buf.len() as u64);
+            let setup_us = t0.elapsed().as_micros();
             let base = buf.as_ptr() as u64;
-            while done < buf.len() {
-                let what = || format!("read of '{}' [{:#x}] into {:#x}", f.path, off + done as u64, base + done as u64);
-                match crate::mem::kernel_io(&what, base + done as u64, (buf.len() - done) as u64, true, || file.seek_read(&mut buf[done..], off + done as u64)) {
-                    Ok(0) => break,
-                    Ok(n) => done += n,
-                    Err(e) => return Err(io_errno(&e)),
-                }
-            }
+            let what = |done| format!("read of '{}' [{:#x}] into {:#x}", f.path, off + done, base + done);
+            let done = crate::mem::kernel_read_at(&what, buf, off, |buf, at| file.seek_read(buf, at))
+                .map_err(|e| {
+                    crate::platform::file_hooks::note_since(t0, || format!("pread '{}' offset {off:#x}, requested {} bytes, failed: {e}", f.path, buf.len()));
+                    io_errno(&e)
+                })?;
             if crate::hle::iostat::note("kernel", &f.path, crate::hle::iostat::What::Read, done as u64) {
                 crate::info!("read '{}' [{off:#x}+{:#x}] -> {done:#x} bytes", f.path, buf.len());
             }
-            crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("read '{}' {} KiB", f.path, done >> 10));
+            crate::platform::file_hooks::note_since(t0, || format!("pread '{}' offset {off:#x}, requested {} bytes, read {done}; setup {setup_us} us, kernel/retry {} us", f.path, buf.len(), t0.elapsed().as_micros().saturating_sub(setup_us)));
             Ok(done)
         }
         Kind::Mem(d) => {
             let start = (off as usize).min(d.len());
             let n = buf.len().min(d.len() - start);
             let what = || format!("read of '{}' [{off:#x}] (memory)", f.path);
-            let _w = crate::gpu::track::host_write(buf.as_ptr() as u64, n as u64);
-            crate::mem::kernel_io(&what, buf.as_ptr() as u64, n as u64, true, || {
+            let _w = crate::platform::file_hooks::host_write(buf.as_ptr() as u64, n as u64);
+            let result = crate::mem::kernel_io(&what, buf.as_ptr() as u64, n as u64, true, || {
                 buf[..n].copy_from_slice(&d[start..start + n]);
                 Ok(n)
-            })
-            .map_err(|e| io_errno(&e))
+            });
+            crate::platform::file_hooks::note_kernel_read(buf.as_ptr() as u64, n as u64, off, &result, &what);
+            result.map_err(|e| io_errno(&e))
         }
         Kind::Zar { archive, node } => {
             let t0 = std::time::Instant::now();
@@ -609,7 +574,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             if off.is_none() {
                 *pos = at + done as u64;
             }
-            crate::gpu::hitch::note_since(crate::gpu::hitch::Kind::File, t0, || format!("write '{}' {} KiB", f.path, done >> 10));
+            crate::platform::file_hooks::note_since(t0, || format!("write '{}' {} KiB", f.path, done >> 10));
             Ok(done)
         }
         Kind::Mem(_) | Kind::Zar { .. } => Err(EBADF),
@@ -943,4 +908,69 @@ pub fn register(r: &mut Registry) {
 
 pub fn ensure_dir(p: &Path) {
     let _ = std::fs::create_dir_all(p);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    #[test]
+    fn read_only_mount_blocks_all_mutations_and_resolves_case() {
+        let dir = std::env::temp_dir().join(format!("regaliant-vfs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Asset.BIN"), b"untouched").unwrap();
+        mount("/test-read-only", vec![dir.clone()], false);
+        let path = "/test-read-only/asset.bin";
+        assert_eq!(vfs_open(path, O_WRONLY, 0), sce(EROFS));
+        assert_eq!(vfs_open(path, O_CREAT | O_TRUNC, 0), sce(EROFS));
+        assert_eq!(vfs_unlink(path), sce(EROFS));
+        assert_eq!(vfs_rename(path, "/test-read-only/other"), sce(EROFS));
+        let fd = vfs_open(path, 0, 0);
+        assert!(fd >= 3);
+        let mut data = [0u8; 9];
+        assert_eq!(pread_fd(fd, &mut data, 0), Ok(9));
+        assert_eq!(&data, b"untouched");
+        assert_eq!(vfs_close(fd), 0);
+        assert_eq!(std::fs::read(dir.join("Asset.BIN")).unwrap(), b"untouched");
+        unmount("/test-read-only");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod archive_tests {
+    #[test]
+    fn mounted_archive_reads_and_refuses_writes() {
+        // The VFS and tracking tables are process-wide; exercise them in an isolated test child.
+        if std::env::var_os("REGALIANT_ARCHIVE_VFS_TEST").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::kernel::fs::archive_tests::mounted_archive_reads_and_refuses_writes", "--nocapture"])
+                .env("REGALIANT_ARCHIVE_VFS_TEST", "1").output().unwrap();
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        use super::*;
+        const O_RDONLY: i32 = 0;
+        crate::hle::kernel::time::init();
+        let root = std::env::temp_dir().join(format!("regaliant-vfs-zar-{}", std::process::id()));
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("Textures")).unwrap();
+        let bytes: Vec<u8> = (0..160_000).map(|i| (i * 31) as u8).collect();
+        std::fs::write(source.join("Textures/Stone.bin"), &bytes).unwrap();
+        let archive = root.join("game.zar");
+        dsconfig::zar::write_folder(&source, &archive, 3, 2, &|_, _| true).unwrap();
+        mount_game("/archive-test", &Source::open(&archive).unwrap());
+        let path = "/archive-test/textures/stone.BIN";
+        assert_eq!(read_file(path).unwrap(), bytes);
+        assert_eq!(vfs_open(path, O_WRONLY, 0), sce(EROFS));
+        assert_eq!(vfs_open(path, O_RDONLY | O_TRUNC, 0), sce(EROFS));
+        assert_eq!(vfs_open("/archive-test/new", O_CREAT | O_RDWR, 0), sce(EROFS));
+        let fd = vfs_open(path, O_RDONLY, 0);
+        assert!(fd >= 0);
+        let mut data = vec![0u8; 70_000];
+        assert_eq!(pread_fd(fd, &mut data, 65_530).unwrap(), data.len());
+        assert_eq!(data, bytes[65_530..135_530]);
+        assert!(matches!(guest_meta(path), Some((Found::Zar(_, _), CachedMeta { size: 160_000, .. }))));
+        assert_eq!(vfs_close(fd), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

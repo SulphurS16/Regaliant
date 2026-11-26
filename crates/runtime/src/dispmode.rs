@@ -162,7 +162,7 @@ fn headless_render() -> u64 {
 }
 
 /// `lines` (at most `max_lines`) at the output's shape `ow`x`oh`, the width a multiple of 8.
-fn shaped_lines(lines: u32, ow: u32, oh: u32) -> (u32, u32) {
+pub(crate) fn shaped_lines(lines: u32, ow: u32, oh: u32) -> (u32, u32) {
     let lines = (lines as u64).min(max_lines(ow, oh));
     let w = ((lines as f32 * ow as f32 / oh as f32 / 8.0).round() as u64 * 8).min(7680);
     (w as u32, lines as u32)
@@ -187,8 +187,7 @@ fn start_aspect() {
             if !crate::gpu::vk::present::active() || !fullscreen {
                 return;
             }
-            use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-            let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            let (w, h) = crate::platform::loader_hooks::desktop_size();
             if w <= 0 || h <= 0 {
                 return;
             }

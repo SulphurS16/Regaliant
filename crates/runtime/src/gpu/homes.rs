@@ -349,6 +349,7 @@ pub struct Bound {
 /// the home while it is certainly alive: the caller keeps it for the work
 /// that uses it (and clones it only when it does not hold it yet).
 pub fn bind(base: u64, size: u64, written: bool, keep: &mut dyn FnMut(&Arc<HomeBuf>)) -> Option<Bound> {
+        let _cpu = crate::gpu::cpu_profile::scope(crate::gpu::cpu_profile::Part::BufferLookup);
     if !any() || size == 0 {
         return None;
     }

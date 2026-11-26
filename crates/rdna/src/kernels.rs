@@ -562,6 +562,12 @@ pub fn mirror_scatter_split() -> Vec<u32> {
     build_scatter(true, false, false, 0, true, false).expect("mirror scatter kernel (split lines)")
 }
 
+/// Bucket census with the same split-line stores as normal write-back. Counting must
+/// not replace the partial-line store pattern being measured with the older slow one.
+pub fn mirror_scatter_split_counting() -> Vec<u32> {
+    build_scatter(true, true, false, 0, true, false).expect("mirror scatter kernel (split lines, counting)")
+}
+
 /// `mirror_scatter_split` leaving held pages in the mirror (the runtime's
 /// front end 4 holds, FRONTEND4.md C4): a bitmap of held pages (a bit per
 /// page of the span, bit i of word i / 32) at the device address in push
@@ -1763,6 +1769,7 @@ mod tests {
             ("mirror_scatter_counting", super::mirror_scatter_counting()),
             ("mirror_scatter_hold_census", super::mirror_scatter_hold_census()),
             ("mirror_scatter_split", super::mirror_scatter_split()),
+            ("mirror_scatter_split_counting", super::mirror_scatter_split_counting()),
             ("mirror_scatter_held", super::mirror_scatter_held()),
         ];
         for (name, w) in all {
