@@ -31,6 +31,24 @@ struct Window {
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
+/// The last sample's GPU figures for the performance overlay (`perfhud`): the 3D engine use of
+/// the card in use summed over every process (percent), this process's and the others' dedicated
+/// video memory on it (bytes), and when it was taken.
+#[derive(Clone, Copy)]
+pub struct Latest {
+    pub gpu_3d: f64,
+    pub vram_ours: f64,
+    pub vram_other: f64,
+    pub at: std::time::Instant,
+}
+
+static LATEST: Mutex<Option<Latest>> = Mutex::new(None);
+
+/// The last sample (once a second; None while the sampler is off, or before the card is known).
+pub fn latest() -> Option<Latest> {
+    *LATEST.lock()
+}
+
 /// Other processes' dedicated video memory at the last sample, bytes
 /// (u64::MAX before the first).
 static OTHERS_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
@@ -241,8 +259,16 @@ fn sampler() {
         let (mut gpu_ours, mut gpu_other, mut vram_ours, mut vram_other, mut cpu_other) = (0.0, 0.0, 0.0, 0.0, 0.0);
         let mut gpu_by: HashMap<String, f64> = HashMap::new();
         let mut cpu_by: HashMap<String, f64> = HashMap::new();
+        let adapter = ADAPTER.lock().clone();
+        let want = adapter.as_deref().map(str::to_ascii_uppercase);
+        // (The card in use's 3D engine over every process: the overlay's GPU use where NVIDIA's
+        // NVML does not give it.)
+        let mut card_3d = 0.0;
         if let Some(c) = gpu {
             for (inst, v) in unsafe { values(c, PDH_FMT_DOUBLE) } {
+                if want.as_deref().is_some_and(|w| inst.to_ascii_uppercase().contains(w)) {
+                    card_3d += v;
+                }
                 let Some(pid) = pid_of(&inst) else { continue };
                 if pid == me {
                     gpu_ours += v;
@@ -253,13 +279,11 @@ fn sampler() {
                 }
             }
         }
-        let adapter = ADAPTER.lock().clone();
-        if let (Some(c), Some(adapter)) = (vram, adapter.as_deref()) {
+        if let (Some(c), Some(want)) = (vram, want.as_deref()) {
             let mut vram_by: HashMap<u32, f64> = HashMap::new();
-            let want = adapter.to_ascii_uppercase();
             for (inst, v) in unsafe { values(c, PDH_FMT_DOUBLE) } {
                 // (Only the card in use: `ADAPTER`.)
-                if !inst.to_ascii_uppercase().contains(&want) {
+                if !inst.to_ascii_uppercase().contains(want) {
                     continue;
                 }
                 match pid_of(&inst) {
@@ -310,6 +334,9 @@ fn sampler() {
                 cpu_other += v;
                 *cpu_by.entry(name.to_string()).or_default() += v;
             }
+        }
+        if want.is_some() {
+            *LATEST.lock() = Some(Latest { gpu_3d: card_3d.min(100.0), vram_ours, vram_other, at: std::time::Instant::now() });
         }
         let cost = t0.elapsed().as_micros() as u64;
         // Who loads the machine now (means over five samples).

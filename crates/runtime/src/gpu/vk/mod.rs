@@ -512,6 +512,8 @@ fn init_inner() -> Result<(), String> {
             if idp.device_luid_valid == vk::TRUE {
                 crate::hostload::set_adapter_luid(idp.device_luid);
             }
+            // (NVIDIA's NVML names the same card by this id: the overlay's GPU figures.)
+            crate::perfhud::set_device(props.vendor_id, idp.device_uuid);
         }
         crate::info!(
             "Vulkan device ids: PCI {:04x}:{:04x}; the translation's subgroup modes {} (DS_PLAIN_MODES=1 or 0 overrides)",
@@ -1206,6 +1208,21 @@ impl Ctx {
 
     /// Each memory heap: size, flags and (VK_EXT_memory_budget) this
     /// process's usage against its budget, MiB.
+    /// The largest device-local heap's use by this process (VK_EXT_memory_budget; None without
+    /// it) and its size, bytes: the performance overlay's video memory (`perfhud`).
+    pub fn local_heap_use(&self) -> Option<(u64, u64)> {
+        if !self.memory_budget {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe { self.instance.get_physical_device_memory_properties2(self.pdev, &mut p2) };
+        let props = p2.memory_properties;
+        let heaps = props.memory_heap_count as usize;
+        let i = (0..heaps).filter(|&i| props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).max_by_key(|&i| props.memory_heaps[i].size)?;
+        Some((budget.heap_usage[i], props.memory_heaps[i].size))
+    }
+
     pub fn heap_report(&self) -> String {
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
         let mut p2 = vk::PhysicalDeviceMemoryProperties2::default();

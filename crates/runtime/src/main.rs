@@ -29,6 +29,7 @@ mod sections;
 mod spatial;
 mod patch;
 mod pcsettings;
+mod perfhud;
 mod jobidle;
 mod camhook;
 mod gamestep;

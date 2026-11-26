@@ -13,6 +13,9 @@
   the upscaler fills in to your screen's resolution. Native AA keeps the full resolution. Before,
   they only smoothed edges at the game's own render size, so they gave no frames. Motion Blur Fix
   moved to the Graphics & Display list to make room.
+- Graphics & Display has a Performance Overlay. In the bottom-right corner it shows the frame
+  rate and its 1% and 0.1% lows, the CPU use of the game's busiest thread, the GPU's use, clock
+  and video memory, and memory. Frame Rate shows the first line only.
 - The launcher's Display page can download NVIDIA's DLSS file. It fetches it from NVIDIA's own
   DLSS SDK on GitHub after you accept NVIDIA's license, and checks it is NVIDIA's file as
   released. Copying your own file still works.

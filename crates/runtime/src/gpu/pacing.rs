@@ -29,6 +29,7 @@ pub fn note_flip(n: u64, us: u64) {
     }
     s.last = Some((us, n));
     drop(s);
+    crate::perfhud::note_flip(us);
     super::hitch::flip(n, us);
     super::fe2::census_sample();
 }

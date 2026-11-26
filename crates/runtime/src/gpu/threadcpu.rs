@@ -40,6 +40,23 @@ fn thread_cycles(tid: u32) -> Option<u64> {
     (unsafe { QueryThreadCycleTime(h as _, &mut c) } != 0).then_some(c)
 }
 
+/// Cycles so far of every thread the port knows, by host thread id: the title's live threads
+/// and the GPU front end's (the performance overlay's busiest thread, `perfhud`).
+pub fn known_thread_cycles() -> Vec<(u32, u64)> {
+    let mut tids: Vec<u32> = crate::thread::THREADS
+        .lock()
+        .iter()
+        .filter(|t| t.exited.try_lock().is_some_and(|e| e.is_none()))
+        .map(|t| t.host_tid.load(Ordering::Relaxed) as u32)
+        .filter(|&t| t != 0)
+        .collect();
+    tids.extend(super::cpu_threads().into_iter().map(|(_, t)| t));
+    tids.extend(super::compute_threads().into_iter().map(|(_, t)| t));
+    tids.sort_unstable();
+    tids.dedup();
+    tids.into_iter().filter_map(|t| thread_cycles(t).map(|c| (t, c))).collect()
+}
+
 /// The calling thread's cycles so far (the timeline's recording spans: CPU
 /// time beside wall time).
 pub fn own_cycles() -> u64 {

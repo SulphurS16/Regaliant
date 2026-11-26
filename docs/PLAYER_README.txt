@@ -82,8 +82,8 @@ The game's SETTINGS screen has a PC tab with the port's settings. Most take effe
   scale, Anti-Aliasing / Upscaler (the game's TAA, off, DLSS, FSR or XeSS), Upscaling, frame
   rate limit (30, 60 or uncapped) and mouse sensitivity.
 - Graphics & Display: quality preset, geometry detail, texture filtering, sharpening, Motion
-  Blur Fix, bloom, vignette, HDR, aspect ratio (16:9, 16:10, 21:9, 32:9), monitor and refresh
-  rate.
+  Blur Fix, bloom, vignette, HDR, aspect ratio (16:9, 16:10, 21:9, 32:9), monitor, refresh
+  rate and the performance overlay.
 
 Upscaling sets how far below your screen's resolution DLSS, FSR or XeSS render: Quality,
 Balanced, Performance or Ultra Performance. The upscaler then fills in to your screen's
@@ -94,6 +94,12 @@ resolution and only smooths edges. With the game's TAA, Render Scale sets the re
   controller speaker's sounds through your speakers (Pad Speaker), skip intro logos, save
   folder, import of a PS5 save.
 - Key Bindings and Controller Bindings: every action's key, mouse button and controller button.
+
+Performance Overlay shows in the bottom-right corner: the frame rate and its 1% and 0.1% lows
+over the last 20 seconds, the CPU use of the game's busiest thread (100% is a whole core, the
+limit when one thread holds the frame rate back), the GPU's use and clock, and video memory and
+memory, the game's and all in use. Frame Rate shows the first line only. The GPU clock needs an
+NVIDIA card.
 
 Motion Blur Fix is No Blur by default: the game's motion blur is off, so plants and detail
 stay sharp while the camera moves. Game's Blur uses the game's own Motion Blur setting, which

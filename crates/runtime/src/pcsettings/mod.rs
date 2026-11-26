@@ -268,6 +268,13 @@ pub fn graphics_items() -> Vec<Item> {
             tooltip: s("The screen's refresh rate in Fullscreen mode (Automatic keeps motion even)."),
             kind: ItemKind::Display(2),
         },
+        Item {
+            id: s("PerfOverlay"),
+            label: s("Performance Overlay"),
+            // (Players' suggestion of 2026-11-26 evening: `crate::perfhud`.)
+            tooltip: s("Shows the frame rate and the PC's load in the bottom-right corner."),
+            kind: ItemKind::Choice(vec![s("Off"), s("Frame Rate"), s("Full")], 0),
+        },
     ]
 }
 
@@ -350,6 +357,7 @@ pub fn apply() {
     crate::input::PC_INVERT_Y.store(get("InvertMouseY") == Some(1), std::sync::atomic::Ordering::Relaxed);
     prompts::MODE.store(get("ButtonPrompts").unwrap_or(0).min(3) as u8, std::sync::atomic::Ordering::Relaxed);
     MOUSE_BLUR.store(get("MouseMotionBlur").unwrap_or(2).min(2) as u8, std::sync::atomic::Ordering::Relaxed);
+    crate::perfhud::set_mode(get("PerfOverlay").unwrap_or(0).min(2) as u8);
     let geo = GEOMETRY_DETAIL.get(get("GeometryDetail").unwrap_or(0) as usize).copied().flatten();
     convar::want("r_tessellationDensity", geo.map(|g| convar::float(g.0)));
     convar::want("r_tessellationFadeOutStart", geo.map(|g| convar::float(g.1)));
@@ -531,6 +539,7 @@ pub fn state_report() {
         format!("Bloom {} / Vignette {}", v("Bloom"), v("Vignette")),
         format!("FrameRateLimit {} (frame cap {}, uncapped {})", v("FrameRateLimit"), crate::gpu::tune::frame_cap(), crate::gpu::tune::uncapped()),
         format!("MouseMotionBlur {} (in effect {})", v("MouseMotionBlur"), MOUSE_BLUR.load(Relaxed)),
+        format!("PerfOverlay {} ({})", v("PerfOverlay"), crate::perfhud::status()),
         format!("UiSize {} (scale {:.2})", v("UiSize"), ui_size()),
         format!("HudMargin {} (safe area {:?})", v("HudMargin"), safe_area()),
         format!("ButtonPrompts {} (in effect {})", v("ButtonPrompts"), prompts::MODE.load(Relaxed)),
