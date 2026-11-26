@@ -401,6 +401,10 @@ fn run() -> Result<(), String> {
             }
             // (Every `DS_LINUX_SHOT_SECONDS`, 5 by default: short-lived artifacts show in more of
             // them. ~18 MB each at 4K; the run directory's screenshots are diagnosis, cleaned up.)
+            // (The vertex outlier census drains at presents; offscreen runs have none.)
+            if offscreen && gpu::shaders::vs_outlier().is_some() {
+                gpu::exec::outlier_note(crate::log::elapsed_ms(), gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+            }
             static SHOT_SECONDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
             let every = *SHOT_SECONDS.get_or_init(|| std::env::var("DS_LINUX_SHOT_SECONDS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(5));
             if !headless && seconds % every == 0 && std::env::var("DS_LINUX_INTERVAL_SHOTS").ok().as_deref() != Some("0") {
