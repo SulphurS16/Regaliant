@@ -1957,7 +1957,7 @@ impl Exec {
     /// tiles enlarged to match (nearest: its pixel stage reads them at its position / 16). True when
     /// recorded: the descriptors and dynamic state bound are then ours.
     #[allow(clippy::too_many_arguments)]
-    fn composite_up(&mut self, bounds: &mut [super::Bound], layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, push: bool, colors: &[Option<Target>; MAX_RT], depth: &Option<Target>, a: &DrawArgs, base_vertex: i32, ps: Option<&Prepared>) -> bool {
+    fn composite_up(&mut self, bounds: &mut [super::Bound], layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, push: bool, colors: &[Option<Target>; MAX_RT], depth: &Option<Target>, a: &DrawArgs, base_vertex: i32, ps: Option<&Prepared>, vp: vk::Viewport, sc: (i32, i32, i32, i32)) -> bool {
         use super::super::upcomp;
         let (Some(t0), Some(ps)) = (colors[0], ps) else { return false };
         let r = (t0.width, t0.height);
@@ -2082,8 +2082,15 @@ impl Exec {
                 .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } })];
             let ri = vk::RenderingInfo::default().render_area(vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: o.0, height: o.1 } }).layer_count(1).color_attachments(&att);
             c.device.cmd_begin_rendering(cmd, &ri);
-            c.device.cmd_set_viewport(cmd, 0, &[vk::Viewport { x: 0.0, y: 0.0, width: o.0 as f32, height: o.1 as f32, min_depth: 0.0, max_depth: 1.0 }]);
-            c.device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: o.0, height: o.1 } }]);
+            // (The title's viewport and scissor scaled to ours: its viewport is flipped, a negative
+            // height from the bottom edge, as the port maps the title's.)
+            let (fx, fy) = (o.0 as f32 / r.0 as f32, o.1 as f32 / r.1 as f32);
+            let svp = vk::Viewport { x: vp.x * fx, y: vp.y * fy, width: vp.width * fx, height: vp.height * fy, min_depth: vp.min_depth, max_depth: vp.max_depth };
+            c.device.cmd_set_viewport(cmd, 0, &[svp]);
+            let sx = |v: i32| ((v as f32 * fx).round() as i32).clamp(0, o.0 as i32);
+            let sy = |v: i32| ((v as f32 * fy).round() as i32).clamp(0, o.1 as i32);
+            let (x0, y0, x1, y1) = (sx(sc.0), sy(sc.1), sx(sc.2), sy(sc.3));
+            c.device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D { x: x0, y: y0 }, extent: vk::Extent2D { width: (x1 - x0).max(0) as u32, height: (y1 - y0).max(0) as u32 } }]);
             c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance);
             c.device.cmd_end_rendering(cmd);
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
@@ -2094,7 +2101,7 @@ impl Exec {
         self.dyncache = Default::default();
         upcomp::note_done(upcomp::Done { base: t0.key.base, view: cview, r, o });
         if upcomp::DRAWN.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::info!("upscaler: the title's composite drawn again at {}x{} from the upscaler's output (render {}x{}; depth-of-field tiles {tw}x{th} to {otw}x{oth}; {} views of ours)", o.0, o.1, r.0, r.1, swapped.len());
+            crate::info!("upscaler: the title's composite drawn again at {}x{} from the upscaler's output (render {}x{}; depth-of-field tiles {tw}x{th} to {otw}x{oth}; {} views of ours; the title's viewport {:?}, scissor {:?})", o.0, o.1, r.0, r.1, swapped.len(), vp, sc);
         }
         true
     }
@@ -3771,7 +3778,7 @@ impl Exec {
         let redone = self.up_comp && ps_addr == super::super::upcomp::SCENE_COMPOSITE_PS && {
             self.up_comp = false;
             let bv = a.base_vertex.unwrap_or(reg(0x28408) as i32);
-            self.composite_up(&mut bounds, layout, set_layout, push, &colors, &depth, a, bv, ps.as_ref())
+            self.composite_up(&mut bounds, layout, set_layout, push, &colors, &depth, a, bv, ps.as_ref(), vp, (x0, y0, x1, y1))
         };
         // Another draw like it can be recorded on the state this one left
         // (`draw_repeat`): GPU-read arguments, indices and arguments in
