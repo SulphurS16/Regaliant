@@ -12137,6 +12137,13 @@ pub struct Exec {
     /// Its copy, recorded where the composite begins rendering (its batch open then): the layer,
     /// our image, the size, the scale and the filter (`uiscale::record`).
     pub(super) ui_job: Option<super::uiscale::Job>,
+    /// Real upscaling's stage B (`gpu::upcomp`): this draw is the title's composite, to be drawn
+    /// again at the upscaler's size (`Exec::composite_up`).
+    pub(super) up_comp: bool,
+    /// The output pass reads our composite: the view of the title's in the draw's bindings and
+    /// ours, and its size constants' sizes (the render size, ours).
+    pub(super) out_sub: Option<(vk::ImageView, vk::ImageView)>,
+    pub(super) up_consts: Option<((u32, u32), (u32, u32))>,
     /// A parallel worker's chunk: the guest ranges CP writes of its run's
     /// earlier chunks write (`par::Run::cp_writes`); a CPU read of one stops
     /// the chunk (those batches are not submitted yet).
@@ -13942,6 +13949,9 @@ impl Exec {
                 par_worker: false,
                 ui_sub: None,
                 ui_job: None,
+                up_comp: false,
+                out_sub: None,
+                up_consts: None,
                 run_writes: Vec::new(),
                 hs_seg: 0,
                 effect_writes: Default::default(),
@@ -21021,13 +21031,11 @@ impl Exec {
                 return false;
             }
         };
-        // The upscaler's output: the screen's size where it is smaller than the title's output
-        // (and not below the render size, as while a resized window's render size settles),
-        // which the merge then fills the TAA's output from; else the output's own.
-        let (uw, uh) = match crate::dispmode::upscale_output() {
-            Some((w, h)) if w <= to.width && h <= to.height && w >= tc.width && h >= tc.height => (w, h),
-            _ => (to.width, to.height),
-        };
+        // The upscaler's output: above the render size the screen's (the title's composite is then
+        // drawn again from it at that size, `gpu::upcomp`), else the TAA output's own (Native AA:
+        // its colour goes into the TAA's output).
+        let up = super::upcomp::size_for((to.width, to.height)).filter(|_| (tc.width, tc.height) == (to.width, to.height));
+        let (uw, uh) = up.unwrap_or((to.width, to.height));
         let output = match super::upmerge::target(uw, uh) {
             Ok(t) => t,
             Err(e) => {
@@ -21059,7 +21067,14 @@ impl Exec {
             return false;
         }
         let (src, view, w, h) = (inp.output.view, taa_out.view, to.width, to.height);
-        super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, uw, uh, view, w, h, exposure)));
+        if up.is_some() {
+            // (The TAA's output stays the title's TAA's: the depth of field, bloom and the next
+            // frame's TAA read it; the composite drawn again reads ours.)
+            super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record_up(cb, src, uw, uh, view, w, h, exposure)));
+            super::upcomp::note_taa_base(to.base);
+        } else {
+            super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, uw, uh, view, w, h, exposure)));
+        }
         // (The upscaler and the merge bound pipelines and descriptors of their own.)
         self.dyncache = Default::default();
         true
@@ -23065,6 +23080,7 @@ pub fn status() -> String {
         + &clear_pass_line()
         + &super::images::pressure_line()
         + &super::upmerge::status_line()
+        + &super::upcomp::status_line()
         + &super::vk::gate_line()
         + &super::fe2::unimported_line()
         + &super::vk::system_line()

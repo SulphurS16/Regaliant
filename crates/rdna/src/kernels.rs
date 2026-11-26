@@ -1870,6 +1870,15 @@ mod tests {
         }
     }
     #[test]
+    fn rgb_merge_up_kernel_assembles() {
+        let w = super::rgb_merge_up();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("rgb_merge_up.spv"), bytes).unwrap();
+        }
+    }
+    #[test]
     fn merge_many_kernel_assembles() {
         let w = super::shadow_merge_many();
         assert_eq!(w[0], 0x0723_0203);
@@ -2304,6 +2313,126 @@ fn build_rgb_merge() -> Result<Vec<u32>, rspirv::dr::Error> {
     let a = b.composite_extract(f32t, None, d, [3])?;
     let out = b.composite_construct(v4f, None, [r, gg, bb, a])?;
     b.image_write(dimg, at, out, None, [])?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [RGB_MERGE_LOCAL, RGB_MERGE_LOCAL, 1]);
+    Ok(b.module().assemble())
+}
+
+/// The upscalers' output made ready for the title's composite at the output's size
+/// (`gpu::upcomp`): in place in the upscaler's image (binding 0, RGBA16F storage, the output's
+/// size), the colour times the exposure the TAA applies to its input (the first float of binding
+/// 2, a storage buffer) and the alpha of the TAA output's pixel under it (binding 1, RGBA16F
+/// storage, the render size: the TAA packs per-pixel data there that the composite reads). Push
+/// constants: the output's width and height, the render size's width and height.
+pub fn rgb_merge_up() -> Vec<u32> {
+    build_rgb_merge_up().expect("rgb merge-up kernel")
+}
+
+fn build_rgb_merge_up() -> Result<Vec<u32>, rspirv::dr::Error> {
+    use rspirv::spirv::{Dim, ImageFormat};
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let i32t = b.type_int(32, 1);
+    let f32t = b.type_float(32, None);
+    let v3u = b.type_vector(u32t, 3);
+    let v2i = b.type_vector(i32t, 2);
+    let v4f = b.type_vector(f32t, 4);
+    let img = b.type_image(f32t, Dim::Dim2D, 0, 0, 0, 2, ImageFormat::Rgba16f, None);
+    let p_img = b.type_pointer(None, StorageClass::UniformConstant, img);
+    let pc = b.type_struct([u32t, u32t, u32t, u32t]);
+    b.decorate(pc, Decoration::Block, []);
+    for (m, off) in [(0, 0), (1, 4), (2, 8), (3, 12)] {
+        b.member_decorate(pc, m, Decoration::Offset, [lit(off)]);
+    }
+    let rta = b.type_runtime_array(f32t);
+    b.decorate(rta, Decoration::ArrayStride, [lit(4)]);
+    let sb = b.type_struct([rta]);
+    b.decorate(sb, Decoration::Block, []);
+    b.member_decorate(sb, 0, Decoration::Offset, [lit(0)]);
+    let p_sb = b.type_pointer(None, StorageClass::StorageBuffer, sb);
+    let p_sbf = b.type_pointer(None, StorageClass::StorageBuffer, f32t);
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let io = global(&mut b, p_img, StorageClass::UniformConstant);
+    b.decorate(io, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(io, Decoration::Binding, [lit(0)]);
+    let taa = global(&mut b, p_img, StorageClass::UniformConstant);
+    b.decorate(taa, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(taa, Decoration::Binding, [lit(1)]);
+    b.decorate(taa, Decoration::NonWritable, []);
+    let expo = global(&mut b, p_sb, StorageClass::StorageBuffer);
+    b.decorate(expo, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(expo, Decoration::Binding, [lit(2)]);
+    b.decorate(expo, Decoration::NonWritable, []);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let (u0, u1, u2, u3) = (b.constant_bit32(u32t, 0), b.constant_bit32(u32t, 1), b.constant_bit32(u32t, 2), b.constant_bit32(u32t, 3));
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let g = b.load(v3u, None, gid, None, [])?;
+    let gx = b.composite_extract(u32t, None, g, [0])?;
+    let gy = b.composite_extract(u32t, None, g, [1])?;
+    let pcload = |b: &mut Builder, i: Word| -> Result<Word, rspirv::dr::Error> {
+        let p = b.access_chain(p_pcu, None, pcv, [i])?;
+        b.load(u32t, None, p, None, [])
+    };
+    let ow = pcload(&mut b, u0)?;
+    let oh = pcload(&mut b, u1)?;
+    let rw = pcload(&mut b, u2)?;
+    let rh = pcload(&mut b, u3)?;
+    let in_x = b.u_less_than(bool_, None, gx, ow)?;
+    let in_y = b.u_less_than(bool_, None, gy, oh)?;
+    let inside = b.logical_and(bool_, None, in_x, in_y)?;
+    let (l_body, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(inside, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    let x = b.bitcast(i32t, None, gx)?;
+    let y = b.bitcast(i32t, None, gy)?;
+    let at = b.composite_construct(v2i, None, [x, y])?;
+    // The render-size pixel whose area holds this one's centre: ((2x + 1) * rw) / (2 * ow).
+    let two = b.constant_bit32(u32t, 2);
+    let x2 = b.i_mul(u32t, None, gx, two)?;
+    let x2 = b.i_add(u32t, None, x2, u1)?;
+    let xn = b.i_mul(u32t, None, x2, rw)?;
+    let ow2 = b.i_mul(u32t, None, ow, two)?;
+    let xr = b.u_div(u32t, None, xn, ow2)?;
+    let y2 = b.i_mul(u32t, None, gy, two)?;
+    let y2 = b.i_add(u32t, None, y2, u1)?;
+    let yn = b.i_mul(u32t, None, y2, rh)?;
+    let oh2 = b.i_mul(u32t, None, oh, two)?;
+    let yr = b.u_div(u32t, None, yn, oh2)?;
+    let xr = b.bitcast(i32t, None, xr)?;
+    let yr = b.bitcast(i32t, None, yr)?;
+    let at_r = b.composite_construct(v2i, None, [xr, yr])?;
+    let iimg = b.load(img, None, io, None, [])?;
+    let c = b.image_read(v4f, None, iimg, at, None, [])?;
+    let timg = b.load(img, None, taa, None, [])?;
+    let t = b.image_read(v4f, None, timg, at_r, None, [])?;
+    let p_e = b.access_chain(p_sbf, None, expo, [u0, u0])?;
+    let e = b.load(f32t, None, p_e, None, [])?;
+    let r = b.composite_extract(f32t, None, c, [0])?;
+    let gg = b.composite_extract(f32t, None, c, [1])?;
+    let bb = b.composite_extract(f32t, None, c, [2])?;
+    let r = b.f_mul(f32t, None, r, e)?;
+    let gg = b.f_mul(f32t, None, gg, e)?;
+    let bb = b.f_mul(f32t, None, bb, e)?;
+    let a = b.composite_extract(f32t, None, t, [3])?;
+    let out = b.composite_construct(v4f, None, [r, gg, bb, a])?;
+    b.image_write(iimg, at, out, None, [])?;
     b.branch(l_end)?;
     b.begin_block(Some(l_end))?;
     b.ret()?;

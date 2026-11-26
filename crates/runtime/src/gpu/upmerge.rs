@@ -35,6 +35,10 @@ struct Merge {
     pipeline: vk::Pipeline,
     /// The linear sampler the merge reads an output smaller than the TAA's with.
     sampler: vk::Sampler,
+    /// The merge-up (`record_up`: the upscaler's output at the screen's size made ready for the
+    /// title's composite drawn at that size, `gpu::upcomp`).
+    up_layout: vk::PipelineLayout,
+    up_pipeline: vk::Pipeline,
     target: Option<Img>,
     /// Images of other sizes. Until 2026-11-24 they were kept for good: the title's small views'
     /// TAA (the equipment menu's character preview at 640x360) changed the size every frame or
@@ -90,7 +94,27 @@ unsafe fn new_merge() -> Result<Merge, String> {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .max_lod(0.0);
         let sampler = d.create_sampler(&sci, None).map_err(|e| format!("merge sampler: {e}"))?;
-        Ok(Merge { layout, pipeline, sampler, target: None, retired: Vec::new() })
+        let up_bindings = [0, 1, 2].map(|b| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(if b == 2 { vk::DescriptorType::STORAGE_BUFFER } else { vk::DescriptorType::STORAGE_IMAGE })
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        });
+        let up_dsl = d
+            .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR).bindings(&up_bindings), None)
+            .map_err(|e| format!("merge-up set layout: {e}"))?;
+        let up_dsls = [up_dsl];
+        let up_pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 16 }];
+        let up_layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&up_dsls).push_constant_ranges(&up_pcr), None).map_err(|e| format!("merge-up layout: {e}"))?;
+        let up_code = rdna::kernels::rgb_merge_up();
+        let up_module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&up_code), None).map_err(|e| format!("merge-up module: {e}"))?;
+        let up_stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(up_module).name(c"main");
+        let up_pipeline = d
+            .create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().stage(up_stage).layout(up_layout)], None)
+            .map_err(|(_, e)| format!("merge-up pipeline: {e}"))?[0];
+        d.destroy_shader_module(up_module, None);
+        Ok(Merge { layout, pipeline, sampler, up_layout, up_pipeline, target: None, retired: Vec::new() })
     }
 }
 
@@ -196,6 +220,11 @@ pub fn target(w: u32, h: u32) -> Result<super::upscale::Tex, String> {
     })
 }
 
+/// The upscaler's output image when it is the current one at `w`x`h` (made by `target`).
+pub fn current_view(w: u32, h: u32) -> Option<vk::ImageView> {
+    MERGE.lock().as_ref().and_then(|m| m.target.as_ref().filter(|t| (t.w, t.h) == (w, h)).map(|t| t.view))
+}
+
 /// The output image's first use in a frame: GENERAL layout from UNDEFINED (its contents are the
 /// upscaler's each frame).
 pub fn begin(cb: vk::CommandBuffer, image: vk::Image) {
@@ -249,6 +278,41 @@ pub fn record(cb: vk::CommandBuffer, src_view: vk::ImageView, sw: u32, sh: u32, 
         c.device.cmd_push_constants(cb, m.layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 16));
         let local = rdna::kernels::RGB_MERGE_LOCAL;
         c.device.cmd_dispatch(cb, w.div_ceil(local), h.div_ceil(local), 1);
+        c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+    }
+}
+
+/// Records into `cb` the merge-up (`rdna::kernels::rgb_merge_up`): in the upscaler's output
+/// (`io_view`, `ow`x`oh`, the screen's size) the colour times the TAA's exposure and the alpha of
+/// the TAA output's pixel under each one (`taa_view`, `rw`x`rh`), for the title's composite drawn
+/// at the screen's size (`gpu::upcomp`); the TAA's output is left as the title's TAA made it.
+#[allow(clippy::too_many_arguments)]
+pub fn record_up(cb: vk::CommandBuffer, io_view: vk::ImageView, ow: u32, oh: u32, taa_view: vk::ImageView, rw: u32, rh: u32, exposure: vk::DescriptorBufferInfo) {
+    let c = ctx();
+    if !super::upscale::last_eval_ok() {
+        return;
+    }
+    let g = MERGE.lock();
+    let Some(m) = g.as_ref() else { return };
+    let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    unsafe {
+        c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        c.device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, m.up_pipeline);
+        let infos = [
+            [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: io_view, image_layout: vk::ImageLayout::GENERAL }],
+            [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: taa_view, image_layout: vk::ImageLayout::GENERAL }],
+        ];
+        let ebuf = [exposure];
+        let writes = [
+            vk::WriteDescriptorSet::default().dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&infos[0]),
+            vk::WriteDescriptorSet::default().dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&infos[1]),
+            vk::WriteDescriptorSet::default().dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ebuf),
+        ];
+        c.push_desc.cmd_push_descriptor_set(cb, vk::PipelineBindPoint::COMPUTE, m.up_layout, 0, &writes);
+        let pc = [ow, oh, rw, rh];
+        c.device.cmd_push_constants(cb, m.up_layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 16));
+        let local = rdna::kernels::RGB_MERGE_LOCAL;
+        c.device.cmd_dispatch(cb, ow.div_ceil(local), oh.div_ceil(local), 1);
         c.device.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
     }
 }

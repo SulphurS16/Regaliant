@@ -67,10 +67,10 @@ pub static SCALE_PCT: AtomicU32 = AtomicU32::new(0);
 /// (`upscale::active`): the screen's size over the render size per side, x100
 /// (`pcsettings::UPSCALE_FACTORS`; 150 Quality).
 pub static UPSCALE_FACTOR: AtomicU32 = AtomicU32::new(150);
-/// The upscaler's output size (width << 32 | height; 0: the TAA output's): the screen's size at
-/// the output's shape where that is smaller than the title's output, which the merge then fills
-/// from it (`gpu::upmerge`; until 2026-11-26 evening the upscalers always output the title's
-/// 3840x2160, costing a mid-range card at a 1080p screen as much as at a 4K one).
+/// The upscaler's output size while an upscaler runs (width << 32 | height; 0: none): the screen's
+/// size at the output's shape, at most the title's output. Above the render size the title's
+/// composite is drawn again at that size from it (`gpu::upcomp`); at the render size (Native AA)
+/// its colour goes into the TAA's output (`gpu::upmerge`).
 static UPSCALE_OUT: AtomicU64 = AtomicU64::new(0);
 /// `DS_RENDER_SIZE` set the render size (the setting then leaves it alone).
 static RENDER_FROM_ENV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -90,7 +90,7 @@ static WANT_TICKS: AtomicU32 = AtomicU32::new(0);
 /// comparisons: applied by a mode pulse as the Render Scale is.
 static HEADLESS_WANT: AtomicU64 = AtomicU64::new(0);
 
-/// The upscaler's output size while it is smaller than the title's output (the screen's).
+/// The upscaler's output size while an upscaler runs (the screen's, at most the title's output).
 pub fn upscale_output() -> Option<(u32, u32)> {
     let v = UPSCALE_OUT.load(Ordering::Relaxed);
     (v != 0).then_some(((v >> 32) as u32, v as u32))
@@ -430,7 +430,8 @@ pub fn tick() {
     let want = if upscaling {
         let ((rw, rh), (uw, uh)) = upscaling_sizes(area);
         let (ow, oh) = output_size();
-        let out = if uw >= ow || uh >= oh { 0 } else { (uw as u64) << 32 | uh as u64 };
+        let (uw, uh) = (uw.min(ow), uh.min(oh));
+        let out = (uw as u64) << 32 | uh as u64;
         if UPSCALE_OUT.swap(out, Ordering::Relaxed) != out {
             crate::info!("upscaler: output {uw}x{uh} for the screen, render {rw}x{rh} (Upscaling at {:.2}x)", UPSCALE_FACTOR.load(Ordering::Relaxed) as f32 / 100.0);
         }

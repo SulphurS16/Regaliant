@@ -551,6 +551,28 @@ pub fn set_equal_bias(v: Option<f32>) {
     EQUAL_BIAS.store(v.unwrap_or(f32::NAN).to_bits(), Ordering::Relaxed);
 }
 
+/// Real upscaling's stage B: the output pass's size constants (its scene image's width, height and
+/// their reciprocals, f32, as its bicubic reads them) given for our composite at `o` instead of the
+/// render size `r`, in the pixel stage's SGPR data as read. Returns the blocks changed.
+fn patch_size_consts(data: &mut [u32], r: (u32, u32), o: (u32, u32)) -> usize {
+    let (rw, rh) = ((r.0 as f32).to_bits(), (r.1 as f32).to_bits());
+    let near = |w: u32, v: f32| (f32::from_bits(w) - v).abs() <= v * 1e-4;
+    let (mut n, mut i) = (0, 0);
+    while i + 4 <= data.len() {
+        if data[i] == rw && data[i + 1] == rh && near(data[i + 2], 1.0 / r.0 as f32) && near(data[i + 3], 1.0 / r.1 as f32) {
+            data[i] = (o.0 as f32).to_bits();
+            data[i + 1] = (o.1 as f32).to_bits();
+            data[i + 2] = (1.0 / o.0 as f32).to_bits();
+            data[i + 3] = (1.0 / o.1 as f32).to_bits();
+            n += 1;
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
 /// Whether a draw trace is on (`DS_TRACE_PS`, `DS_TRACE_PS_BINS`, `DS_TRACE_ARGS`,
 /// `DS_TRACE_DEPTH`): the draw path's one check while they are off.
 #[inline]
@@ -1818,12 +1840,27 @@ impl Exec {
         }
         let t_prog = super::prog_census().then(std::time::Instant::now);
         self.census_kind = 0;
-        // Menu & HUD Size: the interface layer scaled before the title composites it.
-        if super::super::uiscale::scale() < 1.0 {
-            let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
-            if ps == super::super::uiscale::COMPOSITE_PS {
-                self.scale_ui_layer(cp);
+        let ps_now = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+        // Real upscaling's stage B (`gpu::upcomp`): the title's composite drawn again at the
+        // upscaler's size after its own draw, and the output pass reading that.
+        if ps_now == super::super::upcomp::SCENE_COMPOSITE_PS {
+            self.up_comp = true;
+        } else if ps_now == super::super::uiscale::COMPOSITE_PS {
+            if self.deferred && super::super::upcomp::size_for(crate::dispmode::render_size()).is_some() {
+                // (A worker stops here: the command processor records the output pass after
+                // the chunk that holds the composite, so the handover follows program order.)
+                self.stop("the output pass of an upscaled frame");
+                return "stopped (parallel run)".into();
             }
+            // (A composite handed over while stage B still runs: one left from before it stopped,
+            // the player back on the TAA, is dropped.)
+            if let Some(d) = super::super::upcomp::take_done().filter(|_| super::super::upcomp::size_for(crate::dispmode::render_size()).is_some()) {
+                self.output_up(cp, d);
+            }
+        }
+        // Menu & HUD Size: the interface layer scaled before the title composites it.
+        if super::super::uiscale::scale() < 1.0 && ps_now == super::super::uiscale::COMPOSITE_PS {
+            self.scale_ui_layer(cp);
         }
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
         set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
@@ -1831,6 +1868,9 @@ impl Exec {
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
+        self.up_comp = false;
+        self.out_sub = None;
+        self.up_consts = None;
         if let Some(t) = t_prog {
             let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
             let ns = t.elapsed().as_nanos() as u64;
@@ -1889,6 +1929,174 @@ impl Exec {
             // (Rendering begins again at the composite: the copy goes in before it.)
             self.end_rendering();
         }
+    }
+
+    /// Real upscaling's stage B (`gpu::upcomp`): the output pass reads our composite at the
+    /// upscaler's size (drawn just before by `composite_up`) in the title's composite's place
+    /// (`out_sub`, read where the draw binds its pixel stage), its size constants given for ours
+    /// (`up_consts`).
+    fn output_up(&mut self, cp: &Cp, d: super::super::upcomp::Done) {
+        let Ok(p) = shaders::prepare_ps(cp) else { return };
+        let frame = super::super::FRAMES.load(Ordering::Relaxed);
+        for r in p.resources.iter() {
+            let super::Resolved::Image(t) = r else { continue };
+            if t.base != d.base || (t.width, t.height) != d.r {
+                continue;
+            }
+            if let Ok(tex) = super::super::images::with(|im| im.upscale_tex(t, false, frame)) {
+                self.out_sub = Some((tex.view, d.view));
+                self.up_consts = Some((d.r, d.o));
+            }
+            break;
+        }
+    }
+
+    /// Real upscaling's stage B (`gpu::upcomp`): the title's composite, just recorded at the
+    /// render size, drawn again with the same pipeline into our image at the upscaler's size, the
+    /// upscaler's output (`upmerge::record_up`) in the TAA output's place and the depth of field's
+    /// tiles enlarged to match (nearest: its pixel stage reads them at its position / 16). True when
+    /// recorded: the descriptors and dynamic state bound are then ours.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_up(&mut self, bounds: &mut [super::Bound], layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, push: bool, colors: &[Option<Target>; MAX_RT], depth: &Option<Target>, a: &DrawArgs, base_vertex: i32, ps: Option<&Prepared>) -> bool {
+        use super::super::upcomp;
+        let (Some(t0), Some(ps)) = (colors[0], ps) else { return false };
+        let r = (t0.width, t0.height);
+        let Some(o) = upcomp::wanted(r) else { return false };
+        if depth.is_some() || colors[1..].iter().any(Option::is_some) || a.index.is_some() || bounds.len() < 2 {
+            upcomp::fail("the composite draws with other attachments or indices than expected");
+            return false;
+        }
+        let Some(up_view) = super::super::upmerge::current_view(o.0, o.1) else { return false };
+        let taa_base = upcomp::taa_base();
+        let (tw, th) = (r.0.div_ceil(16), r.1.div_ceil(16));
+        let frame = super::super::FRAMES.load(Ordering::Relaxed);
+        let (mut taa, mut tile) = (None, None);
+        for res in ps.resources.iter() {
+            let super::Resolved::Image(t) = res else { continue };
+            if t.base == taa_base && (t.width, t.height) == r {
+                taa = Some(t.clone());
+            } else if (t.width, t.height) == (tw, th) && tile.is_none() {
+                tile = Some(t.clone());
+            }
+        }
+        let (Some(taa), Some(tile)) = (taa, tile) else {
+            // (Not the main view's composite, or another frame's TAA: this frame stays the title's.)
+            return false;
+        };
+        let texes = super::super::images::with(|im| -> Result<_, String> { Ok((im.upscale_tex(&taa, false, frame)?, im.upscale_tex(&tile, false, frame)?, im.upscale_tex(&tile, true, frame).ok())) });
+        let Ok((taa_tex, tile_tex, tile_st)) = texes else { return false };
+        let (otw, oth) = (o.0.div_ceil(16), o.1.div_ceil(16));
+        let (cimg, cview) = match upcomp::composite_image(t0.format, o.0, o.1) {
+            Ok(v) => v,
+            Err(e) => {
+                upcomp::fail(&e);
+                return false;
+            }
+        };
+        let (timg, tview) = match upcomp::tile_image(tile_tex.format, otw, oth) {
+            Ok(v) => v,
+            Err(e) => {
+                upcomp::fail(&e);
+                return false;
+            }
+        };
+        // The pixel stage's views: ours in place of the TAA output and the tiles.
+        let tile_views: Vec<vk::ImageView> = std::iter::once(tile_tex.view).chain(tile_st.as_ref().map(|s| s.view)).collect();
+        let mut swapped: Vec<(usize, vk::ImageView, vk::ImageLayout)> = Vec::new();
+        for (i, e) in bounds[1].imgs.iter_mut().enumerate() {
+            let v = e.2.image_view;
+            let to = if v == taa_tex.view {
+                Some(up_view)
+            } else if tile_views.contains(&v) {
+                Some(tview)
+            } else {
+                None
+            };
+            if let Some(to) = to {
+                swapped.push((i, v, e.2.image_layout));
+                e.2.image_view = to;
+                e.2.image_layout = vk::ImageLayout::GENERAL;
+            }
+        }
+        let restore = |bounds: &mut [super::Bound], swapped: &[(usize, vk::ImageView, vk::ImageLayout)]| {
+            for &(i, v, l) in swapped {
+                bounds[1].imgs[i].2.image_view = v;
+                bounds[1].imgs[i].2.image_layout = l;
+            }
+        };
+        if swapped.len() < 2 {
+            restore(bounds, &swapped);
+            upcomp::fail(&format!("{} of the composite's two views found in its bindings", swapped.len()));
+            return false;
+        }
+        let set = if push {
+            None
+        } else {
+            match self.alloc_set(set_layout) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    restore(bounds, &swapped);
+                    upcomp::fail(&e);
+                    return false;
+                }
+            }
+        };
+        if let Some(s) = set {
+            self.write_set(s, bounds);
+        }
+        self.end_rendering();
+        let cmd = self.cmd();
+        let c = ctx();
+        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        let bar = |img: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout| {
+            vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .old_layout(old)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(img)
+                .subresource_range(range)
+        };
+        let all = vk::PipelineStageFlags::ALL_COMMANDS;
+        unsafe {
+            let b0 = [bar(timg, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL), bar(cimg, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL)];
+            c.device.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &b0);
+            let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+            let region = vk::ImageBlit {
+                src_subresource: sub,
+                src_offsets: [vk::Offset3D::default(), vk::Offset3D { x: tw as i32, y: th as i32, z: 1 }],
+                dst_subresource: sub,
+                dst_offsets: [vk::Offset3D::default(), vk::Offset3D { x: otw as i32, y: oth as i32, z: 1 }],
+            };
+            c.device.cmd_blit_image(cmd, tile_tex.image, vk::ImageLayout::GENERAL, timg, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region], vk::Filter::NEAREST);
+            c.device.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[bar(timg, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL)]);
+            super::bind_descriptors(cmd, vk::PipelineBindPoint::GRAPHICS, layout, set, bounds, &mut super::PushedSet::default(), true);
+            super::push_sgpr_bases(cmd, layout, false, bounds);
+            let att = [vk::RenderingAttachmentInfo::default()
+                .image_view(cview)
+                .image_layout(vk::ImageLayout::GENERAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue { color: vk::ClearColorValue { float32: [0.0; 4] } })];
+            let ri = vk::RenderingInfo::default().render_area(vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: o.0, height: o.1 } }).layer_count(1).color_attachments(&att);
+            c.device.cmd_begin_rendering(cmd, &ri);
+            c.device.cmd_set_viewport(cmd, 0, &[vk::Viewport { x: 0.0, y: 0.0, width: o.0 as f32, height: o.1 as f32, min_depth: 0.0, max_depth: 1.0 }]);
+            c.device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: o.0, height: o.1 } }]);
+            c.device.cmd_draw(cmd, a.count, a.instances, base_vertex as u32, a.first_instance);
+            c.device.cmd_end_rendering(cmd);
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        }
+        restore(bounds, &swapped);
+        // (The pipeline stays bound; the descriptors and dynamic state are ours now.)
+        self.dyncache = Default::default();
+        upcomp::note_done(upcomp::Done { base: t0.key.base, view: cview, r, o });
+        if upcomp::DRAWN.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::info!("upscaler: the title's composite drawn again at {}x{} from the upscaler's output (render {}x{}; depth-of-field tiles {tw}x{th} to {otw}x{oth}; {} views of ours)", o.0, o.1, r.0, r.1, swapped.len());
+        }
+        true
     }
 
     /// The same for an indexed indirect draw whose arguments the CPU read
@@ -3022,6 +3230,21 @@ impl Exec {
                         e.2.image_view = to;
                     }
                 }
+                // Real upscaling's stage B: the output pass reads our composite and its size.
+                if let Some((from, to)) = self.out_sub {
+                    let mut n = 0;
+                    for e in b.imgs.iter_mut().filter(|e| e.2.image_view == from) {
+                        e.2.image_view = to;
+                        e.2.image_layout = vk::ImageLayout::GENERAL;
+                        n += 1;
+                    }
+                    if let Some((r, o)) = self.up_consts {
+                        let patched = patch_size_consts(&mut p.sgpr_data, r, o);
+                        if super::super::upcomp::READ.fetch_add(1, Ordering::Relaxed) == 0 {
+                            crate::info!("upscaler: the output pass reads the composite at {}x{} ({n} view(s) swapped, {patched} size constant block(s) given for it)", o.0, o.1);
+                        }
+                    }
+                }
             }
             if self.stopped {
                 return Err(super::STOPPED.into());
@@ -3544,6 +3767,12 @@ impl Exec {
             }
         }
         lap.mark(16);
+        // Real upscaling's stage B: the title's composite drawn again at the upscaler's size.
+        let redone = self.up_comp && ps_addr == super::super::upcomp::SCENE_COMPOSITE_PS && {
+            self.up_comp = false;
+            let bv = a.base_vertex.unwrap_or(reg(0x28408) as i32);
+            self.composite_up(&mut bounds, layout, set_layout, push, &colors, &depth, a, bv, ps.as_ref())
+        };
         // Another draw like it can be recorded on the state this one left
         // (`draw_repeat`): GPU-read arguments, indices and arguments in
         // homes, no buffer writes, no timestamps around it.
@@ -3551,7 +3780,7 @@ impl Exec {
         // (Not after a batched draw: its pipeline's vertex stage reads its
         // SGPR data from the run's table by draw index.)
         let repeat = match (&index_home, a.index) {
-            _ if batched => None,
+            _ if batched || redone => None,
             (Some(ih), Some((_, size))) if a.base_inst.is_some() && untimed && no_writes && self.recording && super::super::tune::draw_repeat() && !sync_mode() => {
                 Some(Repeat { batch: self.batch_count, uses: 0, index: (0, size, 0), index_buf: ih.0, index_off: ih.1 })
             }
@@ -3603,7 +3832,7 @@ impl Exec {
         }
         if delta.is_some() {
             self.delta.at = Some(self.last_draw_end);
-        } else if has_sig && !fixed.writes && !fixed.hazard && !clear_z && !clear_s && !touches {
+        } else if has_sig && !fixed.writes && !fixed.hazard && !clear_z && !clear_s && !touches && !redone {
             let d = &mut self.delta;
             d.textures.clear();
             d.textures.extend(self.tex_scratch.iter().map(|x| x.0));

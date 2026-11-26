@@ -2273,6 +2273,7 @@ pub mod swizzle_tables;
 pub mod tiling;
 pub mod upscale;
 pub mod upmerge;
+pub mod upcomp;
 pub mod passmap;
 pub mod uiscale;
 pub mod verify;
