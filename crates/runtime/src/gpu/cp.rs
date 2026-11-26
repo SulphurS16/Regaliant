@@ -1432,6 +1432,10 @@ struct ActiveWait {
     mask: u64,
     reference: u64,
     hit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the wait began (`label_sampler` watches waits blocked `SAMPLE_AFTER`).
+    since: Instant,
+    /// The value the label sampler saw last (`u64::MAX` before its first look).
+    seen: AtomicU64,
 }
 
 static ACTIVE_WAITS: parking_lot::Mutex<Vec<ActiveWait>> = parking_lot::Mutex::new(Vec::new());
@@ -1453,6 +1457,77 @@ fn wake_label(addr: u64, bytes: u8) {
     if bytes >= 8 {
         // A 32-bit wait on its upper half.
         unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((addr + 4) as *const core::ffi::c_void) };
+    }
+}
+
+/// How long a wait blocks before the label sampler watches its word (`label_sampler`).
+const SAMPLE_AFTER: Duration = Duration::from_millis(100);
+/// Waits the label sampler latched: it read a value satisfying them that their waiter had not
+/// polled yet (diagnostics; the waiter may have seen some of them itself an instant later).
+pub static SAMPLER_LATCHED: AtomicU64 = AtomicU64::new(0);
+/// Value changes the label sampler saw on blocked waits' words that no CP event explains (the
+/// CPU's or shader work's writes; diagnostics).
+pub static SAMPLER_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Starts the label sampler once (`label_sampler`).
+fn ensure_label_sampler() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Err(e) = crate::thread::spawn_host("gpu-labelsample", 1 << 20, Box::new(label_sampler)) {
+            crate::warn!("gpu: no label sampler ({e})");
+        }
+    });
+}
+
+/// One thread reads the word of every wait blocked `SAMPLE_AFTER` or longer about every 50 us:
+/// a change goes to the label log (`V`, a value no CP write made: the CPU's or shader work's),
+/// and a value that satisfies the wait latches it (`Q`), as a CP write's does and as a hardware
+/// queue polling the label would see it. The waiters sleep up to 1 ms on the label's address,
+/// which only CP writes wake, and prepare work ahead between polls: in 2026-11-23 -030658 the
+/// compute queues slept through flags set to 1 and reset by the CPU or shader work, 3-5 s
+/// stalls each time (FINDINGS.md 2026-11-26). Waits shorter than `SAMPLE_AFTER` (nearly all of
+/// them in play) are left to their waiters; with none longer the thread sleeps 5 ms a look.
+fn label_sampler() {
+    crate::log::set_thread_name("gpu-labelsample");
+    loop {
+        if crate::gpu::shutting_down() {
+            return;
+        }
+        let mut long = false;
+        let mut woke: Vec<(u64, u64, u64, u8)> = Vec::new();
+        let mut changed: Vec<(u64, u64)> = Vec::new();
+        if ACTIVE_COUNT.load(Ordering::Acquire) != 0 {
+            let g = ACTIVE_WAITS.lock();
+            for w in g.iter() {
+                if w.since.elapsed() < SAMPLE_AFTER || w.hit.load(Ordering::Relaxed) {
+                    continue;
+                }
+                long = true;
+                // (Mapped too: the sampler must not fault where a waiter's own read would not run.)
+                if !guest_readable(w.addr, if w.wide { 8 } else { 4 }) {
+                    continue;
+                }
+                let v = unsafe { if w.wide { rd64(w.addr) } else { rd32(w.addr) as u64 } };
+                let prev = w.seen.swap(v, Ordering::Relaxed);
+                if prev != u64::MAX && prev != v {
+                    changed.push((w.addr, v));
+                }
+                if compare(w.func, v & w.mask, w.reference & w.mask) {
+                    w.hit.store(true, Ordering::SeqCst);
+                    woke.push((w.addr, v, w.reference, if w.wide { 8 } else { 4 }));
+                }
+            }
+        }
+        for (a, v) in changed {
+            SAMPLER_CHANGES.fetch_add(1, Ordering::Relaxed);
+            label_event("gpu-labelsample", b'V', a, v, 0, 0);
+        }
+        for (a, v, r, bytes) in woke {
+            SAMPLER_LATCHED.fetch_add(1, Ordering::Relaxed);
+            label_event("gpu-labelsample", b'Q', a, v, r, 0);
+            wake_label(a, bytes);
+        }
+        crate::thread::short_sleep(if long { Duration::from_micros(50) } else { Duration::from_millis(5) });
     }
 }
 
@@ -1708,6 +1783,8 @@ fn label_history(addr: u64, max: usize) -> String {
             b'P' => format!("wait ref {:#x}: passed on a promised write (value now {:#x})", e.reference, e.value),
             b'M' => format!("wait ref {:#x}: passed on a write made after its submission (value now {:#x})", e.reference, e.value),
             b'K' => format!("wait ref {:#x}: passed, its counter moved on past it (value now {:#x})", e.reference, e.value),
+            b'V' => format!("changed to {:#x}, seen by the label sampler (no CP wrote it: the CPU or shader work)", e.value),
+            b'Q' => format!("a wait for {:#x} latched by the label sampler (value {:#x})", e.reference, e.value),
             _ => format!("wait ref {:#x}: satisfied (value {:#x})", e.reference, e.value),
         };
         out.push_str(&format!("\n    {:>10.3} ms {} {what} (packet {:#x})", e.us as f64 / 1000.0, e.queue, e.packet));
@@ -7452,7 +7529,8 @@ impl Cp {
             f.store(true, Ordering::SeqCst);
         }
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone() });
+        ACTIVE_WAITS.lock().push(ActiveWait { addr: a, wide, func, mask, reference, hit: hit.clone(), since: Instant::now(), seen: AtomicU64::new(u64::MAX) });
+        ensure_label_sampler();
         ACTIVE_COUNT.fetch_add(1, Ordering::AcqRel);
         let t0 = Instant::now();
         let tw = super::timeline::wait_start();

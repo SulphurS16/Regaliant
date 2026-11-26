@@ -3762,7 +3762,7 @@ pub fn status_ex(with_stacks: bool) -> String {
 "));
     }
     s.push_str(&format!(
-        "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue{}\n",
+        "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched (and {} by the label sampler, which saw {} values no CP wrote), {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue{}\n",
         SUBMITS.load(Ordering::Relaxed),
         cp::PACKETS.load(Ordering::Relaxed),
         cp::DRAWS.load(Ordering::Relaxed),
@@ -3775,6 +3775,8 @@ pub fn status_ex(with_stacks: bool) -> String {
         cp::EOP_INTERRUPTS.load(Ordering::Relaxed),
         FRAMES.load(Ordering::Relaxed),
         cp::LATCHED.load(Ordering::Relaxed),
+        cp::SAMPLER_LATCHED.load(Ordering::Relaxed),
+        cp::SAMPLER_CHANGES.load(Ordering::Relaxed),
         cp::MISSED.load(Ordering::Relaxed),
         cp::COUNTER_PASSED.load(Ordering::Relaxed),
         cp::PROMISED.load(Ordering::Relaxed),
