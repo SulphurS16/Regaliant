@@ -1,7 +1,9 @@
 # Fetches the upscalers' libraries for the player package into local-data\upscalers
 # (git-ignored): Intel XeSS (libxess.dll), NVIDIA Streamline with DLSS
-# (sl.interposer.dll, sl.common.dll, sl.dlss.dll; nvngx_dlss.dll for
-# development runs only - the package leaves it out, players add their own)
+# (sl.interposer.dll, sl.common.dll, sl.dlss.dll; DLSS Frame Generation and
+# Reflex: sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll, NvLowLatencyVk.dll;
+# nvngx_dlss.dll and nvngx_dlssg.dll for development runs only - the package
+# leaves them out, players add their own)
 # and AMD FSR
 # (amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll), each with
 # its license texts, from the vendors' release archives on GitHub - pinned
@@ -33,7 +35,13 @@ $sdks = @(
       'bin/x64/sl.interposer.dll' = 'sl.interposer.dll'
       'bin/x64/sl.common.dll' = 'sl.common.dll'
       'bin/x64/sl.dlss.dll' = 'sl.dlss.dll'
+      'bin/x64/sl.dlss_g.dll' = 'sl.dlss_g.dll'
+      'bin/x64/sl.reflex.dll' = 'sl.reflex.dll'
+      'bin/x64/sl.pcl.dll' = 'sl.pcl.dll'
+      'bin/x64/NvLowLatencyVk.dll' = 'NvLowLatencyVk.dll'
+      'bin/x64/reflex.license.txt' = 'reflex.license.txt'
       'bin/x64/nvngx_dlss.dll' = 'nvngx_dlss.dll'
+      'bin/x64/nvngx_dlssg.dll' = 'nvngx_dlssg.dll'
       'bin/x64/nvngx_dlss.license.txt' = 'nvngx_dlss.license.txt'
       'license.txt' = 'streamline.license.txt'
       '3rd-party-licenses.md' = 'streamline.3rd-party-licenses.md'

@@ -1687,6 +1687,16 @@ fn build_timestamp_many() -> Result<Vec<u32>, rspirv::dr::Error> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ui_alpha_kernel_assembles() {
+        let w = super::ui_alpha();
+        assert_eq!(w[0], 0x0723_0203);
+        if let Ok(dir) = std::env::var("RDNA_KERNEL_DUMP") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(std::path::Path::new(&dir).join("ui_alpha.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
     fn sharpen_kernel_assembles() {
         let w = super::sharpen();
         assert_eq!(w[0], 0x0723_0203);
@@ -2382,5 +2392,126 @@ fn build_sharpen() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.end_function()?;
     b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
     b.execution_mode(f, ExecutionMode::LocalSize, [SHARPEN_LOCAL, SHARPEN_LOCAL, 1]);
+    Ok(b.module().assemble())
+}
+
+/// Workgroup size of `ui_alpha` (each way).
+pub const UI_ALPHA_LOCAL: u32 = 8;
+
+/// Frame generation's interface coverage (`gpu::framegen::capture`): binding 1 (RGBA8, the
+/// swapchain's size) gets, for each pixel inside the picture's rectangle, the alpha of the pixel
+/// of binding 0 (RGBA8, the interface layer as the title's composite maps it over its picture)
+/// that it shows, and 0 outside; inside a second rectangle (the port's own text box) 1. The
+/// value fills all four channels. Push constants (u32): the picture's x, y, width, height in the
+/// output, the source's width and height, the output's width and height, the box's x0, y0, x1, y1.
+pub fn ui_alpha() -> Vec<u32> {
+    build_ui_alpha().expect("ui alpha kernel")
+}
+
+fn build_ui_alpha() -> Result<Vec<u32>, rspirv::dr::Error> {
+    use rspirv::spirv::{Dim, GlslStd450Op as G, ImageFormat};
+    let lit = Operand::LiteralBit32;
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let bool_ = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let i32t = b.type_int(32, 1);
+    let f32t = b.type_float(32, None);
+    let v3u = b.type_vector(u32t, 3);
+    let v2i = b.type_vector(i32t, 2);
+    let v4f = b.type_vector(f32t, 4);
+    let img = b.type_image(f32t, Dim::Dim2D, 0, 0, 0, 2, ImageFormat::Rgba8, None);
+    let p_img = b.type_pointer(None, StorageClass::UniformConstant, img);
+    let pc = b.type_struct([u32t; 12]);
+    b.decorate(pc, Decoration::Block, []);
+    for i in 0..12 {
+        b.member_decorate(pc, i, Decoration::Offset, [lit(4 * i)]);
+    }
+    let p_pc = b.type_pointer(None, StorageClass::PushConstant, pc);
+    let p_pcu = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_in = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid = global(&mut b, p_in, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let src = global(&mut b, p_img, StorageClass::UniformConstant);
+    b.decorate(src, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(src, Decoration::Binding, [lit(0)]);
+    b.decorate(src, Decoration::NonWritable, []);
+    let dst = global(&mut b, p_img, StorageClass::UniformConstant);
+    b.decorate(dst, Decoration::DescriptorSet, [lit(0)]);
+    b.decorate(dst, Decoration::Binding, [lit(1)]);
+    b.decorate(dst, Decoration::NonReadable, []);
+    let pcv = global(&mut b, p_pc, StorageClass::PushConstant);
+    let idx: Vec<Word> = (0..12u32).map(|i| b.constant_bit32(u32t, i)).collect();
+    let u1 = b.constant_bit32(u32t, 1);
+    let f0 = b.constant_bit32(f32t, 0.0f32.to_bits());
+    let f1 = b.constant_bit32(f32t, 1.0f32.to_bits());
+    let fty = b.type_function(void, []);
+    let f = b.begin_function(void, None, FunctionControl::NONE, fty)?;
+    b.begin_block(None)?;
+    let g = b.load(v3u, None, gid, None, [])?;
+    let gx = b.composite_extract(u32t, None, g, [0])?;
+    let gy = b.composite_extract(u32t, None, g, [1])?;
+    let mut pcs = Vec::with_capacity(12);
+    for &i in &idx {
+        let p = b.access_chain(p_pcu, None, pcv, [i])?;
+        pcs.push(b.load(u32t, None, p, None, [])?);
+    }
+    let (rx, ry, rw, rh, sw, sh, dw, dh, tx0, ty0, tx1, ty1) = (pcs[0], pcs[1], pcs[2], pcs[3], pcs[4], pcs[5], pcs[6], pcs[7], pcs[8], pcs[9], pcs[10], pcs[11]);
+    let in_w = b.u_less_than(bool_, None, gx, dw)?;
+    let in_h = b.u_less_than(bool_, None, gy, dh)?;
+    let in_out = b.logical_and(bool_, None, in_w, in_h)?;
+    let (l_body, l_end) = (b.id(), b.id());
+    b.selection_merge(l_end, SelectionControl::NONE)?;
+    b.branch_conditional(in_out, l_body, l_end, [])?;
+    b.begin_block(Some(l_body))?;
+    // Inside the picture: [rx, rx + rw) x [ry, ry + rh).
+    let within = |b: &mut Builder, v: Word, lo: Word, hi: Word| -> Result<Word, rspirv::dr::Error> {
+        let a = b.u_greater_than_equal(bool_, None, v, lo)?;
+        let c = b.u_less_than(bool_, None, v, hi)?;
+        b.logical_and(bool_, None, a, c)
+    };
+    let rx1 = b.i_add(u32t, None, rx, rw)?;
+    let ry1 = b.i_add(u32t, None, ry, rh)?;
+    let ix = within(&mut b, gx, rx, rx1)?;
+    let iy = within(&mut b, gy, ry, ry1)?;
+    let inside = b.logical_and(bool_, None, ix, iy)?;
+    // The source pixel: (g - r) * s / r, clamped into the source.
+    let coord = |b: &mut Builder, v: Word, r0: Word, rlen: Word, slen: Word| -> Result<Word, rspirv::dr::Error> {
+        let d = b.i_sub(u32t, None, v, r0)?;
+        let m = b.i_mul(u32t, None, d, slen)?;
+        let den = b.ext_inst(u32t, None, glsl, G::UMax as u32, [Operand::IdRef(rlen), Operand::IdRef(u1)])?;
+        let q = b.u_div(u32t, None, m, den)?;
+        let smax = b.ext_inst(u32t, None, glsl, G::UMax as u32, [Operand::IdRef(slen), Operand::IdRef(u1)])?;
+        let last = b.i_sub(u32t, None, smax, u1)?;
+        let q = b.ext_inst(u32t, None, glsl, G::UMin as u32, [Operand::IdRef(q), Operand::IdRef(last)])?;
+        b.bitcast(i32t, None, q)
+    };
+    let sx = coord(&mut b, gx, rx, rw, sw)?;
+    let sy = coord(&mut b, gy, ry, rh, sh)?;
+    let simg = b.load(img, None, src, None, [])?;
+    let at = b.composite_construct(v2i, None, [sx, sy])?;
+    let s = b.image_read(v4f, None, simg, at, None, [])?;
+    let a_src = b.composite_extract(f32t, None, s, [3])?;
+    let a = b.select(f32t, None, inside, a_src, f0)?;
+    let bx = within(&mut b, gx, tx0, tx1)?;
+    let by = within(&mut b, gy, ty0, ty1)?;
+    let in_box = b.logical_and(bool_, None, bx, by)?;
+    let a = b.select(f32t, None, in_box, f1, a)?;
+    let out = b.composite_construct(v4f, None, [a, a, a, a])?;
+    let ox = b.bitcast(i32t, None, gx)?;
+    let oy = b.bitcast(i32t, None, gy)?;
+    let oat = b.composite_construct(v2i, None, [ox, oy])?;
+    let dimg = b.load(img, None, dst, None, [])?;
+    b.image_write(dimg, oat, out, None, [])?;
+    b.branch(l_end)?;
+    b.begin_block(Some(l_end))?;
+    b.ret()?;
+    b.end_function()?;
+    b.entry_point(ExecutionModel::GLCompute, f, "main", [gid]);
+    b.execution_mode(f, ExecutionMode::LocalSize, [UI_ALPHA_LOCAL, UI_ALPHA_LOCAL, 1]);
     Ok(b.module().assemble())
 }

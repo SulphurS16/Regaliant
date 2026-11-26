@@ -68,6 +68,12 @@ pub enum ItemKind {
     /// The Quality Preset (`presets`): Custom and the presets as options (live: the preset the
     /// settings match; a change sets its settings).
     Preset(Vec<String>),
+    /// Frame Generation: Off, then the backends that can run in this session (`fg_list`; the
+    /// choice kept by its code, `gpu::framegen::FG_*`).
+    FrameGen,
+    /// Frame Generation's multiplier: 2x up to what the GPU can (`fg_multipliers`; kept as the
+    /// multiplier).
+    FgMultiplier,
 }
 
 impl Item {
@@ -100,6 +106,8 @@ impl Item {
                 }))
                 .collect(),
             ItemKind::AntiAliasing => aa_list().iter().enumerate().map(|(n, (_, o))| (self.text_key(&format!("_{n}")), Some(o.to_string()))).collect(),
+            ItemKind::FrameGen => fg_list().iter().enumerate().map(|(n, (_, o))| (self.text_key(&format!("_{n}")), Some(o.to_string()))).collect(),
+            ItemKind::FgMultiplier => fg_multipliers().iter().enumerate().map(|(n, m)| (self.text_key(&format!("_{n}")), Some(format!("{m}x")))).collect(),
             ItemKind::Display(k) => {
                 let opts = match k {
                     0 => crate::display::monitor_options(),
@@ -123,6 +131,8 @@ impl Item {
             ItemKind::Display(k) => (store::Kind::Int, 0, Some(store::Live::Display(*k))),
             ItemKind::AntiAliasing => (store::Kind::Int, AA_TAA, Some(store::Live::AntiAliasing)),
             ItemKind::Preset(_) => (store::Kind::Int, 0, Some(store::Live::Preset)),
+            ItemKind::FrameGen => (store::Kind::Int, crate::gpu::framegen::FG_OFF, Some(store::Live::FrameGen)),
+            ItemKind::FgMultiplier => (store::Kind::Int, 2, Some(store::Live::FgMultiplier)),
         };
         store::Def { name: self.key(), kind, default, live }
     }
@@ -230,6 +240,24 @@ pub fn graphics_items() -> Vec<Item> {
             label: s("Sharpening"),
             tooltip: s("Sharpens the image. Off is the original."),
             kind: ItemKind::Choice(vec![s("Off"), s("25%"), s("50%"), s("75%"), s("100%")], 0),
+        },
+        Item {
+            id: s("FrameGeneration"),
+            label: s("Frame Generation"),
+            tooltip: s("DLSS Frame Generation shows generated frames between the game's. GeForce RTX 40 or newer."),
+            kind: ItemKind::FrameGen,
+        },
+        Item {
+            id: s("FrameGenMultiplier"),
+            label: s("Frame Generation Mode"),
+            tooltip: s("Frames shown for each frame the game renders. 3x and more: GeForce RTX 50."),
+            kind: ItemKind::FgMultiplier,
+        },
+        Item {
+            id: s("Reflex"),
+            label: s("NVIDIA Reflex Low Latency"),
+            tooltip: s("Lower input latency. Always on with Frame Generation (Off counts as On)."),
+            kind: ItemKind::Choice(vec![s("Off"), s("On"), s("On + Boost")], 1),
         },
         toggle("Bloom", "Bloom", "The glow around bright lights.", true),
         toggle("Vignette", "Vignette", "The darkening toward the image's edges.", true),
@@ -361,6 +389,10 @@ pub fn apply() {
         AA_XESS => "xess",
         _ => "off",
     }); }
+    // Frame Generation by its code and multiplier (`gpu::framegen`: a new swapchain at the next
+    // present), and NVIDIA Reflex (`gpu::latency`: at least On while frame generation is on).
+    crate::gpu::framegen::set_choice(store::raw_value("Setting_PC_FrameGeneration").unwrap_or(crate::gpu::framegen::FG_OFF), store::raw_value("Setting_PC_FrameGenMultiplier").unwrap_or(2));
+    crate::gpu::latency::set_user_mode(get("Reflex").unwrap_or(1).min(2) as u8);
     convar::want("r_bloomEnable", (get("Bloom") == Some(0)).then_some(0));
     let vignette_off = get("Vignette") == Some(0);
     convar::want("r_vignetteOverrideEnable", vignette_off.then_some(1));
@@ -457,6 +489,24 @@ pub fn aa_list() -> &'static [(u32, &'static str)] {
     })
 }
 
+/// The Frame Generation list of this session: Off, then each backend that can run here or may
+/// still become ready when the menu is first made (codes and labels).
+pub fn fg_list() -> &'static [(u32, &'static str)] {
+    static L: std::sync::OnceLock<Vec<(u32, &'static str)>> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        let v = crate::gpu::framegen::offered();
+        crate::info!("pc settings: Frame Generation offers {}", v.iter().map(|(_, l)| *l).collect::<Vec<_>>().join(", "));
+        v
+    })
+}
+
+/// Frame Generation Mode's multipliers of this session (2x up to what the GPU can, all up to 6x
+/// while that is not known yet when the menu is first made).
+pub fn fg_multipliers() -> &'static [u32] {
+    static L: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    L.get_or_init(crate::gpu::framegen::multipliers)
+}
+
 /// HDR output allowed (the PC tab's HDR: Automatic): the title is told the output is HDR while
 /// Windows' HDR is on for the window's monitor.
 pub fn hdr_allowed() -> bool {
@@ -509,6 +559,14 @@ pub fn state_report() {
         format!("ShadowDistance {} (cap {:?})", v("ShadowDistance"), SHADOW_REACH.get(store::value("Setting_PC_ShadowDistance").unwrap_or(0) as usize).copied().flatten()),
         format!("TextureFiltering {} (anisotropy {})", v("TextureFiltering"), crate::gpu::images::ANISO.load(Relaxed)),
         format!("AntiAliasing {:?} (upscaler {up:?})", store::raw_value("Setting_PC_AntiAliasing")),
+        format!(
+            "FrameGeneration {:?} {:?}x (in effect {} {}x)",
+            store::raw_value("Setting_PC_FrameGeneration"),
+            store::raw_value("Setting_PC_FrameGenMultiplier"),
+            crate::gpu::framegen::backend_name(crate::gpu::framegen::choice()),
+            crate::gpu::framegen::multiplier()
+        ),
+        format!("Reflex {} (in effect {})", v("Reflex"), crate::gpu::latency::mode_name(crate::gpu::latency::effective_mode())),
         format!("Bloom {} / Vignette {}", v("Bloom"), v("Vignette")),
         format!("FrameRateLimit {} (frame cap {}, uncapped {})", v("FrameRateLimit"), crate::gpu::tune::frame_cap(), crate::gpu::tune::uncapped()),
         format!("MouseMotionBlur {} (in effect {})", v("MouseMotionBlur"), MOUSE_BLUR.load(Relaxed)),
@@ -814,6 +872,8 @@ fn edit_data_source(p: &mut Payload, item: &Item) -> Result<(), String> {
         ItemKind::PadBinding(_) => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(bindings::pad_capture_option()))),
         ItemKind::AudioDevice => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(crate::audio::output_devices().len() as u32))),
         ItemKind::AntiAliasing => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(aa_list().len().max(1) as u32 - 1))),
+        ItemKind::FrameGen => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(fg_list().len().max(1) as u32 - 1))),
+        ItemKind::FgMultiplier => (raw_u32(0), Some(raw_u32(0)), Some(raw_u32(fg_multipliers().len().max(1) as u32 - 1))),
         ItemKind::Display(k) => {
             let n = match k {
                 0 => crate::display::monitor_options().len(),
@@ -1218,7 +1278,7 @@ fn start_menu(orig: &[u8]) -> Result<Vec<u8>, String> {
         let mut kids = Vec::new();
         for item in &tab.items {
             let (ti, t) = match item.kind {
-                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Display(_) | ItemKind::AntiAliasing | ItemKind::Preset(_) => (ti_choice, &CHOICE),
+                ItemKind::Toggle(_) | ItemKind::Choice(..) | ItemKind::Status(_) | ItemKind::Count(..) | ItemKind::Binding(_) | ItemKind::PadBinding(_) | ItemKind::AudioDevice | ItemKind::Display(_) | ItemKind::AntiAliasing | ItemKind::FrameGen | ItemKind::FgMultiplier | ItemKind::Preset(_) => (ti_choice, &CHOICE),
                 ItemKind::Slider { .. } => (ti_slider, &SLIDER),
             };
             let tpl = f.roots[ri].at(&page_path).at(&contents_rel).kids[ti].clone();

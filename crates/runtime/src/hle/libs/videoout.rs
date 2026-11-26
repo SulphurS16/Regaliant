@@ -230,7 +230,11 @@ fn vblank_thread() {
             crate::info!("vblank timer at {:.2} Hz ({})", 1.0 / period.as_secs_f64(), if period == uncapped_period { "the frame rate uncapped" } else { "the frame rate limited" });
         }
         let uncapped = period == uncapped_period;
-        let vrr = hz.is_none() && crate::vrr::active();
+        // (Frame generation counts as variable refresh: DLSS-G presents the frames on its own
+        // pacing, so the display's vblanks follow its presents and not the title's flips; a lock
+        // to them would feed back on itself.)
+        let fg = crate::gpu::framegen::dlssg::loaded();
+        let vrr = hz.is_none() && (crate::vrr::active() || fg);
         let lock = if hz.is_none() && !vrr { crate::displayclock::lock() } else { None };
         match lock {
             Some(s) => {
@@ -359,7 +363,7 @@ fn vblank_thread() {
                         let rhz = 1.0 / display.as_secs_f64();
                         crate::info!("pacing: the display's grid ({rhz:.3} Hz measured): the title's vblank at each of its vblanks, flips at least {interval} apart ({:.2} frames a second at most; {limit})", rhz / interval as f64);
                     }
-                    (3, _) => crate::info!("pacing: off the grid ({}): a ready frame is shown {}; the title's vblank on its own {:.2} Hz timer", if vrr { "variable refresh" } else { "`tune flip_grid` 0" }, if pace.is_zero() { "at once".to_string() } else { format!("{:.3} ms after the last at the earliest ({limit})", pace.as_secs_f64() * 1e3) }, 1.0 / period.as_secs_f64()),
+                    (3, _) => crate::info!("pacing: off the grid ({}): a ready frame is shown {}; the title's vblank on its own {:.2} Hz timer", if fg { "frame generation paces the display" } else if vrr { "variable refresh" } else { "`tune flip_grid` 0" }, if pace.is_zero() { "at once".to_string() } else { format!("{:.3} ms after the last at the earliest ({limit})", pace.as_secs_f64() * 1e3) }, 1.0 / period.as_secs_f64()),
                     _ => crate::info!("pacing: the vblank thread's own {:.2} Hz timer: flips at least {interval} vblank(s) apart ({limit}{})", 1.0 / period.as_secs_f64(), if cap > 0 { format!(", `tune frame_cap` {cap}") } else { String::new() }),
                 }
             }
@@ -423,7 +427,7 @@ fn vblank_thread() {
             maybe_screenshot(&b, n);
             crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
             crate::displayclock::note_present();
-            present_buffer(&b);
+            present_buffer(&b, n as u32);
         }
     }
 }
@@ -547,7 +551,9 @@ sysv! {
             gamma: 1.0,
         });
         drop(g);
-        crate::thread::spawn_host("vblank", 1 << 20, Box::new(vblank_thread)).expect("vblank thread");
+        // (8 MiB: the presenter calls into Streamline, NGX and the driver on this thread, which
+        // make DLSS Frame Generation's swapchain and run its first frames there.)
+        crate::thread::spawn_host("vblank", 8 << 20, Box::new(vblank_thread)).expect("vblank thread");
         crate::info!("sceVideoOutOpen -> 1");
         1
     }
@@ -704,11 +710,13 @@ fn registered_size(b: &DisplayBuffer) -> Option<(u32, u32)> {
 /// Presents a flipped display buffer: the GPU image the title rendered at
 /// the buffer's address (`DS_GPU=1`), else a black frame of the buffer's size
 /// (never raw guest memory, which is tiled).
-fn present_buffer(b: &DisplayBuffer) {
+/// Shows display buffer `b` as flip `frame` (the frame's index: `gpu::streamline`).
+fn present_buffer(b: &DisplayBuffer, frame: u32) {
     if crate::gpu::vk::try_ctx().is_none() {
         return;
     }
     if crate::gpu::exec::enabled() {
+        crate::gpu::framegen::capture::note_display_buffer(b.addr);
         let size = registered_size(b);
         if let Some((image, format, width, height)) = crate::gpu::images::with(|im| im.rendered_at(b.addr, size)) {
             // Diagnosis: the image each buffer presents, logged when it changes.
@@ -735,7 +743,7 @@ fn present_buffer(b: &DisplayBuffer) {
             // HDR display buffers: the format's color space bits (0x0704: PQ-encoded BT.2020, what
             // the title registers while the output is reported as HDR; SDR has none).
             let hdr = PORT.lock().as_ref().and_then(|p| p.sets.get(b.set as usize).copied().flatten()).is_some_and(|a| is_hdr_format(a.pixel_format));
-            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height, hdr });
+            crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, format, layout: ash::vk::ImageLayout::GENERAL, width, height, hdr }, Some(frame));
             return;
         }
     }
@@ -746,7 +754,7 @@ fn present_buffer(b: &DisplayBuffer) {
         .map(|a| (a.width.clamp(1, 8192), a.height.clamp(1, 8192)))
         .unwrap_or((1920, 1080));
     let data = vec![0u8; (w * h * 4) as usize];
-    crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Pixels { data, width: w, height: h });
+    crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Pixels { data, width: w, height: h }, None);
 }
 
 /// Screenshot requested through the control channel (file name stem).

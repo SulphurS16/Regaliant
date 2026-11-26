@@ -272,6 +272,9 @@ pub fn name_object<H: vk::Handle>(handle: H, name: &str) {
 static MIRROR_CLAMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The device waits for presents (`DS_PRESENT_STATS=1`: VK_KHR_present_id and present_wait).
 pub static PRESENT_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// VK_KHR_present_id enabled (`present`: each present's id, the frame's index, for Reflex's
+/// VK_NV_low_latency2 markers, which name presents by it).
+pub static PRESENT_ID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether samplers may use `MIRROR_CLAMP_TO_EDGE` (`Images::sampler`).
 pub fn mirror_clamp() -> bool {
@@ -526,11 +529,19 @@ fn init_inner() -> Result<(), String> {
             None
         };
         // (Two queues of the graphics family when it has them: the second for the hidden
-        // present, `Ctx::present_queue`.)
-        let prio2 = [1.0f32, 0.5];
+        // present, `Ctx::present_queue`, and frame generation's presents, `present`.)
         // (`DS_PRESENT_QUEUE=0`: one queue, as on a device with one in that family: a test.)
-        let gfx_queues = if std::env::var("DS_PRESENT_QUEUE").ok().as_deref() == Some("0") { 1 } else { instance.get_physical_device_queue_family_properties(pdev).get(qf as usize).map_or(1, |q| q.queue_count) };
-        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(if gfx_queues >= 2 { &prio2[..] } else { &prio[..] })];
+        let family_queues = instance.get_physical_device_queue_family_properties(pdev).get(qf as usize).map_or(1, |q| q.queue_count);
+        let gfx_queues = if std::env::var("DS_PRESENT_QUEUE").ok().as_deref() == Some("0") { 1 } else { family_queues.min(2) };
+        // The upscalers' and Streamline's device extensions, features and queues (`super::upscale`:
+        // DLSS, DLSS Frame Generation and Reflex ask for queues of the graphics family after the
+        // port's own).
+        let up_dev = crate::gpu::upscale::device_needs(&instance, pdev, family_queues.saturating_sub(gfx_queues));
+        let own_queues = gfx_queues;
+        let gfx_total = own_queues + up_dev.extra_graphics_queues;
+        // (The present queue as urgent as the main one once frame generation may present on it.)
+        let prio_n: Vec<f32> = (0..gfx_total).map(|i| if i == 1 && up_dev.extra_graphics_queues == 0 { 0.5 } else { 1.0 }).collect();
+        let mut qci = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio_n)];
         if let Some(f) = copy_family {
             qci.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
         }
@@ -577,13 +588,24 @@ fn init_inner() -> Result<(), String> {
         if has_hdr_meta {
             dexts.push(ash::ext::hdr_metadata::NAME.as_ptr());
         }
-        // The upscalers' device extensions and features (`super::upscale`).
-        let up_dev = crate::gpu::upscale::device_needs(&instance, pdev);
         for e in &up_dev.extensions {
             if !dexts.iter().any(|&x| CStr::from_ptr(x) == e.as_c_str()) {
                 dexts.push(e.as_ptr());
             }
         }
+        // Reflex's VK_NV_low_latency2 names presents by their ids: VK_KHR_present_id with it
+        // (`present`: each present's id is its frame's index).
+        let ll2 = dexts.iter().any(|&x| CStr::from_ptr(x) == c"VK_NV_low_latency2");
+        let has_pid = !has_pw && ll2 && dev_has(ash::khr::present_id::NAME) && {
+            let mut a = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut a);
+            instance.get_physical_device_features2(pdev, &mut f2);
+            a.present_id != 0
+        };
+        if has_pid {
+            dexts.push(ash::khr::present_id::NAME.as_ptr());
+        }
+        PRESENT_ID.store(has_pw || has_pid, std::sync::atomic::Ordering::Relaxed);
         let memory_budget = instance
             .enumerate_device_extension_properties(pdev)
             .unwrap_or_default()
@@ -982,6 +1004,8 @@ fn init_inner() -> Result<(), String> {
         }
         if has_pw {
             dci = dci.push_next(&mut pid_f).push_next(&mut pw_f);
+        } else if has_pid {
+            dci = dci.push_next(&mut pid_f);
         }
         if barycentric {
             dci = dci.push_next(&mut bary);
@@ -1013,7 +1037,7 @@ fn init_inner() -> Result<(), String> {
         init_stage(3);
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
         // The upscalers get the device (Streamline's DLSS starts on a thread of its own).
-        crate::gpu::upscale::device_created(&instance, pdev, &device, qf, qci.iter().find(|q| q.queue_family_index == qf).map_or(1, |q| q.queue_count));
+        crate::gpu::upscale::device_created(&instance, pdev, &device, qf, own_queues, up_dev.extra_graphics_queues);
         // Its command functions go through deferred recording's (`defer`).
         let device = defer::install(device);
         init_stage(4);

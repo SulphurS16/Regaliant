@@ -21029,6 +21029,8 @@ impl Exec {
             ldr: false,
             jitter_x: j.map_or(0.0, |j| j.x),
             jitter_y: j.map_or(0.0, |j| j.y),
+            // (The flip this frame's TAA is shown in: the next one the command processor queues.)
+            frame: super::streamline_frame(),
         };
         if !super::upscale::record(cmd, &inp) {
             return false;
@@ -21038,6 +21040,45 @@ impl Exec {
         // (The upscaler and the merge bound pipelines and descriptors of their own.)
         self.dyncache = Default::default();
         true
+    }
+
+    /// Frame generation's inputs at the title's TAA (`gpu::framegen`): the depth and motion
+    /// vectors the TAA has just read (the images the upscalers get), tagged for the frame with its
+    /// common constants, recorded into the batch's command buffer after the TAA (Streamline copies
+    /// them there: the title reuses both later in the frame). Only the scene's TAA
+    /// (`upscale::main_view`), only while frame generation runs on the presenter's swapchain.
+    fn taa_framegen(&mut self, p: &Prepared) {
+        if !super::framegen::render_inputs_wanted() {
+            return;
+        }
+        let t = |i: usize| match p.resources.get(TAA_RES[i]) {
+            Some(Resolved::Image(t)) => Some(t.clone()),
+            _ => None,
+        };
+        let (Some(tc), Some(td), Some(tv), Some(to)) = (t(0), t(1), t(2), t(3)) else { return };
+        let frame = super::FRAMES.load(Ordering::Relaxed);
+        if !super::upscale::main_view(to.width, to.height, frame) {
+            return;
+        }
+        let r = super::images::with(|im| -> Result<_, String> { Ok((im.upscale_tex(&td, false, frame)?, im.upscale_tex(&tv, false, frame)?)) });
+        let (depth, mvec) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::warn!("frame generation: the TAA's depth and motion vectors: {e}");
+                }
+                return;
+            }
+        };
+        let id = super::streamline_frame();
+        let extent = (tc.width, tc.height);
+        // (The jitter matters to DLSS only, whose own evaluation sets the frame's constants first
+        // when it runs: `upscale::dlss_record`.)
+        let consts = super::upscale::frame_constants((0.0, 0.0), tc.width as f32 / tc.height.max(1) as f32, false);
+        super::vk::defer::external(self.cmd(), Box::new(move |cb| super::framegen::dlssg::record_render_inputs(cb, id, &depth, &mvec, extent, &consts)));
+        // (Streamline's copies bound pipelines of its own.)
+        self.dyncache = Default::default();
     }
 
     /// Diagnosis: the reads of a GPU-resolved command's shader-resolved
@@ -22752,9 +22793,11 @@ impl Exec {
             }
         }
         }
-        // The chosen upscaler after the title's TAA (`gpu::upscale`, `gpu::upmerge`).
+        // The chosen upscaler after the title's TAA (`gpu::upscale`, `gpu::upmerge`), and frame
+        // generation's inputs, the same depth and motion vectors (`gpu::framegen`).
         if !batched && p.addr == TAA_CS && indirect.is_none() {
             self.taa_upscale(&p, &bound);
+            self.taa_framegen(&p);
         }
         trace_cs_images(&self.name, &p, &bound);
         self.tap_cs(&p, &bound);

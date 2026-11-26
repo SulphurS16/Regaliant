@@ -317,8 +317,9 @@ fn parse_args() -> Config {
     }
     if safe_mode {
         // The GPU front end's cautious fallbacks (no arming of GPU-written pages, no held
-        // pages) and no upscaler library loaded: set before any thread starts or reads them.
-        for (k, v) in [("DS_FE2_ARM_GPU", "0"), ("DS_C4", "0"), ("DS_UPSCALER", "off")] {
+        // pages), no upscaler library loaded and no NVIDIA Streamline (no DLSS, Frame Generation
+        // or Reflex): set before any thread starts or reads them.
+        for (k, v) in [("DS_FE2_ARM_GPU", "0"), ("DS_C4", "0"), ("DS_UPSCALER", "off"), ("DS_STREAMLINE", "0")] {
             // SAFETY: still the only thread (parse_args runs before any is started).
             unsafe { set_unless_given(k, v) };
         }
@@ -2309,7 +2310,7 @@ pub(crate) unsafe fn set_unless_given(k: &str, v: &str) {
 }
 
 fn main() {
-    // `--probe-streamline <dir>`: a start's separate check that Streamline loads (`gpu::upscale::
+    // `--probe-streamline <dir>`: a start's separate check that Streamline loads (`gpu::streamline::
     // probe_streamline`), before anything else: no log, no window, no error popups.
     {
         let mut args = std::env::args().skip(1);
@@ -2318,7 +2319,7 @@ fn main() {
                 use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
                 SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
             }
-            gpu::upscale::probe_streamline(std::path::Path::new(&args.next().unwrap_or_default()));
+            gpu::streamline::probe_streamline(std::path::Path::new(&args.next().unwrap_or_default()));
         }
     }
     // Per-monitor DPI awareness for the whole process, before any window, monitor or surface is
@@ -2450,6 +2451,7 @@ This happens when other software takes that range. Restart the PC and try again.
     exception::install();
     heapsites::start();
     hosted::init();
+    hosted::note_run_dir(&cfg.run_dir);
     hosted::self_test_maybe();
     if cfg.dispatch_bench {
         let code = gpu::dispbench::run();
@@ -2588,7 +2590,7 @@ This happens when other software takes that range. Restart the PC and try again.
     // Safe mode: the display choices and PC settings at their defaults for this session (a
     // scratch file for the display's, the player's files left as they are).
     if cfg.safe_mode {
-        info!("safe mode (the launcher's, for this start): default settings, a window, no upscaler, HDR off, arming and held pages off");
+        info!("safe mode (the launcher's, for this start): default settings, a window, no upscaler, no Frame Generation or Reflex, HDR off, arming and held pages off");
         let scratch = cfg.paths.cache.join("safe-mode-display.txt");
         let _ = std::fs::remove_file(&scratch);
         display::init(scratch);

@@ -686,17 +686,18 @@ const FIXES: &[Fix] = &[
         why: "it steps by 1/59.94 s every frame, so twice as fast at 120 frames a second",
         only_with: None,
     },
-    // Diagnosis (`DS_PACE_PAIR=1`): the render thread's submit of a frame with its flip
-    // (CRenderContext::SubmitAndFlip, eboot+0x911d60: `push rbp; mov rbp,rsp; push r14`),
-    // logged beside the frame steps to see what pairs a step with its flip.
+    // The render thread's submit of a frame with its flip (CRenderContext::SubmitAndFlip,
+    // eboot+0x911d60: `push rbp; mov rbp,rsp; push r14`): which flip shows the frame each step
+    // makes (`gamestep::submit_hook`), for Reflex's markers (`gpu::latency`); with
+    // `DS_PACE_PAIR=1` logged beside the frame steps (diagnosis).
     Fix {
-        name: "frame submits (diagnosis)",
+        name: "frame submits",
         offset: 0x911d60,
         from: (6, 0x82d75b35aabe3a5d),
         change: Change::Hook { at: 0, handler: crate::gamestep::submit_hook },
-        kind: "diagnosis",
-        why: "logs each frame's submit beside the frame steps",
-        only_with: Some("DS_PACE_PAIR"),
+        kind: "PC latency (Reflex), diagnosis",
+        why: "Reflex names each frame's moments by the flip that shows it",
+        only_with: None,
     },
     // The frame step (`gamestep`): after the application's per-frame call of it returned
     // (eboot+0xb27f77 calls eboot+0xb280e0; `mov rax,[rbx+28E8h]`, rbx the application

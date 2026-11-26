@@ -1815,16 +1815,26 @@ impl Exec {
         }
         let t_prog = super::prog_census().then(std::time::Instant::now);
         self.census_kind = 0;
+        let composite = super::super::uiscale::is_composite(((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8);
         // Menu & HUD Size: the interface layer scaled before the title composites it.
-        if super::super::uiscale::scale() < 1.0 {
-            let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
-            if ps == super::super::uiscale::COMPOSITE_PS {
-                self.scale_ui_layer(cp);
-            }
+        if composite && super::super::uiscale::scale() < 1.0 {
+            self.scale_ui_layer(cp);
+        }
+        // Frame generation: the composite drawn first without the interface (`framegen::capture`).
+        if composite && super::super::framegen::capture::wanted() {
+            self.fg_capture_composite(cp, &args);
         }
         // (The vertices a non-indexed draw of one instance reads: `snap_prog`'s snapshots.)
         set_snap_verts(if args.index.is_none() && args.instances == 1 { Some((args.base_vertex.unwrap_or_else(|| ctx_reg(cp, 0x28408) as i32).max(0) as u64, args.count as u64)) } else { None });
         let r = self.draw_inner(cp, &args);
+        // (Frame generation's diagnosis: the pixel stages that draw into a display buffer, when
+        // they are not the composite it captures: `capture::note_display_draw`.)
+        if !composite && super::super::framegen::capture::wanted() && matches!(r, Ok(true)) {
+            if let Some(rt) = self.rendering.as_ref().and_then(|r| r.colors[0]) {
+                let ps = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
+                super::super::framegen::capture::note_display_draw(rt.key.base, ps, rt.key.format, rt.width, rt.height);
+            }
+        }
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
@@ -1886,6 +1896,46 @@ impl Exec {
             // (Rendering begins again at the composite: the copy goes in before it.)
             self.end_rendering();
         }
+    }
+
+    /// Frame generation's HUD-less picture (`gpu::framegen::capture`): the title's composite drawn
+    /// once with a transparent image in its interface layer's place, the display buffer it drew
+    /// into copied, and the layer (or its scaled copy, what the composite samples) copied beside
+    /// it; the composite then draws as the title made it (`draw` goes on). Whether it writes every
+    /// pixel or blends the layer over the picture already there, the first draw leaves the picture
+    /// without the interface and the second the title's own.
+    fn fg_capture_composite(&mut self, cp: &Cp, args: &DrawArgs) {
+        use super::super::framegen::capture::skipped;
+        skipped("");
+        let p = match shaders::prepare_ps(cp) {
+            Ok(p) => p,
+            Err(e) => return skipped(&format!("its pixel stage not prepared ({e})")),
+        };
+        let Some(super::Resolved::Image(t)) = p.resources.first() else { return skipped("its resource 0 not an image") };
+        let frame = super::super::FRAMES.load(Ordering::Relaxed);
+        let layer = match super::super::images::with(|im| im.upscale_tex(t, false, frame)) {
+            Ok(l) => l,
+            Err(e) => return skipped(&format!("the interface layer not resolved ({e})")),
+        };
+        let Some(zero) = super::super::framegen::capture::transparent_view() else { return skipped("no transparent image") };
+        let id = super::super::streamline_frame();
+        let saved = self.ui_sub;
+        self.ui_sub = Some((layer.view, zero));
+        let r = self.draw_inner(cp, args);
+        self.ui_sub = saved;
+        // (The title's own draw comes next: no buffer-delta or repeated draw of this one.)
+        self.delta.at = None;
+        self.repeat = None;
+        match r {
+            Ok(true) => {}
+            Ok(false) => return skipped("the hidden-interface draw drew nothing"),
+            Err(e) => return skipped(&format!("the hidden-interface draw failed ({e})")),
+        }
+        let Some(rt) = self.rendering.as_ref().and_then(|r| r.colors[0]) else { return skipped("no colour target after the draw") };
+        self.end_rendering();
+        // What the composite samples in the layer's place: the scaled copy under Menu & HUD Size.
+        let ui = if saved.is_some() { super::super::uiscale::spare_image() } else { Some((layer.image, layer.size.0, layer.size.1)) };
+        super::super::framegen::capture::record(self.cmd(), id, rt.image, rt.key.format, rt.width, rt.height, ui);
     }
 
     /// The same for an indexed indirect draw whose arguments the CPU read

@@ -27,6 +27,8 @@ This is an early version.
 - Render scale, sharpening, quality presets, geometry detail, shadow distance, texture filtering, bloom and vignette.
 - A frame rate limit of 30, 60 or uncapped. The game keeps its normal speed at any frame rate.
 - Even frame pacing at any refresh rate, with G-SYNC and FreeSync.
+- NVIDIA DLSS Frame Generation (2x up to 6x, as the GPU allows) and NVIDIA Reflex, in SDR and HDR. Frame Generation needs your own copy of NVIDIA's Frame Generation file.
+- Borderless fullscreen presents like exclusive fullscreen (independent flip), without the desktop compositor's added latency.
 - Keyboard and mouse with raw mouse look, a mouse pointer in menus and prompts for the keys you bound. Every key can be changed in the game.
 - Xbox and PlayStation controllers with their own button prompts. A DualSense works directly over USB or Bluetooth, without Steam Input.
 - 5.1 and 7.1 sound, and headphone output of the game's 3D sound, also through Windows Sonic or Dolby Atmos for Headphones.

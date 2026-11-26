@@ -63,6 +63,12 @@ pub enum Live {
     /// The Quality Preset: the preset the settings match (`presets::current`); a change sets
     /// the preset's settings.
     Preset,
+    /// Frame Generation: the menu shows the session list's index of the code kept
+    /// (`super::fg_list`); a change keeps the code.
+    FrameGen,
+    /// Frame Generation Mode: the menu shows the session list's index of the multiplier kept
+    /// (`super::fg_multipliers`); a change keeps the multiplier.
+    FgMultiplier,
 }
 
 struct Store {
@@ -173,6 +179,18 @@ pub fn get(hash: u32) -> Option<u32> {
             drop(g);
             return Some(super::aa_list().iter().position(|(c, _)| *c == code).unwrap_or(0) as u32);
         }
+        Some(Live::FrameGen) => {
+            let code = s.values.get(&hash).copied().unwrap_or(d.default);
+            drop(g);
+            return Some(super::fg_list().iter().position(|(c, _)| *c == code).unwrap_or(0) as u32);
+        }
+        Some(Live::FgMultiplier) => {
+            let m = s.values.get(&hash).copied().unwrap_or(d.default);
+            drop(g);
+            // (A multiplier past this GPU's most shows as its most.)
+            let l = super::fg_multipliers();
+            return Some(l.iter().position(|x| *x == m).unwrap_or_else(|| l.iter().rposition(|x| *x <= m).unwrap_or(0)) as u32);
+        }
         Some(Live::Display(k)) => {
             return Some(match k {
                 0 => crate::display::monitor_index(),
@@ -238,7 +256,12 @@ fn set(hash: u32, bits: u32) -> bool {
         return true;
     }
     // Anti-Aliasing: the menu's index becomes the code kept (the normal path below stores it).
-    let bits = if let Some(Live::AntiAliasing) = d.live { super::aa_list().get(bits as usize).map_or(super::AA_TAA, |(c, _)| *c) } else { bits };
+    let bits = match d.live {
+        Some(Live::AntiAliasing) => super::aa_list().get(bits as usize).map_or(super::AA_TAA, |(c, _)| *c),
+        Some(Live::FrameGen) => super::fg_list().get(bits as usize).map_or(crate::gpu::framegen::FG_OFF, |(c, _)| *c),
+        Some(Live::FgMultiplier) => super::fg_multipliers().get(bits as usize).copied().unwrap_or(2),
+        _ => bits,
+    };
     if let Some(Live::Display(k)) = d.live {
         drop(g);
         match k {
@@ -248,7 +271,7 @@ fn set(hash: u32, bits: u32) -> bool {
         }
         return true;
     }
-    if d.live.is_some() && !matches!(d.live, Some(Live::AntiAliasing)) {
+    if d.live.is_some() && !matches!(d.live, Some(Live::AntiAliasing | Live::FrameGen | Live::FgMultiplier)) {
         // A row showing the achievements; the menu cannot change it.
         return true;
     }

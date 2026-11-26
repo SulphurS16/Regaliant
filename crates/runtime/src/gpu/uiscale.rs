@@ -11,8 +11,17 @@ use super::vk::ctx;
 use ash::vk;
 use parking_lot::Mutex;
 
-/// The title's interface composite (01.007.000).
+/// The title's interface composite (01.007.000), SDR.
 pub const COMPOSITE_PS: u64 = 0x100888d100;
+/// The same composite when the title outputs HDR10 (its HDR variant beside it, the interface
+/// layer its resource 0 as well; seen drawing the display buffer in HDR sessions on 2026-11-26,
+/// where the SDR one never ran: frame generation's HUD-less capture met no composite).
+pub const COMPOSITE_PS_HDR: u64 = 0x100888d900;
+
+/// Whether pixel stage `ps` is the interface composite (SDR or HDR).
+pub fn is_composite(ps: u64) -> bool {
+    ps == COMPOSITE_PS || ps == COMPOSITE_PS_HDR
+}
 
 struct Spare {
     image: vk::Image,
@@ -160,6 +169,12 @@ unsafe fn scale_into(cb: vk::CommandBuffer, layer: vk::Image, tmp: vk::Image, w:
 }
 
 /// The scale now (1.0: the original's).
+/// Our scaled copy of the interface layer now (image, width, height; frame generation's
+/// interface coverage reads what the composite samples: `framegen::capture`).
+pub fn spare_image() -> Option<(vk::Image, u32, u32)> {
+    SPARE.lock().as_ref().map(|s| (s.image, s.w, s.h))
+}
+
 pub fn scale() -> f32 {
     crate::pcsettings::ui_size()
 }

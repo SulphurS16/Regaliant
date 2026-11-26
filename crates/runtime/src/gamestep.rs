@@ -337,6 +337,11 @@ pub extern "sysv64" fn submit_hook(regs: *const u64, _arg: u32) {
         }
         let k = SUBMIT_FLIP.load(Relaxed);
         *LAST_SUBMIT.lock() = (k != 0).then_some((frame, seq.wrapping_add(k)));
+        // Reflex: the frame's simulation ends and its render submission starts (`gpu::latency`),
+        // named by the flip that will show it.
+        if k != 0 {
+            crate::gpu::latency::render_submit(seq.wrapping_add(k) as u32);
+        }
     }
     if PAIR_LEFT.load(Relaxed) == 0 {
         return;
@@ -359,13 +364,21 @@ pub extern "sysv64" fn submit_hook(regs: *const u64, _arg: u32) {
 /// application object, r13b the title's own "one fixed step" request).
 pub extern "sysv64" fn after_step(regs: *const u64, _arg: u32) {
     let app = unsafe { *regs.add(3) };
-    // (`DS_PACE_PAIR=1`: the flip that will show this frame, by the title's ring of frame
-    // packets, whose index was just moved on for it.)
-    let own_flip = if pair_diag() {
+    // The flip that will show this frame, by the title's ring of frame packets, whose index was
+    // just moved on for it (0: not known yet).
+    let own = {
         let base = BASE.load(Relaxed);
         let render = if base != 0 { rdq(base + RENDER) } else { 0 };
         let ring = if render != 0 { unsafe { ((render + 8) as *const i32).read_volatile() } } else { -1 };
-        let own = own_flip(ring);
+        (ring, own_flip(ring))
+    };
+    // Reflex: its sleep and the simulation's start, before the frame reads input and simulates
+    // (`gpu::latency`; the frame named by the flip that will show it, two past the last queued
+    // while that is not known).
+    crate::gpu::latency::simulation_start(if own.1 != 0 { own.1 as u32 } else { (crate::hle::libs::videoout::QUEUED_FLIP.load(Relaxed) + 2) as u32 });
+    // (`DS_PACE_PAIR=1`: logged beside the frame's flip.)
+    let own_flip = if pair_diag() {
+        let (ring, own) = own;
         if PAIR_LEFT.load(Relaxed) > 0 {
             PAIR_LEFT.fetch_sub(1, Relaxed);
             crate::info!(

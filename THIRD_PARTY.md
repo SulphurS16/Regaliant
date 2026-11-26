@@ -50,14 +50,15 @@ section 7 permission to link with and ship them under their own terms (README, L
 | Component | Files | License (shipped beside them) |
 | --- | --- | --- |
 | Intel XeSS 3.0.2 | libxess.dll | Intel Simplified Software License (libxess.license.txt, with its third-party notices in libxess.third-party-programs.txt) |
-| NVIDIA Streamline 2.14.16 | sl.interposer.dll, sl.common.dll, sl.dlss.dll | MIT (streamline.license.txt, with its third-party notices in streamline.3rd-party-licenses.md) |
+| NVIDIA Streamline 2.14.16 | sl.interposer.dll, sl.common.dll, sl.dlss.dll, sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll | MIT (streamline.license.txt, with its third-party notices in streamline.3rd-party-licenses.md) |
+| NVIDIA Reflex low-latency library (from Streamline 2.14.16) | NvLowLatencyVk.dll | NVIDIA Reflex SDK license (reflex.license.txt) |
 | AMD FSR SDK 2.4.0 | amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll | MIT (fidelityfx.license.md, which lists the files under each license) |
 
-Not shipped: NVIDIA DLSS itself (`nvngx_dlss.dll`, under NVIDIA's RTX SDKs license). Players
-who want DLSS put their own copy in the folder. `regaliant.exe` uses it through Streamline after
+Not shipped: NVIDIA DLSS itself (`nvngx_dlss.dll`) and DLSS Frame Generation (`nvngx_dlssg.dll`),
+both under NVIDIA's RTX SDKs license. Players who want them put their own copies in the folder. `regaliant.exe` uses it through Streamline after
 checking that it carries NVIDIA's signature. The section 7 permission covers linking with it.
 
-NVIDIA DLSS and NVIDIA Streamline are trademarks and/or registered trademarks of NVIDIA
+NVIDIA DLSS, NVIDIA Reflex, G-SYNC and NVIDIA Streamline are trademarks and/or registered trademarks of NVIDIA
 Corporation. Intel XeSS is a trademark of Intel Corporation. AMD FSR and FidelityFX are
 trademarks of Advanced Micro Devices, Inc.
 

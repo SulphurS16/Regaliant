@@ -2272,6 +2272,9 @@ pub mod shaders;
 pub mod swizzle_tables;
 pub mod tiling;
 pub mod upscale;
+pub mod streamline;
+pub mod framegen;
+pub mod latency;
 pub mod upmerge;
 pub mod uiscale;
 pub mod verify;
@@ -2285,6 +2288,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Flips presented so far (VideoOut).
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The index of the frame whose GPU work the graphics command processor records now: the number
+/// of the flip that will show it, the next one it queues (`hle::libs::videoout::QUEUED_FLIP`
+/// counts every flip queued; the work of a frame comes before its flip in the command stream).
+/// Streamline's features name frames by it (`gpu::streamline`): the present of that flip has the
+/// same number (`hle::libs::videoout`, the vblank thread's flip count).
+pub fn streamline_frame() -> u32 {
+    (crate::hle::libs::videoout::QUEUED_FLIP.load(std::sync::atomic::Ordering::Relaxed) + 1) as u32
+}
 /// Command buffer submissions received (DCB/ACB).
 pub static SUBMITS: AtomicU64 = AtomicU64::new(0);
 /// Debug: dump GPU-visible images at the next flip (control `dump`).
@@ -3761,6 +3773,9 @@ pub fn status_ex(with_stacks: bool) -> String {
         s.push_str(&format!("    {hidden}
 "));
     }
+    s.push_str(&streamline::status_line());
+    s.push_str(&framegen::status_line());
+    s.push_str(&latency::status_line());
     s.push_str(&format!(
         "    gpu totals: {} submits, {} packets, {} draws ({} from {} multi-draw packets, {} of them with a GPU-written count; {} indexed indirect draws dropped, their arguments past the index buffer, {} drawn as they read later), {} dispatches, {} EOP interrupts, {} flips, {} label waits latched, {} passed on writes made after their submission, {} on counters past their value, {} passed on promises, {} CP reads waited for another queue{}\n",
         SUBMITS.load(Ordering::Relaxed),

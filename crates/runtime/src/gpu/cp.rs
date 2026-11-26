@@ -7674,6 +7674,11 @@ impl Cp {
                 match r {
                     Ok(ticket) => {
                         self.effect(true, None, Box::new(move || crate::hle::libs::videoout::commit_flip(ticket)));
+                        // Reflex: the frame's GPU work is all recorded (`gpu::latency`; the flip's
+                        // number is the frame's index).
+                        if !self.compute {
+                            crate::gpu::latency::marker(crate::gpu::latency::Marker::RenderSubmitEnd, crate::hle::libs::videoout::QUEUED_FLIP.load(Ordering::Relaxed) as u32);
+                        }
                     }
                     Err(e) => crate::warn!("gpu[{}]: flip of buffer {index} (handle {handle:#x}) failed ({e:#x})", self.name),
                 }

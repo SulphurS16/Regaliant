@@ -77,7 +77,7 @@ pub fn build(app: &mut App) {
         let r = (26, 218, 730, 120);
         app.game.pc = app.put(0, b.label("", r, -1), r) as usize;
         let r = (16, 360, 748, 40);
-        app.game.safe = app.put(0, b.check("Start in safe mode once: default settings for that session, in a window, without an upscaler. Use it when the game does not start.", r, ID_SAFE), r) as usize;
+        app.game.safe = app.put(0, b.check("Start in safe mode once: default settings for that session, in a window, without an upscaler, Frame Generation or Reflex. Use it when the game does not start.", r, ID_SAFE), r) as usize;
         ui::set_check(h(app.game.safe), app.launch.safe_mode);
         // (Also in the launcher's log: what the player was told about this PC, in bug reports and
         // the small-card tests.)

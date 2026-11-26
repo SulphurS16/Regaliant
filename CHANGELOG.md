@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- NVIDIA DLSS Frame Generation (SETTINGS > PC > Graphics & Display): 2x up to 6x, as far as
+  the GPU allows. It uses the game's own depth and motion vectors and the picture without the
+  menus and HUD, and it works in SDR and HDR (10-bit HDR10). It needs your own
+  'nvngx_dlssg.dll' in the 'upscalers' folder ([more](docs/settings.md#dlss-frame-generation-and-nvidia-reflex)).
+- NVIDIA Reflex Low Latency: Off, On (the default) or On + Boost, with or without Frame
+  Generation. Frame Generation always runs with at least On.
+- Borderless fullscreen now presents straight to the screen (independent flip) instead of
+  through the desktop compositor. On screens without G-SYNC, windowed and borderless modes no
+  longer wait for the screen's refresh (mailbox).
+- DLSS (upscaling) now shares its NVIDIA Streamline setup with Frame Generation and Reflex.
+
 ## 0.1.7
 
 - Fixed the crash with Aspect Ratio 21:9 or 32:9 and Visual Mode Cinematic, also at every

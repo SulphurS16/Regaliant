@@ -86,10 +86,13 @@ foreach ($f in $programs.Keys) {
   if ((Get-FileHash $src).Hash -ne (Get-FileHash (Join-Path $out $f)).Hash) { Write-Host "$f was not copied whole"; exit 1 }
 }
 # The upscalers' libraries and their licenses (an allowlist of names). DLSS itself,
-# nvngx_dlss.dll, is not one of them: it is under NVIDIA's own license, so players add their own.
+# nvngx_dlss.dll, and DLSS Frame Generation's nvngx_dlssg.dll are not among them: they are under
+# NVIDIA's own license, so players add their own. Streamline's Frame Generation and Reflex plugins
+# are (MIT; NvLowLatencyVk.dll under the Reflex SDK license beside it).
 $upNames = @(
   'libxess.dll', 'libxess.license.txt', 'libxess.third-party-programs.txt',
   'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'streamline.license.txt', 'streamline.3rd-party-licenses.md',
+  'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll', 'NvLowLatencyVk.dll', 'reflex.license.txt',
   'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll', 'fidelityfx.license.md'
 )
 if (-not $NoUpscalers) {

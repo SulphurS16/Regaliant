@@ -521,6 +521,11 @@ unsafe fn raw_input(lp: LPARAM) {
 static IME_SWALLOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // Reflex: the flash indicator's left click (`gpu::latency`; the driver shows it where the
+    // player turned it on).
+    if msg == WM_LBUTTONDOWN {
+        crate::gpu::latency::trigger_flash();
+    }
     match msg {
         WM_CLOSE => {
             CLOSED.store(true, Ordering::SeqCst);
@@ -782,6 +787,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             FOCUSED.store(false, Ordering::Relaxed);
             unsafe { update_capture(hwnd) };
+            0
+        }
+        // Reflex's PC Latency ping (a message Streamline sends): the next frame takes it.
+        m if crate::gpu::latency::is_ping(m) => {
+            crate::gpu::latency::ping();
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },

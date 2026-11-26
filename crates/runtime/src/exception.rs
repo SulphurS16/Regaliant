@@ -168,6 +168,27 @@ unsafe fn export_table(base: u64) -> Vec<(u32, String)> {
     }
 }
 
+/// Whether module `name` (holding `addr`) is NVIDIA's: the driver's (nv*), Streamline's (sl.*),
+/// or one under an NVIDIA folder (NGX's models and Streamline's plugin overrides in ProgramData).
+fn nvidia_module(name: &str, addr: u64) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("nv") || n.starts_with("sl.") || module_path(addr).is_some_and(|p| p.to_ascii_lowercase().contains("\\nvidia"))
+}
+
+/// The full path of the module containing `addr`.
+fn module_path(addr: u64) -> Option<String> {
+    use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};
+    unsafe {
+        let mut m = std::ptr::null_mut();
+        if GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, addr as *const u16, &mut m) == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 520];
+        let n = GetModuleFileNameW(m, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        Some(String::from_utf16_lossy(&buf[..n.min(buf.len())]))
+    }
+}
+
 /// The file name of the module containing `addr` ("?" if none).
 fn host_module(addr: u64) -> String {
     use windows_sys::Win32::System::LibraryLoader::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW};
@@ -569,6 +590,19 @@ pub fn install() {
     let h = unsafe { AddVectoredExceptionHandler(1, Some(veh)) };
     unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(unhandled)) };
     crate::info!("vectored exception handler installed: {:?}", h);
+}
+
+/// Our unhandled-exception filter again, where a library loaded since replaced it (Streamline's
+/// and NGX's install their own crash handlers: a fault deep inside them then ended the game with
+/// nothing in its log, the first Frame Generation test of 2026-11-26). Logged when it was taken.
+pub fn reclaim_unhandled_filter(after: &str) {
+    let prev = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(unhandled)) };
+    if let Some(f) = prev
+        && f as usize != unhandled as usize
+    {
+        let who = module_offset(f as usize as u64).map_or_else(|| format!("{:#x}", f as usize), |(m, o)| format!("{m}+{o:#x}"));
+        crate::info!("exception: the unhandled-exception filter taken back from {who} (set during {after})");
+    }
 }
 
 /// Set while `unhandled` reports a fault the vectored handler left to other
@@ -1465,8 +1499,12 @@ unsafe fn veh_body(info: *mut EXCEPTION_POINTERS) -> i32 {
                 // takes it the game ends with no report of ours (DLSS's sessions of 2026-11-25:
                 // only Streamline's minidump). Logged at first chance with our frames, each site
                 // once, eight at most.)
+                // (Streamline's plugins and NGX's libraries too since 2026-11-26: named sl.* in the
+                // upscalers folder, or numbered copies under ProgramData\NVIDIA\NGX that the
+                // NVIDIA app keeps up to date; a fault in them ended the first Frame Generation
+                // test with nothing in the log.)
                 if code == 0xC0000005
-                    && let Some((m, o)) = module_offset(rip).filter(|(m, _)| m.to_ascii_lowercase().starts_with("nv"))
+                    && let Some((m, o)) = module_offset(rip).filter(|(m, _)| nvidia_module(m, rip))
                     && new_driver_fault_site(rip)
                 {
                     let (access, target) = if rec.NumberParameters >= 2 {

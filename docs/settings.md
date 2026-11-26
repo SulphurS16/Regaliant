@@ -22,7 +22,25 @@ The game runs at the same speed at every frame rate. With the 60 limit each fram
 
 NVIDIA's 'nvngx_dlss.dll' is under NVIDIA's own license and not included. Copy your own into the 'upscalers' folder beside 'regaliant.exe' (games with DLSS have it in their installation folder). Then DLSS appears in the Anti-Aliasing list. XeSS, FSR and NVIDIA Streamline ship in the 'upscalers' folder with their licenses, and each is loaded only after its maker's digital signature checks out. DLSS is first tried in a short separate check: if your 'nvngx_dlss.dll' cannot be loaded, the game starts without DLSS and its log says why. It is tried again when the file changes.
 
-NVIDIA and DLSS are trademarks of NVIDIA Corporation. Intel and XeSS are trademarks of Intel Corporation. AMD and FSR are trademarks of Advanced Micro Devices, Inc.
+## DLSS Frame Generation and NVIDIA Reflex
+
+These are in SETTINGS > PC > Graphics & Display.
+
+- **Frame Generation**: Off or DLSS Frame Generation. It needs a GeForce RTX 40 or newer, a recent driver, Windows' Hardware-accelerated GPU scheduling turned on, and NVIDIA's 'nvngx_dlssg.dll'. Like 'nvngx_dlss.dll', that file is not included: copy your own into the 'upscalers' folder (games with DLSS Frame Generation have it in their installation folder). Without it the list shows only Off, and the log says why.
+- **Frame Generation Mode**: how many frames are shown for each frame the game renders. The list goes from 2x up to what your GPU can do: 2x on RTX 40, up to 6x on RTX 50 with a recent Frame Generation file. The game itself still renders 60 frames a second, so with 3x you see 180.
+- Frame Generation uses the game's own depth and motion vectors, the same ones DLSS gets. It also uses the picture without the menus and HUD, so text and markers do not smear. It works with any Anti-Aliasing choice.
+- In HDR the generated frames are made from the 10-bit HDR10 picture the screen gets. Highlights are not clipped and there is no extra banding.
+- Frame Generation uses the newest full model in your 'nvngx_dlssg.dll'. Neither DLSS nor Streamline lets a game pick another model. The NVIDIA App's DLSS override can still change it for the game, and that choice is honored.
+- **NVIDIA Reflex Low Latency**: Off, On (the default) or On + Boost. It lowers the delay between your input and the screen on GeForce GPUs, with or without Frame Generation. NVIDIA requires Reflex with Frame Generation, so while Frame Generation is on, Off counts as On. On + Boost also keeps the GPU's clocks up, which can lower latency a little more when the game is limited by the CPU.
+- For the smoothest picture with Frame Generation, turn on G-SYNC in the NVIDIA Control Panel and play in borderless or exclusive fullscreen. With Frame Generation the game always presents without V-Sync. To avoid tearing above the screen's refresh rate, turn on V-Sync for the game in the NVIDIA Control Panel, not in the game. Frame Generation then keeps the frame rate under the refresh rate.
+
+### Window modes and presentation
+
+- Borderless fullscreen hands its frames straight to the screen (independent flip), like exclusive fullscreen, so the desktop compositor adds no latency. G-SYNC and FreeSync work there too.
+- Exclusive fullscreen works as before.
+- Without G-SYNC, in a window or in borderless mode, the game presents new frames as soon as they are ready and drops none of them early (mailbox). The game's own pacing keeps the frame rate even. With G-SYNC or FreeSync it waits for the screen as before, so the screen follows the game's frames.
+
+NVIDIA, DLSS, G-SYNC and Reflex are trademarks of NVIDIA Corporation. Intel and XeSS are trademarks of Intel Corporation. AMD and FSR are trademarks of Advanced Micro Devices, Inc.
 
 ## Saves and files
 

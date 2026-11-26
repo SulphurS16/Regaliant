@@ -1,5 +1,25 @@
 //! Swapchain presentation: blits a rendered image (or uploaded pixels) to the window.
 //!
+//! The swapchain: made through NVIDIA Streamline's entry points once it is ready
+//! (`gpu::streamline::proxies`; its surface too), so that its plugins see the presentation they
+//! hook: DLSS Frame Generation's own swapchain and pacing, Reflex's latency mode, sl.common's
+//! per-frame bookkeeping; through the driver before that and without Streamline. Its present
+//! mode (`choose_present_mode`): with frame generation IMMEDIATE (DLSS-G paces its frames itself
+//! and does not support an application's VSync on Vulkan: tear-free output is G-SYNC with the
+//! NVIDIA Control Panel's V-Sync, as NVIDIA advises); in exclusive fullscreen FIFO; in a window or
+//! borderless fullscreen FIFO where the screen can refresh at a variable rate (G-SYNC or
+//! FreeSync with V-Sync and the frame limit below the refresh rate, the combination their makers
+//! advise), MAILBOX where the NVIDIA driver says it cannot (no tearing, nothing queued behind the
+//! display: the port's own pacing decides when a frame is shown). On NVIDIA's drivers a Vulkan
+//! swapchain is a DXGI flip-model one ("Vulkan/OpenGL present method: Prefer layered on DXGI
+//! Swapchain", the default's choice), so borderless fullscreen gets independent flip, without the
+//! desktop compositor's extra frame. `DS_PRESENT_MODE=fifo|mailbox|immediate` decides instead.
+//!
+//! With frame generation the frame's HUD-less picture and interface coverage are made beside it
+//! at the swapchain's size (`gpu::framegen::capture`), the frame goes to the second queue of the
+//! graphics family (DLSS-G blocks the presenting queue while it works, and the game's work need
+//! not wait behind it), and Reflex's present markers bracket the present (`gpu::latency`).
+//!
 //! The frame keeps its aspect (centred, black bars where the window's aspect
 //! differs by 1% or more). A frame more than twice the window's size is first
 //! halved by 2:1 linear blits (2x2 box filters) until the last blit reduces by
@@ -55,8 +75,21 @@ struct Presenter {
     watch_failed: bool,
     /// The system text box drawn over the frame (`crate::textbox`), made on first use.
     text_box: Option<TextBox>,
-    /// The last present's id on this swapchain (`DS_PRESENT_STATS=1`: `waiter`).
+    /// The last present's id on this swapchain (`DS_PRESENT_STATS=1`: `waiter`; Reflex's
+    /// latency markers name presents by it: the frame's index).
     present_id: u64,
+    /// The surface and swapchain came from Streamline's entry points (`gpu::streamline`).
+    sl: Option<&'static crate::gpu::streamline::Proxies>,
+    /// The swapchain was made with DLSS Frame Generation loaded.
+    fg: bool,
+    /// Frame generation's HUD-less picture and interface coverage at the swapchain's size.
+    fg_res: Option<crate::gpu::framegen::capture::Present>,
+    fg_res_failed: bool,
+    /// The sharpening of the HUD-less picture (the frame's own pass, `sharpen`, beside it).
+    sharpen_fg: Option<super::sharpen::Sharpen>,
+    /// The present mode in use and what decided it (`mode_key`).
+    mode: vk::PresentModeKHR,
+    mode_key: (bool, bool, Option<bool>),
 }
 
 /// On-screen frame times (`DS_PRESENT_STATS=1`): each present's id goes to a thread that waits
@@ -203,17 +236,17 @@ impl TextBox {
 
 /// Draws the system text box (the character's name: `hle::libs::ime_dialog`) over the frame in
 /// `dst` (TRANSFER_DST_OPTIMAL), centred across the picture at 38% of its height.
-unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, dst: vk::Image, picture: (u32, u32, u32, u32)) {
+unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, dst: vk::Image, picture: (u32, u32, u32, u32)) -> Option<(u32, u32, u32, u32)> {
     // A size whose image or staging buffers could not be made, and when: tried again after 2 s,
     // not every frame.
     static FAILED: Mutex<Option<((u32, u32), std::time::Instant)>> = Mutex::new(None);
     // (The text entry's box, or the save list's: `hle::libs::savedata`.)
-    let Some((generation, content)) = crate::hle::libs::ime_dialog::overlay().or_else(crate::hle::libs::savedata::overlay) else { return };
+    let (generation, content) = crate::hle::libs::ime_dialog::overlay().or_else(crate::hle::libs::savedata::overlay)?;
     let c = ctx();
     let (rx, ry, rw, rh) = picture;
     let (w, h) = crate::textbox::size_for(rh, &content);
     if w > rw || h > rh || FAILED.lock().is_some_and(|(s, at)| s == (w, h) && at.elapsed() < std::time::Duration::from_secs(2)) {
-        return;
+        return None;
     }
     let failed = || {
         if FAILED.lock().replace(((w, h), std::time::Instant::now())).is_none_or(|(s, _)| s != (w, h)) {
@@ -239,18 +272,18 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
                 .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC);
             let Ok(image) = c.device.create_image(&ici, None) else {
                 failed();
-                return;
+                return None;
             };
             let Ok(memory) = c.alloc(c.device.get_image_memory_requirements(image), vk::MemoryPropertyFlags::DEVICE_LOCAL) else {
                 c.device.destroy_image(image, None);
                 failed();
-                return;
+                return None;
             };
             if c.device.bind_image_memory(image, memory, 0).is_err() {
                 c.device.destroy_image(image, None);
                 c.device.free_memory(memory, None);
                 failed();
-                return;
+                return None;
             }
             let mut staging = Vec::new();
             for _ in 0..FRAMES {
@@ -260,7 +293,7 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
                         crate::warn!("text box: no staging buffer ({e})");
                         TextBox { image, memory, w, h, staging, key: None }.destroy();
                         failed();
-                        return;
+                        return None;
                     }
                 }
             }
@@ -307,6 +340,7 @@ unsafe fn draw_text_box(p: &mut Presenter, cmd: vk::CommandBuffer, slot: usize, 
         let x = rx + (rw - w) / 2;
         let y = (ry + rh * 38 / 100).saturating_sub(h / 2).max(ry);
         blit(c, cmd, t.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, (0, 0, w, h), dst, (x, y, w, h));
+        Some((x, y, w, h))
     }
 }
 
@@ -338,8 +372,158 @@ pub enum Source {
     Pixels { data: Vec<u8>, width: u32, height: u32 },
 }
 
+/// The presentation's functions: the driver's, or Streamline's entry points once the surface
+/// came from them (`Presenter::sl`).
+unsafe fn sc_create(p: &Presenter, sci: &vk::SwapchainCreateInfoKHR) -> Result<vk::SwapchainKHR, vk::Result> {
+    let c = ctx();
+    match p.sl {
+        Some(s) => {
+            let mut sc = vk::SwapchainKHR::null();
+            let r = unsafe { (s.create_swapchain)(c.device.handle(), sci, std::ptr::null(), &mut sc) };
+            if r == vk::Result::SUCCESS { Ok(sc) } else { Err(r) }
+        }
+        None => unsafe { c.swapchain_d.create_swapchain(sci, None) },
+    }
+}
+
+unsafe fn sc_destroy(p: &Presenter, sc: vk::SwapchainKHR) {
+    let c = ctx();
+    match p.sl {
+        Some(s) => unsafe { (s.destroy_swapchain)(c.device.handle(), sc, std::ptr::null()) },
+        None => unsafe { c.swapchain_d.destroy_swapchain(sc, None) },
+    }
+}
+
+unsafe fn sc_images(p: &Presenter, sc: vk::SwapchainKHR) -> Result<Vec<vk::Image>, vk::Result> {
+    let c = ctx();
+    match p.sl {
+        Some(s) => unsafe {
+            let mut n = 0u32;
+            let r = (s.get_images)(c.device.handle(), sc, &mut n, std::ptr::null_mut());
+            if r != vk::Result::SUCCESS {
+                return Err(r);
+            }
+            let mut v = vec![vk::Image::null(); n as usize];
+            let r = (s.get_images)(c.device.handle(), sc, &mut n, v.as_mut_ptr());
+            if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+                return Err(r);
+            }
+            v.truncate(n as usize);
+            Ok(v)
+        },
+        None => unsafe { c.swapchain_d.get_swapchain_images(sc) },
+    }
+}
+
+/// vkAcquireNextImageKHR: the image and whether the swapchain is suboptimal.
+unsafe fn sc_acquire(p: &Presenter, sem: vk::Semaphore) -> Result<(u32, bool), vk::Result> {
+    let c = ctx();
+    match p.sl {
+        Some(s) => {
+            let mut i = 0u32;
+            match unsafe { (s.acquire)(c.device.handle(), p.swapchain, u64::MAX, sem, vk::Fence::null(), &mut i) } {
+                vk::Result::SUCCESS => Ok((i, false)),
+                vk::Result::SUBOPTIMAL_KHR => Ok((i, true)),
+                e => Err(e),
+            }
+        }
+        None => unsafe { c.swapchain_d.acquire_next_image(p.swapchain, u64::MAX, sem, vk::Fence::null()) },
+    }
+}
+
+/// vkQueuePresentKHR: whether the swapchain is suboptimal.
+unsafe fn sc_present(p: &Presenter, q: vk::Queue, pi: &vk::PresentInfoKHR) -> Result<bool, vk::Result> {
+    let c = ctx();
+    match p.sl {
+        Some(s) => {
+            let r = unsafe { (s.present)(q, pi) };
+            crate::gpu::upscale::note_sl_present();
+            match r {
+                vk::Result::SUCCESS => Ok(false),
+                vk::Result::SUBOPTIMAL_KHR => Ok(true),
+                e => Err(e),
+            }
+        }
+        None => unsafe { c.swapchain_d.queue_present(q, pi) },
+    }
+}
+
+/// What decides the present mode: frame generation, exclusive fullscreen, and whether the NVIDIA
+/// driver says the screen can refresh at a variable rate (None: no answer).
+fn mode_key(fg: bool) -> (bool, bool, Option<bool>) {
+    (fg, window::exclusive_wanted().is_some() && ctx().fse.is_some(), crate::vrr::driver_possible())
+}
+
+/// The present mode for the swapchain (`modes`: the surface's), and why.
+fn choose_present_mode(modes: &[vk::PresentModeKHR], key: (bool, bool, Option<bool>)) -> (vk::PresentModeKHR, &'static str) {
+    let has = |m: vk::PresentModeKHR| modes.contains(&m);
+    let forced = std::env::var("DS_PRESENT_MODE").ok().and_then(|v| match v.trim() {
+        "fifo" => Some(vk::PresentModeKHR::FIFO),
+        "mailbox" => Some(vk::PresentModeKHR::MAILBOX),
+        "immediate" => Some(vk::PresentModeKHR::IMMEDIATE),
+        _ => None,
+    });
+    if let Some(m) = forced.filter(|&m| has(m)) {
+        return (m, "DS_PRESENT_MODE");
+    }
+    let (fg, exclusive, vrr) = key;
+    if fg {
+        for m in [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX] {
+            if has(m) {
+                return (m, "frame generation: DLSS-G paces its frames itself (tear-free with G-SYNC and the NVIDIA Control Panel's V-Sync)");
+            }
+        }
+        return (vk::PresentModeKHR::FIFO, "frame generation, and the surface offers only FIFO");
+    }
+    if exclusive {
+        return (vk::PresentModeKHR::FIFO, "exclusive fullscreen: V-Sync on the display's grid");
+    }
+    if vrr == Some(false) && has(vk::PresentModeKHR::MAILBOX) {
+        return (vk::PresentModeKHR::MAILBOX, "no variable refresh on this screen (the NVIDIA driver): the newest frame at each refresh, nothing queued, no tearing");
+    }
+    (vk::PresentModeKHR::FIFO, if vrr == Some(true) { "variable refresh possible: V-Sync with the frame limit, as G-SYNC wants" } else { "V-Sync (no driver answer on variable refresh: FreeSync and G-SYNC keep working)" })
+}
+
+/// Streamline is ready: the window's surface and swapchain are made again through its entry
+/// points (the driver's go first).
+unsafe fn switch_to_streamline(p: &mut Presenter, s: &'static crate::gpu::streamline::Proxies) -> Result<(), String> {
+    let c = ctx();
+    let w = window::get().ok_or("no window")?;
+    unsafe {
+        c.device.wait_for_fences(&p.fences, true, u64::MAX).ok();
+        {
+            let q = c.queue.lock();
+            c.device.queue_wait_idle(*q).ok();
+        }
+        if p.swapchain != vk::SwapchainKHR::null() {
+            let _pw = PW_LOCK.lock();
+            PW_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sc_destroy(p, p.swapchain);
+            p.swapchain = vk::SwapchainKHR::null();
+            for sem in p.done.drain(..) {
+                c.device.destroy_semaphore(sem, None);
+            }
+        }
+        c.surface_i.destroy_surface(p.surface, None);
+        p.surface = vk::SurfaceKHR::null();
+        let sci = vk::Win32SurfaceCreateInfoKHR::default().hinstance(w.hinstance).hwnd(w.hwnd);
+        let mut surface = vk::SurfaceKHR::null();
+        let r = (s.create_surface)(c.instance.handle(), &sci, std::ptr::null(), &mut surface);
+        if r != vk::Result::SUCCESS {
+            // (Back to the driver's surface: the game keeps its window.)
+            p.surface = c.win32_i.create_win32_surface(&sci, None).map_err(|e| format!("create surface: {e}"))?;
+            return Err(format!("Streamline's vkCreateWin32SurfaceKHR failed ({r:?})"));
+        }
+        p.surface = surface;
+        p.sl = Some(s);
+        crate::info!("present: the window's surface and swapchain through Streamline from now on");
+        create_swapchain(p)
+    }
+}
+
 unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
     let c = ctx();
+    let fg = p.sl.is_some() && crate::gpu::framegen::dlssg::wants_swapchain();
     unsafe {
         let caps = c.surface_i.get_physical_device_surface_capabilities(c.pdev, p.surface).map_err(|e| format!("surface caps: {e}"))?;
         let formats = c.surface_i.get_physical_device_surface_formats(c.pdev, p.surface).map_err(|e| format!("surface formats: {e}"))?;
@@ -359,12 +543,12 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         // fullscreen); `DS_PRESENT_10BIT=1` keeps 10-bit SDR (diagnosis). HDR10 is 10-bit.
         let srgb_space = |f: &&vk::SurfaceFormatKHR| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
         // The title's HDR output (PQ-encoded BT.2020 in 10:10:10:2 display buffers) goes to an
-        // HDR10 swapchain as it is, where the display offers one.
+        // HDR10 swapchain as it is, where the display offers one: A2B10G10R10 first (DLSS Frame
+        // Generation's HDR10 format; it takes no FP16 scRGB), then A2R10G10B10.
         let hdr10 = p.want_hdr && c.colorspaces;
-        let hdr_fmt = formats
-            .iter()
-            .find(|f| hdr10 && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT && matches!(f.format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32))
-            .copied();
+        let hdr_fmt = [vk::Format::A2B10G10R10_UNORM_PACK32, vk::Format::A2R10G10B10_UNORM_PACK32]
+            .into_iter()
+            .find_map(|want| formats.iter().find(|f| hdr10 && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT && f.format == want).copied());
         if p.want_hdr && hdr_fmt.is_none() {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| crate::warn!("present: the frames are HDR but the display offers no HDR10 format: shown as SDR values"));
@@ -398,11 +582,47 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             }
         }
         let count = (caps.min_image_count + 1).min(if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count });
-        let old = p.swapchain;
         // Exclusive fullscreen: held by the swapchain when the window asks for it (the PC tab's
         // Fullscreen), and never taken by the driver on its own for a window or borderless
         // fullscreen (a driver may change a display's mode for a window that covers it).
         let exclusive = if c.fse.is_some() { window::exclusive_wanted() } else { None };
+        let key = mode_key(fg);
+        let modes = c.surface_i.get_physical_device_surface_present_modes(c.pdev, p.surface).unwrap_or_default();
+        let (mode, why) = choose_present_mode(&modes, key);
+        // Frame generation off before its swapchain changes (DLSS-G's guide 12.0).
+        crate::gpu::framegen::dlssg::swapchain_destroying();
+        let mut old = p.swapchain;
+        // Through Streamline the old swapchain goes before the new one is made (as the guide's
+        // swapchain changes do: DLSS-G keeps its own swapchain behind the one it hands out).
+        if old != vk::SwapchainKHR::null() && p.sl.is_some() {
+            c.device.wait_for_fences(&p.fences, true, u64::MAX).ok();
+            {
+                let q = c.queue.lock();
+                c.device.queue_wait_idle(*q).ok();
+            }
+            if let Some(pq) = c.present_queue.as_ref() {
+                let q = pq.lock();
+                c.device.queue_wait_idle(*q).ok();
+            }
+            let _pw = PW_LOCK.lock();
+            PW_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sc_destroy(p, old);
+            p.swapchain = vk::SwapchainKHR::null();
+            for s in p.done.drain(..) {
+                c.device.destroy_semaphore(s, None);
+            }
+            old = vk::SwapchainKHR::null();
+        }
+        // DLSS-G loaded for the new swapchain, or unhooked (its resources freed). (Logged and
+        // written out first when that changes: the steps where NVIDIA's libraries do the most.)
+        let fg_changes = fg != p.fg;
+        if p.sl.is_some() {
+            if fg_changes {
+                crate::info!("present: a new swapchain {} DLSS Frame Generation ({mode:?})", if fg { "with" } else { "without" });
+                crate::log::flush();
+            }
+            crate::gpu::framegen::dlssg::swapchain_loading(fg);
+        }
         let mut fse_info = vk::SurfaceFullScreenExclusiveInfoEXT::default().full_screen_exclusive(if exclusive.is_some() {
             vk::FullScreenExclusiveEXT::APPLICATION_CONTROLLED
         } else {
@@ -420,7 +640,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(mode)
             .clipped(true)
             .old_swapchain(old);
         if c.fse.is_some() {
@@ -429,7 +649,12 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
                 sci = sci.push_next(&mut fse_win);
             }
         }
-        let sc = c.swapchain_d.create_swapchain(&sci, None).map_err(|e| format!("create swapchain: {e}"))?;
+        let sc = sc_create(p, &sci).map_err(|e| format!("create swapchain: {e}"))?;
+        if p.sl.is_some() && fg_changes {
+            crate::exception::reclaim_unhandled_filter("Streamline's vkCreateSwapchainKHR");
+            crate::info!("present: the swapchain made through Streamline");
+            crate::log::flush();
+        }
         if old != vk::SwapchainKHR::null() {
             // The old swapchain's images are only the presenter's: its frames done and the queue
             // idle under the queue's lock (a device-wide idle wait touches the queue while the
@@ -442,7 +667,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             // (No present wait on it meanwhile, and none after: `present_waiter`.)
             let _pw = PW_LOCK.lock();
             PW_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            c.swapchain_d.destroy_swapchain(old, None);
+            sc_destroy(p, old);
             for s in p.done.drain(..) {
                 c.device.destroy_semaphore(s, None);
             }
@@ -467,7 +692,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
                 m.set_hdr_metadata(&[sc], &[md]);
             }
         }
-        p.images = c.swapchain_d.get_swapchain_images(sc).map_err(|e| format!("swapchain images: {e}"))?;
+        p.images = sc_images(p, sc).map_err(|e| format!("swapchain images: {e}"))?;
         p.format = fmt.format;
         p.extent = extent;
         for _ in 0..p.images.len() {
@@ -480,14 +705,23 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
                 Err(e) => crate::warn!("present: exclusive fullscreen not acquired ({e}): shown as borderless"),
             }
         }
+        p.fg = fg;
+        p.mode = mode;
+        p.mode_key = key;
+        if p.sl.is_some() {
+            crate::gpu::framegen::dlssg::swapchain_created(fg, (extent.width, extent.height), fmt.format, p.images.len() as u32);
+            crate::gpu::latency::swapchain_created();
+        }
         crate::info!(
-            "swapchain {}x{} {:?} {:?} ({} images{})",
+            "swapchain {}x{} {:?} {:?} ({} images{}, {mode:?}: {why}{}{})",
             extent.width,
             extent.height,
             fmt.format,
             fmt.color_space,
             p.images.len(),
-            if p.exclusive.is_some() { ", exclusive fullscreen" } else { "" }
+            if p.exclusive.is_some() { ", exclusive fullscreen" } else { "" },
+            if p.sl.is_some() { "; through Streamline" } else { "" },
+            if fg { ", DLSS Frame Generation" } else { "" }
         );
     }
     Ok(())
@@ -701,9 +935,9 @@ fn hidden_present_once() {
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&signal).swapchains(&scs).image_indices(&idxs);
         let q = pq.lock();
         if c.device.queue_submit(*q, &[si], h.fences[f]).is_ok() {
-            // (Through Streamline's present once DLSS runs, as a window's: it needs to see every
-            // frame's present, `upscale::note_sl_present`.)
-            match crate::gpu::upscale::present_hook() {
+            // (Through Streamline's present once it is ready, as a window's: its per-frame
+            // bookkeeping needs to see every frame's present, `upscale::note_sl_present`.)
+            match crate::gpu::streamline::proxies().map(|s| s.present) {
                 Some(p) => {
                     let _ = p(*q, &pi);
                     crate::gpu::upscale::note_sl_present();
@@ -772,6 +1006,13 @@ pub fn init(title: &str) -> Result<(), String> {
             watch_failed: false,
             text_box: None,
             present_id: 0,
+            sl: None,
+            fg: false,
+            fg_res: None,
+            fg_res_failed: false,
+            sharpen_fg: None,
+            mode: vk::PresentModeKHR::FIFO,
+            mode_key: (false, false, None),
         };
         super::framewatch::init_from_env();
         create_swapchain(&mut p)?;
@@ -796,8 +1037,159 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
     }
 }
 
-/// Presents one frame. Returns false if presentation is not possible (minimized).
-pub fn present(src: Source) -> bool {
+/// The frame `src` (`from`, in `src_layout`, `src_format`, `sw`x`sh`) into rectangle `rect` of
+/// `dst` (TRANSFER_DST_OPTIMAL): halved by 2:1 blits while more than twice the rectangle's size,
+/// the PC settings' sharpening, the last blit. The HUD-less picture of frame generation goes the
+/// same way (`hudless`: its own sharpening images), so that the two match pixel for pixel.
+/// Returns the image, layout and size the last blit read (the frame watch's copy).
+#[allow(clippy::too_many_arguments)]
+unsafe fn compose(p: &mut Presenter, cmd: vk::CommandBuffer, f: usize, src: vk::Image, src_layout: vk::ImageLayout, src_format: vk::Format, sw: u32, sh: u32, dst: vk::Image, rect: (u32, u32, u32, u32), hudless: bool) -> (vk::Image, vk::ImageLayout, u32, u32, usize) {
+    let c = ctx();
+    let (rx, ry, rw, rh) = rect;
+    let fitted = crate::gpu::tune::present_fit();
+    // Halvings while the frame is more than twice the destination's size.
+    let (mut from, mut from_layout, mut fw, mut fh) = (src, src_layout, sw, sh);
+    let mut level = 0;
+    while fitted && (fw > 2 * rw || fh > 2 * rh) {
+        let (hw, hh) = (fw.div_ceil(2), fh.div_ceil(2));
+        let half = match unsafe { half_image(p, f, level, src_format, hw, hh) } {
+            Ok(h) => h,
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::warn!("present: no {hw}x{hh} halving image ({e}): one blit"));
+                break;
+            }
+        };
+        barrier(c, cmd, half, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        blit(c, cmd, from, from_layout, (0, 0, fw, fh), half, (0, 0, hw, hh));
+        barrier(c, cmd, half, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        (from, from_layout, fw, fh) = (half, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, hw, hh);
+        level += 1;
+    }
+    // The PC settings' sharpening: the frame blitted at its shown size, sharpened, blitted
+    // to the window.
+    let amount = super::sharpen::amount();
+    let mut sharpened = false;
+    if amount > 0.0 && !p.sharpen_failed {
+        let slot = if hudless { &mut p.sharpen_fg } else { &mut p.sharpen };
+        if slot.is_none() {
+            match unsafe { super::sharpen::Sharpen::new() } {
+                Ok(s) => *slot = Some(s),
+                Err(e) => {
+                    crate::warn!("present: no sharpening ({e})");
+                    p.sharpen_failed = true;
+                }
+            }
+        }
+        let fences: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != f).map(|(_, &x)| x).collect();
+        let slot = if hudless { &mut p.sharpen_fg } else { &mut p.sharpen };
+        if let Some(s) = slot.as_mut() {
+            match unsafe {
+                s.ensure(rw, rh, || {
+                    c.device.wait_for_fences(&fences, true, u64::MAX).ok();
+                })
+            } {
+                Ok((a, b, fresh)) => {
+                    s.begin(cmd, fresh);
+                    blit_to(c, cmd, from, from_layout, (0, 0, fw, fh), a, vk::ImageLayout::GENERAL, (0, 0, rw, rh));
+                    s.record(cmd, amount);
+                    blit(c, cmd, b, vk::ImageLayout::GENERAL, (0, 0, rw, rh), dst, (rx, ry, rw, rh));
+                    sharpened = true;
+                }
+                Err(e) => {
+                    crate::warn!("present: no sharpening images ({e})");
+                    p.sharpen_failed = true;
+                }
+            }
+        }
+    }
+    if !sharpened {
+        blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
+    }
+    (from, from_layout, fw, fh, level)
+}
+
+/// Frame generation's inputs of the present (`gpu::framegen`): the frame's HUD-less picture
+/// scaled and placed as the frame itself and its interface coverage, both at the swapchain's
+/// size, tagged with the picture's place for frame `frame` (recorded into `cmd` before the
+/// swapchain image's last barrier).
+#[allow(clippy::too_many_arguments)]
+unsafe fn frame_generation_inputs(p: &mut Presenter, cmd: vk::CommandBuffer, f: usize, frame: u32, src_img: vk::Image, rect: (u32, u32, u32, u32), text_box: Option<(u32, u32, u32, u32)>) {
+    use crate::gpu::framegen::{capture, dlssg};
+    let c = ctx();
+    let full = (p.extent.width, p.extent.height);
+    let taken = capture::for_present(frame, src_img);
+    let mut hudless = None;
+    let mut ui = None;
+    if let Some(t) = taken {
+        if p.fg_res.is_none() && !p.fg_res_failed {
+            match unsafe { capture::Present::new(FRAMES) } {
+                Ok(r) => p.fg_res = Some(r),
+                Err(e) => {
+                    crate::warn!("frame generation: no HUD-less images ({e})");
+                    p.fg_res_failed = true;
+                }
+            }
+        }
+        let fences: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != f).map(|(_, &x)| x).collect();
+        let (format, w, h) = (p.format, p.extent.width, p.extent.height);
+        let ok = match p.fg_res.as_mut() {
+            Some(r) => match unsafe {
+                r.ensure(FRAMES, format, w, h, || {
+                    c.device.wait_for_fences(&fences, true, u64::MAX).ok();
+                })
+            } {
+                Ok(()) => true,
+                Err(e) => {
+                    crate::warn!("frame generation: no HUD-less images of {w}x{h} ({e})");
+                    p.fg_res = None;
+                    p.fg_res_failed = true;
+                    false
+                }
+            },
+            None => false,
+        };
+        if ok {
+            let dst = p.fg_res.as_ref().unwrap().hudless(f);
+            barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            // (Black bars where the frame's shape differs from the window's, as the frame's own.)
+            if (rect.2, rect.3) != full {
+                let black = vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] };
+                let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+                unsafe { c.device.cmd_clear_color_image(cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &black, &[range]) };
+                barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            }
+            unsafe { compose(p, cmd, f, t.hudless, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, t.format, t.w, t.h, dst, rect, true) };
+            let r = p.fg_res.as_mut().unwrap();
+            r.hudless_done(cmd, f);
+            if let Some(view) = t.ui {
+                unsafe { r.record_ui(cmd, f, view, t.w, t.h, rect, text_box) };
+            }
+            let (h_res, u_res) = r.resources(f);
+            hudless = Some(h_res);
+            ui = t.ui.map(|_| u_res);
+        }
+    }
+    dlssg::tag_present(frame, cmd, rect, full, hudless, ui);
+}
+
+/// Submits `cmd` to `queue` (the second queue of the graphics family, frame generation's
+/// presenting queue), as `Ctx::submit` does to the main queue.
+unsafe fn submit_to(queue: &Mutex<vk::Queue>, cmd: vk::CommandBuffer, wait: (vk::Semaphore, vk::PipelineStageFlags), signal: vk::Semaphore, fence: vk::Fence) -> Result<(), String> {
+    let c = ctx();
+    let cmds = [cmd];
+    let waits = [wait.0];
+    let stages = [wait.1];
+    let signals = [signal];
+    let si = vk::SubmitInfo::default().command_buffers(&cmds).wait_semaphores(&waits).wait_dst_stage_mask(&stages).signal_semaphores(&signals);
+    let q = queue.lock();
+    unsafe { c.device.queue_submit(*q, &[si], fence) }.map_err(|e| format!("present submit: {e}"))
+}
+
+/// Presents one frame: `frame` is its index (the number of the flip that shows it; None for
+/// pixels shown before the GPU renders). Returns false if presentation is not possible
+/// (minimized).
+pub fn present(src: Source, frame: Option<u32>) -> bool {
     let c = ctx();
     let mut g = PRESENTER.lock();
     let Some(p) = g.as_mut() else {
@@ -823,19 +1215,39 @@ pub fn present(src: Source) -> bool {
         if window::exclusive_wanted() != p.exclusive && c.fse.is_some() {
             window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        // Streamline ready: the surface and swapchain through its entry points from now on.
+        if p.sl.is_none() {
+            if let Some(s) = crate::gpu::streamline::proxies() {
+                static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    if let Err(e) = switch_to_streamline(p, s) {
+                        crate::warn!("present: the swapchain stays the driver's ({e}): no DLSS Frame Generation or Reflex low latency");
+                        window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        // Frame generation chosen or not, or what decides the present mode changed: a new
+        // swapchain (DLSS-G's guide 18.0: no overhead while it is off).
+        let want_fg = p.sl.is_some() && crate::gpu::framegen::dlssg::wants_swapchain();
+        if p.swapchain == vk::SwapchainKHR::null() || want_fg != p.fg || mode_key(want_fg) != p.mode_key {
+            window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if window::RESIZED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             if let Err(e) = create_swapchain(p) {
                 crate::debug!("swapchain recreate: {e}");
                 return false;
             }
         }
+        // Frame generation for this frame (on with the frame's inputs: `framegen::dlssg`).
+        let fg_on = p.fg && matches!(src, Source::Image { .. }) && frame.is_some_and(crate::gpu::framegen::dlssg::present_frame);
         let f = p.frame % FRAMES;
         p.frame += 1;
         c.device.wait_for_fences(&[p.fences[f]], true, u64::MAX).ok();
         if let Some(w) = p.watch.as_mut() {
             w.collect(f);
         }
-        let (idx, _) = match c.swapchain_d.acquire_next_image(p.swapchain, u64::MAX, p.acquire[f], vk::Fence::null()) {
+        let (idx, _) = match sc_acquire(p, p.acquire[f]) {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                 window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -878,61 +1290,7 @@ pub fn present(src: Source) -> bool {
             c.device.cmd_clear_color_image(cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &black, &[range]);
             barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         }
-        // Halvings while the frame is more than twice the destination's size.
-        let (mut from, mut from_layout, mut fw, mut fh) = (src_img, blit_layout, sw, sh);
-        let mut level = 0;
-        while fitted && (fw > 2 * rw || fh > 2 * rh) {
-            let (hw, hh) = (fw.div_ceil(2), fh.div_ceil(2));
-            let half = match half_image(p, f, level, src_format, hw, hh) {
-                Ok(h) => h,
-                Err(e) => {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| crate::warn!("present: no {hw}x{hh} halving image ({e}): one blit"));
-                    break;
-                }
-            };
-            barrier(c, cmd, half, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-            blit(c, cmd, from, from_layout, (0, 0, fw, fh), half, (0, 0, hw, hh));
-            barrier(c, cmd, half, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-            (from, from_layout, fw, fh) = (half, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, hw, hh);
-            level += 1;
-        }
-        // The PC settings' sharpening: the frame blitted at its shown size, sharpened, blitted
-        // to the window.
-        let amount = super::sharpen::amount();
-        let mut sharpened = false;
-        if amount > 0.0 && !p.sharpen_failed {
-            if p.sharpen.is_none() {
-                match super::sharpen::Sharpen::new() {
-                    Ok(s) => p.sharpen = Some(s),
-                    Err(e) => {
-                        crate::warn!("present: no sharpening ({e})");
-                        p.sharpen_failed = true;
-                    }
-                }
-            }
-            let fences: Vec<vk::Fence> = p.fences.iter().enumerate().filter(|&(i, _)| i != f).map(|(_, &x)| x).collect();
-            if let Some(s) = p.sharpen.as_mut() {
-                match s.ensure(rw, rh, || {
-                    c.device.wait_for_fences(&fences, true, u64::MAX).ok();
-                }) {
-                    Ok((a, b, fresh)) => {
-                        s.begin(cmd, fresh);
-                        blit_to(c, cmd, from, from_layout, (0, 0, fw, fh), a, vk::ImageLayout::GENERAL, (0, 0, rw, rh));
-                        s.record(cmd, amount);
-                        blit(c, cmd, b, vk::ImageLayout::GENERAL, (0, 0, rw, rh), dst, (rx, ry, rw, rh));
-                        sharpened = true;
-                    }
-                    Err(e) => {
-                        crate::warn!("present: no sharpening images ({e})");
-                        p.sharpen_failed = true;
-                    }
-                }
-            }
-        }
-        if !sharpened {
-            blit(c, cmd, from, from_layout, (0, 0, fw, fh), dst, (rx, ry, rw, rh));
-        }
+        let (from, from_layout, fw, fh, level) = compose(p, cmd, f, src_img, blit_layout, src_format, sw, sh, dst, (rx, ry, rw, rh), false);
         // The frame watch's copy of the frame as shown (before the window's scaling).
         if super::framewatch::ON.load(std::sync::atomic::Ordering::Relaxed) && !p.watch_failed {
             if p.watch.is_none() {
@@ -949,7 +1307,11 @@ pub fn present(src: Source) -> bool {
             }
         }
         // The system text box (the character's name) over the frame.
-        draw_text_box(p, cmd, f, dst, (rx, ry, rw, rh));
+        let text_box = draw_text_box(p, cmd, f, dst, (rx, ry, rw, rh));
+        // Frame generation's inputs: the HUD-less picture and the interface coverage.
+        if let (true, Some(n)) = (fg_on, frame) {
+            frame_generation_inputs(p, cmd, f, n, src_img, (rx, ry, rw, rh), text_box);
+        }
         if p.logged != (sw, sh, p.extent.width, p.extent.height) {
             p.logged = (sw, sh, p.extent.width, p.extent.height);
             crate::info!("present: {sw}x{sh} frame into a {}x{} window at {rw}x{rh}+{rx}+{ry}: {level} halving(s), then {fw}x{fh} -> {rw}x{rh}", p.extent.width, p.extent.height);
@@ -982,7 +1344,15 @@ pub fn present(src: Source) -> bool {
         };
         c.device.end_command_buffer(cmd).ok();
         let done = p.done[idx as usize];
-        if let Err(e) = c.submit(cmd, &[(p.acquire[f], vk::PipelineStageFlags::TRANSFER)], &[done], p.fences[f]) {
+        // With DLSS-G the frame goes to the second queue of the graphics family: DLSS-G blocks
+        // the presenting queue while it generates, and the game's work on the main queue need not
+        // wait behind it. (The frame's own work completed before its flip was shown: no wait.)
+        let present_queue = if p.fg { c.present_queue.as_ref() } else { None };
+        let submitted = match present_queue {
+            Some(q) => submit_to(q, cmd, (p.acquire[f], vk::PipelineStageFlags::TRANSFER), done, p.fences[f]),
+            None => c.submit(cmd, &[(p.acquire[f], vk::PipelineStageFlags::TRANSFER)], &[done], p.fences[f]),
+        };
+        if let Err(e) = submitted {
             crate::error!("{e}");
             return false;
         }
@@ -1004,32 +1374,36 @@ pub fn present(src: Source) -> bool {
         let scs = [p.swapchain];
         let idxs = [idx];
         let waits = [done];
-        // (`DS_PRESENT_STATS=1`: the present's id for `present_waiter`.)
-        let pw = super::PRESENT_WAIT.load(std::sync::atomic::Ordering::Relaxed);
-        if pw {
-            p.present_id += 1;
+        // The present's id (VK_KHR_present_id): the frame's index where it goes forward, for
+        // Reflex's latency markers (VK_NV_low_latency2 names presents by it) and the present waits
+        // of `DS_PRESENT_STATS=1`. Not with DLSS-G: its own swapchain numbers its presents.
+        let pw = super::PRESENT_WAIT.load(std::sync::atomic::Ordering::Relaxed) && !p.fg;
+        let ids_on = (pw || super::PRESENT_ID.load(std::sync::atomic::Ordering::Relaxed)) && !p.fg;
+        if ids_on {
+            p.present_id = (p.present_id + 1).max(frame.map_or(0, |n| n as u64));
         }
         let ids = [p.present_id];
         let mut pid = vk::PresentIdKHR::default().present_ids(&ids);
         let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
-        if pw {
+        if ids_on {
             pi = pi.push_next(&mut pid);
         }
-        let q = c.queue.lock();
-        // (Through Streamline's present once DLSS runs: its per-frame bookkeeping.)
-        let presented = match crate::gpu::upscale::present_hook() {
-            Some(f) => {
-                let r = f(*q, &pi);
-                crate::gpu::upscale::note_sl_present();
-                match r {
-                    vk::Result::SUCCESS => Ok(false),
-                    vk::Result::SUBOPTIMAL_KHR => Ok(true),
-                    e => Err(e),
-                }
+        if let Some(n) = frame {
+            crate::gpu::latency::marker(crate::gpu::latency::Marker::PresentStart, n);
+        }
+        let presented = match present_queue {
+            Some(q) => {
+                let q = q.lock();
+                sc_present(p, *q, &pi)
             }
-            None => c.swapchain_d.queue_present(*q, &pi),
+            None => {
+                let q = c.queue.lock();
+                sc_present(p, *q, &pi)
+            }
         };
-        drop(q);
+        if let Some(n) = frame {
+            crate::gpu::latency::marker(crate::gpu::latency::Marker::PresentEnd, n);
+        }
         if pw && presented.is_ok() {
             use ash::vk::Handle;
             let mut tx = PW_TX.lock();

@@ -201,6 +201,19 @@ pub fn possible_on(device: &str) -> Option<bool> {
     r
 }
 
+/// The NVIDIA driver's word on the window's monitor now: whether it can refresh at a variable
+/// rate there (None: no answer, as on other vendors' GPUs; `tune vrr` 0 and 1 answer for it).
+pub fn driver_possible() -> Option<bool> {
+    match crate::gpu::tune::vrr() {
+        0 => Some(false),
+        1 => Some(true),
+        _ => {
+            let d = DRIVER.load(Relaxed);
+            (d & KNOWN != 0).then_some(d & 2 != 0)
+        }
+    }
+}
+
 /// Status line.
 pub fn status_line() -> String {
     let d = DRIVER.load(Relaxed);

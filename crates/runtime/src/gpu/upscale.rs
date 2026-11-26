@@ -19,13 +19,11 @@
 //! XeSS: Intel's libxess.dll (Intel Simplified Software License). Its Vulkan path needs the
 //! mutable-descriptor-type extension and feature, enabled when the device is made.
 //!
-//! DLSS: NVIDIA Streamline 2.14 (sl.interposer.dll with its plugins sl.common.dll and
-//! sl.dlss.dll, MIT, shipped) and DLSS itself, nvngx_dlss.dll (NVIDIA's RTX SDK license: not
-//! shipped, the player's own copy; without it Streamline is not started), in Streamline's
-//! "manual hooking" mode: slInit before the device, the DLSS plugin's Vulkan extensions and
-//! features added to the instance and device, slSetVulkanInfo once it exists (on a thread of
-//! its own: DLSS is offered once it is done), the present through Streamline's
-//! vkQueuePresentKHR, and each frame the four images tagged on the slEvaluateFeature call.
+//! DLSS: NVIDIA Streamline 2.14 (`gpu::streamline`, which loads it with DLSS Frame Generation
+//! and Reflex) and DLSS itself, nvngx_dlss.dll (NVIDIA's RTX SDK license: not shipped, the
+//! player's own copy; without it DLSS is not offered): each frame the four images tagged on the
+//! slEvaluateFeature call, with the frame's common constants (shared with DLSS Frame
+//! Generation: `frame_constants`) under the frame's index, the flip that shows it.
 //!
 //! FSR: AMD's FSR API (amd_fidelityfx_loader_vk.dll, which loads amd_fidelityfx_upscaler_vk.dll
 //! beside it: FSR 4 on the AMD GPUs it supports, else FSR 3.1; MIT).
@@ -292,7 +290,7 @@ fn fail(k: Kind, msg: impl std::fmt::Display) {
 // ---------------------------------------------------------------------------
 // Loading.
 
-trait WideNull {
+pub(super) trait WideNull {
     fn encode_wide_null(&self) -> Vec<u16>;
 }
 
@@ -305,7 +303,7 @@ impl WideNull for std::ffi::OsStr {
 
 /// The upscalers' folder: `DS_UPSCALER_DIR`, else `upscalers` beside dsport.exe (a
 /// development checkout's: local-data/upscalers; `dsconfig::paths`).
-fn lib_dir() -> PathBuf {
+pub(super) fn lib_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("DS_UPSCALER_DIR") {
         return PathBuf::from(d);
     }
@@ -315,7 +313,7 @@ fn lib_dir() -> PathBuf {
 /// Checks that `path` carries a valid Authenticode signature whose signer's
 /// name starts with `publisher` (no revocation check, nothing fetched from
 /// the network). DS_UPSCALER_UNSIGNED=1 skips it (development builds).
-fn check_signature(path: &Path, publisher: &str) -> Result<(), String> {
+pub(super) fn check_signature(path: &Path, publisher: &str) -> Result<(), String> {
     use windows_sys::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
     use windows_sys::Win32::Security::WinTrust::*;
     if std::env::var("DS_UPSCALER_UNSIGNED").is_ok_and(|v| v == "1") {
@@ -367,7 +365,7 @@ fn check_signature(path: &Path, publisher: &str) -> Result<(), String> {
 }
 
 /// Why a library was not loaded.
-enum LoadError {
+pub(super) enum LoadError {
     /// Not installed (quietly skipped).
     Missing,
     Failed(String),
@@ -381,7 +379,7 @@ impl From<String> for LoadError {
 
 /// Loads a library signed by `publisher` (its dependencies from its own
 /// folder).
-fn load_lib(path: &Path, publisher: &str) -> Result<HMODULE, LoadError> {
+pub(super) fn load_lib(path: &Path, publisher: &str) -> Result<HMODULE, LoadError> {
     use windows_sys::Win32::System::LibraryLoader::{LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW};
     if !path.is_file() {
         return Err(LoadError::Missing);
@@ -396,7 +394,7 @@ fn load_lib(path: &Path, publisher: &str) -> Result<HMODULE, LoadError> {
 }
 
 /// A library's export.
-fn export(h: HMODULE, path: &Path, name: &CStr) -> Result<*const c_void, String> {
+pub(super) fn export(h: HMODULE, path: &Path, name: &CStr) -> Result<*const c_void, String> {
     use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
     match unsafe { GetProcAddress(h, name.as_ptr() as *const u8) } {
         Some(p) => Ok(p as *const c_void),
@@ -405,7 +403,7 @@ fn export(h: HMODULE, path: &Path, name: &CStr) -> Result<*const c_void, String>
 }
 
 /// C strings out of a library's list (count, array of pointers).
-unsafe fn names(count: u32, list: *const *const c_char) -> Vec<CString> {
+pub(super) unsafe fn names(count: u32, list: *const *const c_char) -> Vec<CString> {
     if list.is_null() {
         return Vec::new();
     }
@@ -421,7 +419,7 @@ unsafe fn names(count: u32, list: *const *const c_char) -> Vec<CString> {
 pub fn instance_extensions(avail: &[vk::ExtensionProperties]) -> Vec<CString> {
     let has = |e: &CStr| avail.iter().any(|x| unsafe { CStr::from_ptr(x.extension_name.as_ptr()) } == e);
     let mut out: Vec<CString> = Vec::new();
-    for (k, list) in [(Kind::Xess, xess_instance_extensions()), (Kind::Dlss, sl().map(|s| s.reqs.instance_ext.clone()).unwrap_or_default())] {
+    for (k, list) in [(Kind::Xess, xess_instance_extensions())] {
         if let Some(e) = list.iter().find(|e| !has(e)) {
             fail(k, format!("the Vulkan loader lacks the instance extension {}", e.to_string_lossy()));
             continue;
@@ -430,6 +428,12 @@ pub fn instance_extensions(avail: &[vk::ExtensionProperties]) -> Vec<CString> {
             if !out.contains(&e) {
                 out.push(e);
             }
+        }
+    }
+    // Streamline's (DLSS, DLSS Frame Generation, Reflex: `gpu::streamline`).
+    for e in super::streamline::instance_extensions(avail) {
+        if !out.contains(&e) {
+            out.push(e);
         }
     }
     out
@@ -443,19 +447,38 @@ pub struct DeviceNeeds {
     pub mutable_descriptor: bool,
     /// Vulkan 1.0-1.3 features by name (`apply_features`).
     pub features: Vec<String>,
+    /// Queues of the graphics family Streamline asks for after the port's own (`gpu::streamline`).
+    pub extra_graphics_queues: u32,
 }
 
 static XESS_DEVICE_OK: AtomicBool = AtomicBool::new(false);
 static DLSS_DEVICE_OK: AtomicBool = AtomicBool::new(false);
 static FSR_DEVICE_OK: AtomicBool = AtomicBool::new(false);
 
-/// Device extensions and features of the upscalers that can run on this
-/// device (before vkCreateDevice).
-pub fn device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> DeviceNeeds {
+/// Device extensions, features and queues of the upscalers and Streamline's features (DLSS,
+/// DLSS Frame Generation, Reflex: `gpu::streamline`) that can run on this device (before
+/// vkCreateDevice). `queues_left`: queues of the graphics family past the port's own.
+pub fn device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice, queues_left: u32) -> DeviceNeeds {
     let mut n = DeviceNeeds::default();
+    let s = super::streamline::device_needs(instance, pdev, queues_left);
+    let dlss = (super::streamline::supported(super::streamline::FEATURE_DLSS) && !DLSS_FAILED.load(Relaxed)).then(|| DeviceNeeds { extensions: Vec::new(), mutable_descriptor: false, features: Vec::new(), extra_graphics_queues: 0 });
+    if super::streamline::loaded(super::streamline::FEATURE_DLSS) && dlss.is_none() {
+        fail(Kind::Dlss, super::streamline::unsupported_reason(super::streamline::FEATURE_DLSS).unwrap_or_else(|| "not supported here".into()));
+    }
+    for e in s.extensions {
+        if !n.extensions.contains(&e) {
+            n.extensions.push(e);
+        }
+    }
+    for f in s.features {
+        if !n.features.contains(&f) {
+            n.features.push(f);
+        }
+    }
+    n.extra_graphics_queues = s.graphics_queues + s.compute_queues;
     for (k, needs, ok) in [
         (Kind::Xess, xess_device_needs(instance, pdev), &XESS_DEVICE_OK),
-        (Kind::Dlss, dlss_device_needs(instance, pdev), &DLSS_DEVICE_OK),
+        (Kind::Dlss, dlss, &DLSS_DEVICE_OK),
         (Kind::Fsr, fsr_device_needs(instance, pdev), &FSR_DEVICE_OK),
     ] {
         let Some(d) = needs else { continue };
@@ -489,15 +512,78 @@ fn feature_slot<'a>(
 ) -> Option<&'a mut vk::Bool32> {
     Some(match name {
         "shaderInt16" => &mut f10.shader_int16,
+        "shaderInt64" => &mut f10.shader_int64,
         "storageBuffer16BitAccess" => &mut f11.storage_buffer16_bit_access,
         "uniformAndStorageBuffer16BitAccess" => &mut f11.uniform_and_storage_buffer16_bit_access,
-        "timelineSemaphore" => &mut f12.timeline_semaphore,
-        "descriptorIndexing" => &mut f12.descriptor_indexing,
-        "bufferDeviceAddress" => &mut f12.buffer_device_address,
+        "storagePushConstant16" => &mut f11.storage_push_constant16,
+        "shaderDrawParameters" => &mut f11.shader_draw_parameters,
+        "samplerYcbcrConversion" => &mut f11.sampler_ycbcr_conversion,
+        "variablePointersStorageBuffer" => &mut f11.variable_pointers_storage_buffer,
+        "variablePointers" => &mut f11.variable_pointers,
+        // Vulkan 1.2 (the names Streamline's plugins may ask for: sl_helpers_vk.h).
+        "samplerMirrorClampToEdge" => &mut f12.sampler_mirror_clamp_to_edge,
+        "drawIndirectCount" => &mut f12.draw_indirect_count,
+        "storageBuffer8BitAccess" => &mut f12.storage_buffer8_bit_access,
+        "uniformAndStorageBuffer8BitAccess" => &mut f12.uniform_and_storage_buffer8_bit_access,
+        "storagePushConstant8" => &mut f12.storage_push_constant8,
+        "shaderBufferInt64Atomics" => &mut f12.shader_buffer_int64_atomics,
+        "shaderSharedInt64Atomics" => &mut f12.shader_shared_int64_atomics,
         "shaderFloat16" => &mut f12.shader_float16,
+        "shaderInt8" => &mut f12.shader_int8,
+        "descriptorIndexing" => &mut f12.descriptor_indexing,
+        "shaderInputAttachmentArrayDynamicIndexing" => &mut f12.shader_input_attachment_array_dynamic_indexing,
+        "shaderUniformTexelBufferArrayDynamicIndexing" => &mut f12.shader_uniform_texel_buffer_array_dynamic_indexing,
+        "shaderStorageTexelBufferArrayDynamicIndexing" => &mut f12.shader_storage_texel_buffer_array_dynamic_indexing,
+        "shaderUniformBufferArrayNonUniformIndexing" => &mut f12.shader_uniform_buffer_array_non_uniform_indexing,
+        "shaderSampledImageArrayNonUniformIndexing" => &mut f12.shader_sampled_image_array_non_uniform_indexing,
         "shaderStorageBufferArrayNonUniformIndexing" => &mut f12.shader_storage_buffer_array_non_uniform_indexing,
+        "shaderStorageImageArrayNonUniformIndexing" => &mut f12.shader_storage_image_array_non_uniform_indexing,
+        "shaderInputAttachmentArrayNonUniformIndexing" => &mut f12.shader_input_attachment_array_non_uniform_indexing,
+        "shaderUniformTexelBufferArrayNonUniformIndexing" => &mut f12.shader_uniform_texel_buffer_array_non_uniform_indexing,
+        "shaderStorageTexelBufferArrayNonUniformIndexing" => &mut f12.shader_storage_texel_buffer_array_non_uniform_indexing,
+        "descriptorBindingUniformBufferUpdateAfterBind" => &mut f12.descriptor_binding_uniform_buffer_update_after_bind,
+        "descriptorBindingSampledImageUpdateAfterBind" => &mut f12.descriptor_binding_sampled_image_update_after_bind,
+        "descriptorBindingStorageImageUpdateAfterBind" => &mut f12.descriptor_binding_storage_image_update_after_bind,
+        "descriptorBindingStorageBufferUpdateAfterBind" => &mut f12.descriptor_binding_storage_buffer_update_after_bind,
+        "descriptorBindingUniformTexelBufferUpdateAfterBind" => &mut f12.descriptor_binding_uniform_texel_buffer_update_after_bind,
+        "descriptorBindingStorageTexelBufferUpdateAfterBind" => &mut f12.descriptor_binding_storage_texel_buffer_update_after_bind,
+        "descriptorBindingUpdateUnusedWhilePending" => &mut f12.descriptor_binding_update_unused_while_pending,
+        "descriptorBindingPartiallyBound" => &mut f12.descriptor_binding_partially_bound,
+        "descriptorBindingVariableDescriptorCount" => &mut f12.descriptor_binding_variable_descriptor_count,
+        "runtimeDescriptorArray" => &mut f12.runtime_descriptor_array,
+        "samplerFilterMinmax" => &mut f12.sampler_filter_minmax,
+        "scalarBlockLayout" => &mut f12.scalar_block_layout,
+        "imagelessFramebuffer" => &mut f12.imageless_framebuffer,
+        "uniformBufferStandardLayout" => &mut f12.uniform_buffer_standard_layout,
+        "shaderSubgroupExtendedTypes" => &mut f12.shader_subgroup_extended_types,
+        "separateDepthStencilLayouts" => &mut f12.separate_depth_stencil_layouts,
+        "hostQueryReset" => &mut f12.host_query_reset,
+        "timelineSemaphore" => &mut f12.timeline_semaphore,
+        "bufferDeviceAddress" => &mut f12.buffer_device_address,
+        "bufferDeviceAddressCaptureReplay" => &mut f12.buffer_device_address_capture_replay,
+        "bufferDeviceAddressMultiDevice" => &mut f12.buffer_device_address_multi_device,
+        "vulkanMemoryModel" => &mut f12.vulkan_memory_model,
+        "vulkanMemoryModelDeviceScope" => &mut f12.vulkan_memory_model_device_scope,
+        "vulkanMemoryModelAvailabilityVisibilityChains" => &mut f12.vulkan_memory_model_availability_visibility_chains,
+        "shaderOutputViewportIndex" => &mut f12.shader_output_viewport_index,
+        "shaderOutputLayer" => &mut f12.shader_output_layer,
+        "subgroupBroadcastDynamicId" => &mut f12.subgroup_broadcast_dynamic_id,
+        // Vulkan 1.3.
+        "robustImageAccess" => &mut f13.robust_image_access,
+        "inlineUniformBlock" => &mut f13.inline_uniform_block,
+        "descriptorBindingInlineUniformBlockUpdateAfterBind" => &mut f13.descriptor_binding_inline_uniform_block_update_after_bind,
+        "pipelineCreationCacheControl" => &mut f13.pipeline_creation_cache_control,
+        "privateData" => &mut f13.private_data,
+        "shaderDemoteToHelperInvocation" => &mut f13.shader_demote_to_helper_invocation,
+        "shaderTerminateInvocation" => &mut f13.shader_terminate_invocation,
         "subgroupSizeControl" => &mut f13.subgroup_size_control,
         "computeFullSubgroups" => &mut f13.compute_full_subgroups,
+        "synchronization2" => &mut f13.synchronization2,
+        "textureCompressionASTC_HDR" => &mut f13.texture_compression_astc_hdr,
+        "shaderZeroInitializeWorkgroupMemory" => &mut f13.shader_zero_initialize_workgroup_memory,
+        "dynamicRendering" => &mut f13.dynamic_rendering,
+        "shaderIntegerDotProduct" => &mut f13.shader_integer_dot_product,
+        "maintenance4" => &mut f13.maintenance4,
         _ => return None,
     })
 }
@@ -531,8 +617,10 @@ fn device_features(instance: &ash::Instance, pdev: vk::PhysicalDevice, names: &[
 
 /// The features in `names`, each one the device has (Err: one it lacks or
 /// the port does not know).
-fn features_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice, names: &[String]) -> Result<(), String> {
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+pub(super) fn features_supported<'a>(instance: &ash::Instance, pdev: vk::PhysicalDevice, names: impl IntoIterator<Item = &'a String>) -> Result<(), String> {
+    // (opticalFlow is VK_NV_optical_flow's, left out with it: `gpu::streamline::device_needs`.)
+    let names: Vec<&String> = names.into_iter().filter(|n| n.as_str() != "opticalFlow").collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     for (name, have) in names.iter().zip(device_features(instance, pdev, &refs)) {
         match have {
             None => return Err(format!("it asks for the Vulkan feature {name}, unknown to the port")),
@@ -545,7 +633,7 @@ fn features_supported(instance: &ash::Instance, pdev: vk::PhysicalDevice, names:
 
 /// Called right after vkCreateDevice: `queues` of family `qf` are the
 /// port's.
-pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device: &ash::Device, qf: u32, queues: u32) {
+pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device: &ash::Device, qf: u32, queues: u32, extra_graphics: u32) {
     if XESS_DEVICE_OK.load(Relaxed) && xess().is_some() {
         XESS_READY.store(true, Relaxed);
         crate::info!("upscaler: XeSS ready");
@@ -556,23 +644,15 @@ pub fn device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device
         crate::info!("upscaler: FSR ready");
         now_ready(Kind::Fsr);
     }
-    if DLSS_DEVICE_OK.load(Relaxed) {
-        dlss_device_created(instance, pdev, device, qf, queues);
-    }
+    // Streamline's features (DLSS among them) start on a thread of their own
+    // (`streamline_ready`).
+    super::streamline::device_created(instance, pdev, device, qf, queues, extra_graphics);
     DEVICE_MADE.store(true, Relaxed);
     let k = choice();
     if k != Kind::Off && !ready(k) && !may_become_ready(k) {
         crate::info!("upscaler: {} (the chosen Anti-Aliasing) is not available here: the game's TAA stays", k.name());
     }
 }
-
-/// Streamline's vkQueuePresentKHR once DLSS is ready (its per-frame
-/// bookkeeping runs there); None: the usual present.
-pub fn present_hook() -> Option<vk::PFN_vkQueuePresentKHR> {
-    SL_PRESENT.get().copied()
-}
-
-static SL_PRESENT: std::sync::OnceLock<vk::PFN_vkQueuePresentKHR> = std::sync::OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // The per-frame inputs.
@@ -610,6 +690,8 @@ pub struct Inputs {
     /// The frame's jitter, in pixels of the render size (the title's, `crate::jitter`).
     pub jitter_x: f32,
     pub jitter_y: f32,
+    /// The frame's index: the number of the flip that will show it (`gpu::streamline`).
+    pub frame: u32,
 }
 
 impl Inputs {
@@ -871,7 +953,7 @@ fn xess_device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Opti
         return None;
     }
     crate::info!("upscaler: XeSS asks for device extensions {extensions:?} and mutableDescriptorType");
-    Some(DeviceNeeds { extensions, mutable_descriptor: true, features: Vec::new() })
+    Some(DeviceNeeds { extensions, mutable_descriptor: true, features: Vec::new(), extra_graphics_queues: 0 })
 }
 
 unsafe extern "C" fn xess_log(msg: *const c_char, level: i32) {
@@ -989,59 +1071,10 @@ fn xess_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Streamline's C interface (sl_struct.h, sl_core_types.h, sl_consts.h,
-// sl_dlss.h, sl_helpers_vk.h of SDK 2.14.16; MSVC x64 layout, which
-// repr(C) reproduces - the sizes are checked in the tests).
+// DLSS through Streamline (`gpu::streamline`: the library, its structures and the frames).
 
-/// sl::StructType (a GUID).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlType(u32, u16, u16, [u8; 8]);
+use super::streamline::{self as sl, SlBase, SlConstants, SlDlssOptions, SlExtent, SlResource, SlResourceTag, SlViewport, IDENTITY, SL_FALSE, SL_OK, SL_TRUE};
 
-/// sl::BaseStructure.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlBase {
-    next: *const SlBase,
-    ty: SlType,
-    version: usize,
-}
-
-impl SlBase {
-    const fn new(ty: SlType, version: usize) -> Self {
-        Self { next: std::ptr::null(), ty, version }
-    }
-}
-
-// SAFETY: `next` is always null here (no chained structures): the per-frame
-// structures move to the recorder thread as plain data.
-unsafe impl Send for SlBase {}
-
-const SL_PREFERENCES: SlType = SlType(0x1ca10965, 0xbf8e, 0x432b, [0x8d, 0xa1, 0x67, 0x16, 0xd8, 0x79, 0xfb, 0x14]);
-const SL_RESOURCE: SlType = SlType(0x3a9d70cf, 0x2418, 0x4b72, [0x83, 0x91, 0x13, 0xf8, 0x72, 0x1c, 0x72, 0x61]);
-const SL_RESOURCE_TAG: SlType = SlType(0x4c6a5aad, 0xb445, 0x496c, [0x87, 0xff, 0x1a, 0xf3, 0x84, 0x5b, 0xe6, 0x53]);
-const SL_VIEWPORT: SlType = SlType(0x171b6435, 0x9b3c, 0x4fc8, [0x99, 0x94, 0xfb, 0xe5, 0x25, 0x69, 0xaa, 0xa4]);
-const SL_FEATURE_REQUIREMENTS: SlType = SlType(0x66714097, 0xac6d, 0x4bc6, [0x89, 0x15, 0x1e, 0x0f, 0x55, 0xa6, 0xb6, 0x1f]);
-const SL_FEATURE_VERSION: SlType = SlType(0x6d5b51f0, 0x076b, 0x486d, [0x99, 0x95, 0x5a, 0x56, 0x10, 0x43, 0xf5, 0xc1]);
-const SL_ADAPTER_INFO: SlType = SlType(0x0677315f, 0xa746, 0x4492, [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4]);
-const SL_VULKAN_INFO: SlType = SlType(0x0eed6fd5, 0x82cd, 0x43a9, [0xbd, 0xb5, 0x47, 0xa5, 0xba, 0x2f, 0x45, 0xd6]);
-const SL_CONSTANTS: SlType = SlType(0xdcd35ad7, 0x4e4a, 0x4bad, [0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe]);
-const SL_DLSS_OPTIONS: SlType = SlType(0x6ac826e4, 0x4c61, 0x4101, [0xa9, 0x2d, 0x63, 0x8d, 0x42, 0x10, 0x57, 0xb8]);
-
-/// sl::kSDKVersion of 2.14.16.
-const SL_SDK_VERSION: u64 = (2u64 << 48) | (14u64 << 32) | (16u64 << 16) | 0xfedc;
-const SL_FEATURE_DLSS: u32 = 0;
-const SL_OK: i32 = 0;
-// PreferenceFlags.
-const SL_DISABLE_CL_STATE_TRACKING: u64 = 1 << 0;
-const SL_USE_MANUAL_HOOKING: u64 = 1 << 2;
-// BufferType.
-const SL_DEPTH: u32 = 0;
-const SL_MOTION_VECTORS: u32 = 1;
-const SL_SCALING_INPUT_COLOR: u32 = 3;
-const SL_SCALING_OUTPUT_COLOR: u32 = 4;
-/// ResourceLifecycle::eValidUntilEvaluate.
-const SL_VALID_UNTIL_EVALUATE: u32 = 2;
 /// DLSSMode::eDLAA.
 const SL_DLSS_DLAA: u32 = 6;
 
@@ -1056,707 +1089,76 @@ fn dlss_mode(ratio: f32) -> u32 {
         _ => 4,
     }
 }
-/// RenderAPI::eVulkan.
-const SL_VULKAN: u32 = 2;
-// sl::Boolean.
-const SL_FALSE: u8 = 0;
-const SL_TRUE: u8 = 1;
 
-/// sl::Preferences.
-#[repr(C)]
-struct SlPreferences {
-    base: SlBase,
-    show_console: bool,
-    log_level: u32,
-    paths_to_plugins: *const *const u16,
-    num_paths_to_plugins: u32,
-    path_to_logs_and_data: *const u16,
-    allocate_callback: *const c_void,
-    release_callback: *const c_void,
-    log_message_callback: Option<unsafe extern "C" fn(u32, *const c_char)>,
-    flags: u64,
-    features_to_load: *const u32,
-    num_features_to_load: u32,
-    application_id: u32,
-    engine: u32,
-    engine_version: *const c_char,
-    project_id: *const c_char,
-    render_api: u32,
+/// Whether this session prepares DLSS's library (`DS_UPSCALER` names the one in development runs).
+pub(super) fn prepares_dlss() -> bool {
+    prepares(Kind::Dlss)
 }
 
-/// sl::Resource (Vulkan: the image, its view, layout and description).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlResource {
-    base: SlBase,
-    ty: u8,
-    native: u64,
-    memory: u64,
-    view: u64,
-    state: u32,
-    width: u32,
-    height: u32,
-    native_format: u32,
-    mip_levels: u32,
-    array_layers: u32,
-    gpu_virtual_address: u64,
-    flags: u32,
-    usage: u32,
-    internal_flags: u16,
-    reserved: u16,
+/// Streamline cannot run in this session (`gpu::streamline`): DLSS neither.
+pub(super) fn streamline_failed(why: &str) {
+    fail(Kind::Dlss, why);
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlExtent {
-    top: u32,
-    left: u32,
-    width: u32,
-    height: u32,
-}
-
-/// sl::ResourceTag.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlResourceTag {
-    base: SlBase,
-    resource: *const SlResource,
-    ty: u32,
-    lifecycle: u32,
-    extent: SlExtent,
-}
-
-/// sl::ViewportHandle.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlViewport {
-    base: SlBase,
-    value: u32,
-}
-
-/// sl::FeatureRequirements (version 2).
-#[repr(C)]
-struct SlFeatureRequirements {
-    base: SlBase,
-    flags: u32,
-    max_cpu_threads: u32,
-    max_viewports: u32,
-    num_required_tags: u32,
-    required_tags: *const u32,
-    os_detected: [u32; 3],
-    os_required: [u32; 3],
-    driver_detected: [u32; 3],
-    driver_required: [u32; 3],
-    vk_compute_queues: u32,
-    vk_graphics_queues: u32,
-    vk_num_device_extensions: u32,
-    vk_device_extensions: *const *const c_char,
-    vk_num_instance_extensions: u32,
-    vk_instance_extensions: *const *const c_char,
-    vk_num_features12: u32,
-    vk_features12: *const *const c_char,
-    vk_num_features13: u32,
-    vk_features13: *const *const c_char,
-    vk_optical_flow_queues: u32,
-}
-
-/// sl::FeatureVersion.
-#[repr(C)]
-struct SlFeatureVersion {
-    base: SlBase,
-    sl: [u32; 3],
-    ngx: [u32; 3],
-}
-
-/// sl::AdapterInfo.
-#[repr(C)]
-struct SlAdapterInfo {
-    base: SlBase,
-    luid: *const u8,
-    luid_size: u32,
-    vk_physical_device: vk::PhysicalDevice,
-}
-
-/// sl::VulkanInfo (version 3).
-#[repr(C)]
-struct SlVulkanInfo {
-    base: SlBase,
-    device: vk::Device,
-    instance: vk::Instance,
-    physical_device: vk::PhysicalDevice,
-    compute_queue_index: u32,
-    compute_queue_family: u32,
-    graphics_queue_index: u32,
-    graphics_queue_family: u32,
-    optical_flow_queue_index: u32,
-    optical_flow_queue_family: u32,
-    use_native_optical_flow: bool,
-    compute_queue_create_flags: u32,
-    graphics_queue_create_flags: u32,
-    optical_flow_queue_create_flags: u32,
-}
-
-/// A row-major 4x4 matrix (sl::float4x4).
-type SlMatrix = [[f32; 4]; 4];
-
-const IDENTITY: SlMatrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
-
-/// sl::Constants (version 2).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlConstants {
-    base: SlBase,
-    camera_view_to_clip: SlMatrix,
-    clip_to_camera_view: SlMatrix,
-    clip_to_lens_clip: SlMatrix,
-    clip_to_prev_clip: SlMatrix,
-    prev_clip_to_clip: SlMatrix,
-    jitter_offset: [f32; 2],
-    mvec_scale: [f32; 2],
-    camera_pinhole_offset: [f32; 2],
-    camera_pos: [f32; 3],
-    camera_up: [f32; 3],
-    camera_right: [f32; 3],
-    camera_fwd: [f32; 3],
-    camera_near: f32,
-    camera_far: f32,
-    camera_fov: f32,
-    camera_aspect_ratio: f32,
-    motion_vectors_invalid_value: f32,
-    depth_inverted: u8,
-    camera_motion_included: u8,
-    motion_vectors_3d: u8,
-    reset: u8,
-    orthographic_projection: u8,
-    motion_vectors_dilated: u8,
-    motion_vectors_jittered: u8,
-    min_relative_linear_depth_object_separation: f32,
-}
-
-/// sl::DLSSOptions (version 3).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SlDlssOptions {
-    base: SlBase,
-    mode: u32,
-    output_width: u32,
-    output_height: u32,
-    sharpness: f32,
-    pre_exposure: f32,
-    exposure_scale: f32,
-    color_buffers_hdr: u8,
-    indicator_invert_x: u8,
-    indicator_invert_y: u8,
-    dlaa_preset: u32,
-    quality_preset: u32,
-    balanced_preset: u32,
-    performance_preset: u32,
-    ultra_performance_preset: u32,
-    ultra_quality_preset: u32,
-    use_auto_exposure: u8,
-    alpha_upscaling_enabled: u8,
-}
-
-/// The port's NGX project id (Streamline passes it with the engine type
-/// "custom" when no NVIDIA application id is given).
-const NGX_PROJECT_ID: &CStr = c"48421953-2aae-4cec-9b59-7e92288edb4a";
-
-/// DLSS's Vulkan needs (slGetFeatureRequirements).
-#[derive(Default)]
-struct DlssReqs {
-    instance_ext: Vec<CString>,
-    device_ext: Vec<CString>,
-    features12: Vec<String>,
-    features13: Vec<String>,
-    queues: u32,
-}
-
-struct SlLib {
-    is_supported: unsafe extern "C" fn(u32, *const SlAdapterInfo) -> i32,
-    set_vulkan_info: unsafe extern "C" fn(*const SlVulkanInfo) -> i32,
-    frame_token: unsafe extern "C" fn(*mut *const c_void, *const u32) -> i32,
-    set_constants: unsafe extern "C" fn(*const SlConstants, *const c_void, *const SlViewport) -> i32,
-    evaluate: unsafe extern "C" fn(u32, *const c_void, *const *const SlBase, u32, vk::CommandBuffer) -> i32,
-    feature_function: unsafe extern "C" fn(u32, *const c_char, *mut *const c_void) -> i32,
-    version: unsafe extern "C" fn(u32, *mut SlFeatureVersion) -> i32,
-    gipa: vk::PFN_vkGetInstanceProcAddr,
-    reqs: DlssReqs,
-}
-
-// SAFETY: plain function pointers into a library that stays loaded.
-unsafe impl Send for SlLib {}
-unsafe impl Sync for SlLib {}
-
-/// Streamline, initialised with DLSS (None: not prepared, not installed or
-/// unusable).
-fn sl() -> Option<&'static SlLib> {
-    static L: std::sync::OnceLock<Option<SlLib>> = std::sync::OnceLock::new();
-    L.get_or_init(|| {
-        if !prepares(Kind::Dlss) {
-            return None;
-        }
-        match load_sl() {
-            Ok(l) => Some(l),
-            Err(LoadError::Missing) => {
-                crate::info!("upscaler: DLSS not installed (nvngx_dlss.dll - the player's own - and Streamline in the upscalers folder)");
-                None
-            }
-            Err(LoadError::Failed(e)) => {
-                fail(Kind::Dlss, e);
-                None
-            }
-        }
-    })
-    .as_ref()
-}
-
-unsafe extern "C" fn sl_log(ty: u32, msg: *const c_char) {
-    if msg.is_null() {
-        return;
-    }
-    let m = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
-    let m = m.trim_end();
-    // (Its Reflex low-latency library is not shipped - the port uses no
-    // Reflex: that failure is expected.)
-    let ty = if m.contains("NvLowLatencyVk.dll") { 0 } else { ty };
-    match ty {
-        2 => crate::warn!("Streamline error: {m}"),
-        1 => crate::warn!("Streamline: {m}"),
-        _ => crate::debug!("Streamline: {m}"),
-    }
-}
-
-/// The system folder (nvapi64.dll, NVIDIA's driver library, is there with every NVIDIA driver).
-fn system_dir() -> Option<PathBuf> {
-    let mut sys = [0u16; 260];
-    let n = unsafe { windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(sys.as_mut_ptr(), sys.len() as u32) } as usize;
-    (n > 0 && n < sys.len()).then(|| PathBuf::from(String::from_utf16_lossy(&sys[..n])))
-}
-
-/// Streamline's files, NVIDIA's driver library and the port's version, as a line
-/// (`streamline-ok.txt` and `streamline-crashed.txt` hold the line they were written for: a check
-/// is made again once it differs, a driver update included).
-fn streamline_files_line(dir: &Path) -> String {
-    let mut v = vec![format!("Regaliant {}", env!("CARGO_PKG_VERSION"))];
-    let files = ["nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"].map(|f| dir.join(f));
-    for p in files.iter().cloned().chain(system_dir().map(|s| s.join("nvapi64.dll"))) {
-        let m = std::fs::metadata(&p).ok();
-        let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-        let name = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-        v.push(format!("{name} {} {t}", m.map_or(0, |m| m.len())));
-    }
-    v.join("; ")
-}
-
-/// Whether process `pid` still runs.
-fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return false;
-        }
-        let mut code = 0u32;
-        let alive = GetExitCodeProcess(h, &mut code) != 0 && code == 259;
-        CloseHandle(h);
-        alive
-    }
-}
-
-/// Streamline loads that ended a process, or checks that did not end (`note_streamline_death`),
-/// in a row for the same files: at `STREAMLINE_DEATHS` DLSS is left out. One alone is no proof: a
-/// launcher check or preparation step is ended from outside when the launcher closes or a check
-/// takes too long, and such an end in the load must not switch DLSS off (the review of 2026-11-24
-/// night); it only makes the separate check run again.
-const STREAMLINE_DEATHS: u32 = 2;
-
-/// One more death in Streamline's load for the files of `line` (`streamline-deaths.txt`: the
-/// count and the line), the separate check made to run again; at `STREAMLINE_DEATHS` the files'
-/// line goes to `streamline-crashed.txt`.
-fn note_streamline_death(cache: &Path, line: &str, what: &str) {
-    let deaths = cache.join("streamline-deaths.txt");
-    let n = std::fs::read_to_string(&deaths)
-        .ok()
-        .and_then(|t| t.split_once(' ').filter(|(_, l)| l.trim() == line.trim()).and_then(|(n, _)| n.parse::<u32>().ok()))
-        .unwrap_or(0)
-        + 1;
-    let _ = std::fs::remove_file(cache.join("streamline-ok.txt"));
-    if n >= STREAMLINE_DEATHS {
-        crate::warn!("upscaler: {what} ({n} in a row with these files): DLSS is left out");
-        let _ = std::fs::write(cache.join("streamline-crashed.txt"), line.trim());
-        let _ = std::fs::remove_file(&deaths);
-    } else {
-        crate::warn!("upscaler: {what}: Streamline's separate check runs again before DLSS is loaded");
-        let _ = std::fs::write(&deaths, format!("{n} {}", line.trim()));
-    }
-}
-
-/// Starts that died while Streamline loaded (2026-11-24 night: a player's every start, the shader
-/// preparation's compute step too, ended with an access violation right after XeSS's query, where
-/// Streamline loads, with their own nvngx_dlss.dll in the upscalers folder; the launcher said the
-/// preparation "crashed (status 0xc0000005)"). Each process leaves `streamline-loading-<pid>.txt`
-/// in the cache folder while it loads Streamline. A marker of a process that no longer runs (or
-/// one older than five minutes: the load takes seconds) is claimed by renaming it (a death counts
-/// once, however many processes start together) and counted (`note_streamline_death`). Returns
-/// why DLSS is left out, if it is (`streamline-crashed.txt` written for these files).
-fn streamline_crashed_before(dir: &Path) -> Option<String> {
-    let cache = crate::paths().cache.clone();
-    let crashed = cache.join("streamline-crashed.txt");
-    if let Ok(rd) = std::fs::read_dir(&cache) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(pid) = name.strip_prefix("streamline-loading-").and_then(|s| s.strip_suffix(".txt")).and_then(|s| s.parse::<u32>().ok()) else { continue };
-            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 300);
-            if pid == std::process::id() || !(old || !process_alive(pid)) {
-                continue;
-            }
-            let claimed = cache.join(format!("streamline-loading-{pid}.claimed-{}", std::process::id()));
-            if std::fs::rename(e.path(), &claimed).is_err() {
-                continue;
-            }
-            let line = std::fs::read_to_string(&claimed).unwrap_or_default();
-            let _ = std::fs::remove_file(&claimed);
-            note_streamline_death(&cache, &line, &format!("an earlier start (process {pid}) ended while it loaded Streamline (DLSS)"));
-        }
-    }
-    let was = std::fs::read_to_string(&crashed).ok()?;
-    if was.trim() == streamline_files_line(dir) {
-        Some(format!(
-            "Streamline's load ended starts or its separate check with these files, so DLSS is left out (it is tried again when they, the graphics driver or Regaliant's version change, or after deleting {})",
-            crashed.display()
-        ))
-    } else {
-        let _ = std::fs::remove_file(&crashed);
-        None
-    }
-}
-
-fn load_sl() -> Result<SlLib, LoadError> {
-    let dir = std::env::var_os("DS_SL_DIR").map(PathBuf::from).unwrap_or_else(lib_dir);
-    // DLSS itself: the player's own nvngx_dlss.dll (from a game with DLSS or
-    // NVIDIA's DLSS SDK; NVIDIA's license keeps it out of the package), signed
-    // by NVIDIA. Without it Streamline is not started.
-    let ngx = dir.join("nvngx_dlss.dll");
-    if !ngx.is_file() {
-        return Err(LoadError::Missing);
-    }
-    // (Without NVIDIA's driver Streamline has nothing to run on: its library nvapi64.dll is in
-    // the system folder with every NVIDIA driver.)
-    if system_dir().is_some_and(|s| !s.join("nvapi64.dll").is_file()) {
-        return Err("no NVIDIA graphics driver here (nvapi64.dll is not in the system folder): DLSS needs an NVIDIA RTX card".to_string().into());
-    }
-    check_signature(&ngx, "NVIDIA Corporation")?;
-    if let Some(why) = streamline_crashed_before(&dir) {
-        return Err(why.into());
-    }
-    let cache = crate::paths().cache.clone();
-    let _ = std::fs::create_dir_all(&cache);
-    let line = streamline_files_line(&dir);
-    // A start loads Streamline itself only once a separate process has loaded these files
-    // (`probe_streamline`; `streamline-ok.txt` holds their line): the player's DLSS runtime that
-    // ended every start ended only that process, and the game starts without DLSS.
-    let ok = cache.join("streamline-ok.txt");
-    if std::fs::read_to_string(&ok).ok().as_deref().map(str::trim) != Some(line.as_str()) {
-        let t0 = std::time::Instant::now();
-        match run_probe(&dir) {
-            ProbeEnd::Ended(code) => {
-                crate::info!("upscaler: Streamline's separate check loaded these files in {:.2} s (exit {code})", t0.elapsed().as_secs_f32());
-                let _ = std::fs::write(&ok, &line);
-            }
-            // (A fault's NTSTATUS: the load itself crashed, not an end from outside.)
-            ProbeEnd::Faulted(code) => {
-                let crashed = cache.join("streamline-crashed.txt");
-                let _ = std::fs::write(&crashed, &line);
-                return Err(format!(
-                    "Streamline's separate check of these files crashed (code {code:#x}), so DLSS is left out (it is tried again when they, the graphics driver or Regaliant's version change, or after deleting {})",
-                    crashed.display()
-                )
-                .into());
-            }
-            ProbeEnd::Other(why) => {
-                note_streamline_death(&cache, &line, &format!("Streamline's separate check {why}"));
-                return Err(format!("Streamline's separate check {why}: DLSS is left out for this start").into());
-            }
-        }
-    }
-    // (Removed whatever the load's outcome; left behind only if the process dies in it.)
-    let marker = cache.join(format!("streamline-loading-{}.txt", std::process::id()));
-    let _ = std::fs::write(&marker, &line);
-    // (Diagnosis: `DS_SL_CRASH_TEST=2` ends the process here, as a crash in the load would; `1`
-    // ends the separate check instead.)
-    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "2") {
-        crate::warn!("upscaler: DS_SL_CRASH_TEST: ending the process while Streamline loads");
-        std::process::abort();
-    }
-    let r = load_sl_from(&dir);
-    let _ = std::fs::remove_file(&marker);
-    // (Loaded: the deaths in a row end here.)
-    if r.is_ok() {
-        let _ = std::fs::remove_file(cache.join("streamline-deaths.txt"));
-    }
-    r
-}
-
-/// Exit codes of `dsport --probe-streamline`: loaded, refused without a fault, out of time (its
-/// own limit, `PROBE_SECS`).
-const PROBE_LOADED: u32 = 0;
-const PROBE_REFUSED: u32 = 3;
-const PROBE_TIMED_OUT: u32 = 4;
-const PROBE_SECS: u64 = 30;
-
-/// How the separate check ended.
-enum ProbeEnd {
-    /// Loaded, or refused without a fault (`PROBE_LOADED`, `PROBE_REFUSED`).
-    Ended(u32),
-    /// A fault's code (an NTSTATUS error, 0xC0000000 and up: an access violation, a fail-fast).
-    Faulted(u32),
-    /// Out of time, ended from outside, not started or not waited for.
-    Other(String),
-}
-
-/// Runs `dsport --probe-streamline <dir>` at normal priority (a launcher check's lower one is not
-/// inherited) and waits up to `PROBE_SECS` and a little more (it ends itself at `PROBE_SECS`).
-fn run_probe(dir: &Path) -> ProbeEnd {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => return ProbeEnd::Other(format!("could not start ({e})")),
-    };
-    let mut child = match std::process::Command::new(exe)
-        .arg("--probe-streamline")
-        .arg(dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return ProbeEnd::Other(format!("could not start ({e})")),
-    };
-    let t0 = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let code = status.code().map_or(u32::MAX, |c| c as u32);
-                return match code {
-                    PROBE_LOADED | PROBE_REFUSED => ProbeEnd::Ended(code),
-                    PROBE_TIMED_OUT => ProbeEnd::Other(format!("did not end within {PROBE_SECS} s")),
-                    c if c >= 0xC000_0000 && c != u32::MAX => ProbeEnd::Faulted(c),
-                    c => ProbeEnd::Other(format!("was ended from outside (code {c:#x})")),
-                };
-            }
-            Ok(None) if t0.elapsed() < std::time::Duration::from_secs(PROBE_SECS + 5) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Ok(None) => {
-                let _ = child.kill();
-                return ProbeEnd::Other(format!("did not end within {PROBE_SECS} s"));
-            }
-            Err(e) => return ProbeEnd::Other(format!("could not be waited for ({e})")),
-        }
-    }
-}
-
-/// `dsport --probe-streamline <dir>` (`main`, before anything else of a start): loads Streamline
-/// from `dir` as a start does (its library, slInit with DLSS, DLSS's requirements) and ends at
-/// once (no library's exit code runs): `PROBE_LOADED`, or `PROBE_REFUSED` when it refused without
-/// a fault; at `PROBE_SECS` it ends itself (`PROBE_TIMED_OUT`), so a load that hangs does not
-/// outlive the start that waits for it. A fault in it ends only this process (`load_sl`).
-pub fn probe_streamline(dir: &Path) -> ! {
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(PROBE_SECS));
-        unsafe { TerminateProcess(GetCurrentProcess(), PROBE_TIMED_OUT) };
-    });
-    if std::env::var_os("DS_SL_CRASH_TEST").is_some_and(|v| v == "1") {
-        std::process::abort();
-    }
-    let code = if load_sl_from(dir).is_ok() { PROBE_LOADED } else { PROBE_REFUSED };
-    unsafe { TerminateProcess(GetCurrentProcess(), code) };
-    std::process::exit(code as i32)
-}
-
-fn load_sl_from(dir: &Path) -> Result<SlLib, LoadError> {
-    let dir = dir.to_path_buf();
-    let path = dir.join("sl.interposer.dll");
-    let h = load_lib(&path, "NVIDIA Corporation")?;
-    let f = |name: &CStr| export(h, &path, name);
-    // SAFETY: the signatures of sl_core_api.h / sl_helpers_vk.h.
-    unsafe {
-        let init: unsafe extern "C" fn(*const SlPreferences, u64) -> i32 = std::mem::transmute(f(c"slInit")?);
-        let requirements: unsafe extern "C" fn(u32, *mut SlFeatureRequirements) -> i32 = std::mem::transmute(f(c"slGetFeatureRequirements")?);
-        let mut lib = SlLib {
-            is_supported: std::mem::transmute(f(c"slIsFeatureSupported")?),
-            set_vulkan_info: std::mem::transmute(f(c"slSetVulkanInfo")?),
-            frame_token: std::mem::transmute(f(c"slGetNewFrameToken")?),
-            set_constants: std::mem::transmute(f(c"slSetConstants")?),
-            evaluate: std::mem::transmute(f(c"slEvaluateFeature")?),
-            feature_function: std::mem::transmute(f(c"slGetFeatureFunction")?),
-            version: std::mem::transmute(f(c"slGetFeatureVersion")?),
-            gipa: std::mem::transmute(f(c"vkGetInstanceProcAddr")?),
-            reqs: DlssReqs::default(),
-        };
-        // slInit: DLSS only, the port restores its own command buffer state
-        // (it does after any foreign recording), manual hooking, no
-        // over-the-air downloads, logs into the port's log.
-        let t0 = std::time::Instant::now();
-        let dir_w = dir.as_os_str().encode_wide_null();
-        let paths = [dir_w.as_ptr()];
-        let features = [SL_FEATURE_DLSS];
-        let prefs = SlPreferences {
-            base: SlBase::new(SL_PREFERENCES, 1),
-            show_console: false,
-            log_level: 1,
-            paths_to_plugins: paths.as_ptr(),
-            num_paths_to_plugins: 1,
-            path_to_logs_and_data: std::ptr::null(),
-            allocate_callback: std::ptr::null(),
-            release_callback: std::ptr::null(),
-            log_message_callback: Some(sl_log),
-            flags: SL_DISABLE_CL_STATE_TRACKING | SL_USE_MANUAL_HOOKING,
-            features_to_load: features.as_ptr(),
-            num_features_to_load: 1,
-            application_id: 0,
-            engine: 0,
-            engine_version: c"1.0".as_ptr(),
-            project_id: NGX_PROJECT_ID.as_ptr(),
-            render_api: SL_VULKAN,
-        };
-        let r = init(&prefs, SL_SDK_VERSION);
-        if r != SL_OK {
-            return Err(format!("slInit failed ({r})").into());
-        }
-        let mut reqs: SlFeatureRequirements = std::mem::zeroed();
-        reqs.base = SlBase::new(SL_FEATURE_REQUIREMENTS, 2);
-        let r = requirements(SL_FEATURE_DLSS, &mut reqs);
-        if r != SL_OK {
-            return Err(format!("no DLSS here ({r}): it needs an NVIDIA RTX GPU and driver").into());
-        }
-        // (FeatureRequirementFlags::eVulkanSupported.)
-        if reqs.flags & 4 == 0 {
-            return Err("DLSS does not support Vulkan here".to_string().into());
-        }
-        let v = |x: [u32; 3]| format!("{}.{}.{}", x[0], x[1], x[2]);
-        crate::info!(
-            "upscaler: Streamline loaded from {} in {:.2} s (OS {} needs {}, driver {} needs {})",
-            dir.display(),
-            t0.elapsed().as_secs_f32(),
-            v(reqs.os_detected),
-            v(reqs.os_required),
-            v(reqs.driver_detected),
-            v(reqs.driver_required)
-        );
-        let strings = |n: u32, p: *const *const c_char| names(n, p).into_iter().map(|c| c.to_string_lossy().into_owned()).collect::<Vec<_>>();
-        lib.reqs = DlssReqs {
-            instance_ext: names(reqs.vk_num_instance_extensions, reqs.vk_instance_extensions),
-            device_ext: names(reqs.vk_num_device_extensions, reqs.vk_device_extensions),
-            features12: strings(reqs.vk_num_features12, reqs.vk_features12),
-            features13: strings(reqs.vk_num_features13, reqs.vk_features13),
-            queues: reqs.vk_compute_queues + reqs.vk_graphics_queues + reqs.vk_optical_flow_queues,
-        };
-        crate::info!(
-            "upscaler: DLSS asks for instance extensions {:?}, device extensions {:?}, Vulkan 1.2 features {:?}, 1.3 features {:?}, {} extra queues",
-            lib.reqs.instance_ext,
-            lib.reqs.device_ext,
-            lib.reqs.features12,
-            lib.reqs.features13,
-            lib.reqs.queues
-        );
-        Ok(lib)
-    }
-}
-
-fn dlss_device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Option<DeviceNeeds> {
-    let s = sl()?;
-    if DLSS_FAILED.load(Relaxed) {
-        return None;
-    }
-    let info = SlAdapterInfo { base: SlBase::new(SL_ADAPTER_INFO, 1), luid: std::ptr::null(), luid_size: 0, vk_physical_device: pdev };
-    let r = unsafe { (s.is_supported)(SL_FEATURE_DLSS, &info) };
-    if r != SL_OK {
-        fail(Kind::Dlss, format!("not supported on this GPU or driver (Streamline result {r})"));
-        return None;
-    }
-    if s.reqs.queues > 0 || !s.reqs.features13.is_empty() {
-        fail(Kind::Dlss, format!("it asks for {} extra queues and 1.3 features {:?}, which the port does not provide", s.reqs.queues, s.reqs.features13));
-        return None;
-    }
-    if let Err(e) = features_supported(instance, pdev, &s.reqs.features12) {
-        fail(Kind::Dlss, e);
-        return None;
-    }
-    // The device's extensions. (VK_EXT_buffer_device_address must not be
-    // enabled with the 1.2 bufferDeviceAddress feature: the KHR extension
-    // in its place, as Streamline's own device creation does.)
-    let avail = unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
-    let has = |n: &CStr| avail.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == n);
-    let mut extensions = Vec::new();
-    for e in &s.reqs.device_ext {
-        let e = if e.as_c_str() == ash::ext::buffer_device_address::NAME { ash::khr::buffer_device_address::NAME.to_owned() } else { e.clone() };
-        if !has(&e) {
-            fail(Kind::Dlss, format!("the device lacks {}", e.to_string_lossy()));
-            return None;
-        }
-        if !extensions.contains(&e) {
-            extensions.push(e);
-        }
-    }
-    Some(DeviceNeeds { extensions, mutable_descriptor: false, features: s.reqs.features12.clone() })
-}
-
-/// Hands the device to Streamline (slSetVulkanInfo, which starts NGX) on a
-/// thread of its own; DLSS is ready - offered and its present hook used -
-/// once that is done.
-fn dlss_device_created(instance: &ash::Instance, pdev: vk::PhysicalDevice, device: &ash::Device, qf: u32, queues: u32) {
-    let Some(s) = sl() else { return };
-    // (No extra queues: Streamline's would start after the port's.)
-    let info = SlVulkanInfo {
-        base: SlBase::new(SL_VULKAN_INFO, 3),
-        device: device.handle(),
-        instance: instance.handle(),
-        physical_device: pdev,
-        compute_queue_index: queues,
-        compute_queue_family: qf,
-        graphics_queue_index: queues,
-        graphics_queue_family: qf,
-        optical_flow_queue_index: 0,
-        optical_flow_queue_family: 0,
-        use_native_optical_flow: false,
-        compute_queue_create_flags: 0,
-        graphics_queue_create_flags: 0,
-        optical_flow_queue_create_flags: 0,
-    };
-    let spawned = std::thread::Builder::new().name("dlss-init".into()).spawn(move || {
-        let t0 = std::time::Instant::now();
-        let r = unsafe { (s.set_vulkan_info)(&info) };
-        if r != SL_OK {
-            fail(Kind::Dlss, format!("slSetVulkanInfo failed ({r})"));
-            return;
-        }
-        // Streamline's vkQueuePresentKHR, through its vkGetDeviceProcAddr.
-        // SAFETY: Streamline's loader functions, valid for this device.
-        let present = unsafe {
-            let gdpa: Option<vk::PFN_vkGetDeviceProcAddr> = std::mem::transmute((s.gipa)(info.instance, c"vkGetDeviceProcAddr".as_ptr()));
-            gdpa.and_then(|g| g(info.device, c"vkQueuePresentKHR".as_ptr())).map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkQueuePresentKHR>(p))
-        };
-        let Some(present) = present else {
-            fail(Kind::Dlss, "no vkQueuePresentKHR from Streamline");
-            return;
-        };
-        let mut ver: SlFeatureVersion = unsafe { std::mem::zeroed() };
-        ver.base = SlBase::new(SL_FEATURE_VERSION, 1);
-        let ngx = if unsafe { (s.version)(SL_FEATURE_DLSS, &mut ver) } == SL_OK { format!(", NGX DLSS {}.{}.{}", ver.ngx[0], ver.ngx[1], ver.ngx[2]) } else { String::new() };
-        // (Ready before its present is published: the first present through Streamline then
-        // finds DLSS ready, and `note_sl_present` logs it in use; the review of 2026-11-25.)
+/// Streamline is ready (`gpu::streamline::device_created`, its own thread): DLSS is, where the
+/// device supports it.
+pub(super) fn streamline_ready() {
+    if sl::supported(sl::FEATURE_DLSS) {
         DLSS_READY.store(true, SeqCst);
-        crate::info!("upscaler: DLSS ready in {:.2} s (Streamline {}.{}.{}{ngx}): in use from the first present through Streamline", t0.elapsed().as_secs_f32(), ver.sl[0], ver.sl[1], ver.sl[2]);
-        let _ = SL_PRESENT.set(present);
-    });
-    if let Err(e) = spawned {
-        fail(Kind::Dlss, format!("no thread for its start ({e})"));
+        crate::info!("upscaler: DLSS ready: in use from the first present through Streamline");
+        // (Ready before the first present through Streamline: `note_sl_present` then logs it.)
+        if SL_PRESENTED.load(SeqCst) {
+            now_ready(Kind::Dlss);
+        }
     }
+}
+
+/// The common constants of a frame (`gpu::streamline::set_constants`, shared by DLSS and DLSS
+/// Frame Generation): the jitter of the frame in pixels of the render size, the motion vectors'
+/// scale, the render size's aspect, and whether the history starts anew. The camera's matrices
+/// and vectors are not known to the port: neutral values (an identity camera, whose basis is
+/// orthonormal, so DLSS-G's scene change detection stays valid and the reset flag decides).
+pub fn frame_constants(jitter: (f32, f32), aspect: f32, reset: bool) -> SlConstants {
+    // The game's motion vectors: screen fraction, current - previous; Streamline's: scaled
+    // into [-1, 1] screen fractions, current -> previous.
+    let (mx, my) = mv_scale();
+    SlConstants {
+        base: SlBase::new(sl::SL_CONSTANTS, 2),
+        camera_view_to_clip: IDENTITY,
+        clip_to_camera_view: IDENTITY,
+        clip_to_lens_clip: IDENTITY,
+        clip_to_prev_clip: IDENTITY,
+        prev_clip_to_clip: IDENTITY,
+        // (DLSS's jitter: the image's shift, as rendered.)
+        jitter_offset: [jitter.0, jitter.1],
+        mvec_scale: [-mx, -my],
+        camera_pinhole_offset: [0.0, 0.0],
+        camera_pos: [0.0, 0.0, 0.0],
+        camera_up: [0.0, 1.0, 0.0],
+        camera_right: [1.0, 0.0, 0.0],
+        camera_fwd: [0.0, 0.0, 1.0],
+        camera_near: 0.1,
+        camera_far: 10000.0,
+        camera_fov: 1.0,
+        camera_aspect_ratio: aspect,
+        motion_vectors_invalid_value: 0.0,
+        // (The title's depth is reversed: near 1, far 0.)
+        depth_inverted: SL_TRUE,
+        camera_motion_included: SL_TRUE,
+        motion_vectors_3d: SL_FALSE,
+        reset: if reset { SL_TRUE } else { SL_FALSE },
+        orthographic_projection: SL_FALSE,
+        motion_vectors_dilated: SL_FALSE,
+        motion_vectors_jittered: SL_FALSE,
+        min_relative_linear_depth_object_separation: 40.0,
+    }
+}
+
+/// The jitter Streamline is given for an upscaler's inputs (the title's offset times
+/// `jitter_scale`).
+pub fn sl_jitter(inp: &Inputs) -> (f32, f32) {
+    let (sx, sy) = jitter_scale();
+    (inp.jitter_x * sx, inp.jitter_y * sy)
 }
 
 /// slDLSSSetOptions (from the plugin, once the device is set).
@@ -1770,38 +1172,20 @@ struct DlssState {
 
 static DLSS_STATE: Mutex<Option<DlssState>> = Mutex::new(None);
 
-fn sl_resource(t: &Tex) -> SlResource {
-    use ash::vk::Handle;
-    SlResource {
-        base: SlBase::new(SL_RESOURCE, 1),
-        ty: 0,
-        native: t.image.as_raw(),
-        memory: 0,
-        view: t.view.as_raw(),
-        state: t.layout.as_raw() as u32,
-        width: t.size.0,
-        height: t.size.1,
-        native_format: t.format.as_raw() as u32,
-        mip_levels: 1,
-        array_layers: 1,
-        gpu_virtual_address: 0,
-        flags: 0,
-        usage: t.usage.as_raw(),
-        internal_flags: 0,
-        reserved: 0,
-    }
+pub fn sl_resource(t: &Tex) -> SlResource {
+    SlResource::image(t.image, t.view, t.layout, t.format, t.size, t.usage)
 }
 
 fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
-    let Some(s) = sl() else { return false };
+    if sl::lib().is_none() {
+        return false;
+    }
     let mut st = DLSS_STATE.lock();
     if st.is_none() {
-        let mut p: *const c_void = std::ptr::null();
-        let r = unsafe { (s.feature_function)(SL_FEATURE_DLSS, c"slDLSSSetOptions".as_ptr(), &mut p) };
-        if r != SL_OK || p.is_null() {
-            fail(Kind::Dlss, format!("no slDLSSSetOptions ({r})"));
+        let Some(p) = sl::feature_fn(sl::FEATURE_DLSS, c"slDLSSSetOptions") else {
+            fail(Kind::Dlss, "no slDLSSSetOptions");
             return false;
-        }
+        };
         // SAFETY: sl_dlss.h's PFun_slDLSSSetOptions.
         let set_options: DlssSetOptions = unsafe { std::mem::transmute(p) };
         *st = Some(DlssState { set_options, key: (0, 0, 0, 0, false), frame: 0 });
@@ -1818,51 +1202,13 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
         }
         d.key = key;
     }
-    let (jx, jy) = (inp.jitter_x, inp.jitter_y);
-    let (sx, sy) = jitter_scale();
-    // The game's motion vectors: screen fraction, current - previous;
-    // Streamline's: scaled into [-1, 1] screen fractions, current ->
-    // previous.
-    let (mx, my) = mv_scale();
     let reset = reset || d.frame == 0 || new_size;
     d.frame += 1;
     let set_options = d.set_options;
     drop(st);
-    let consts = SlConstants {
-        base: SlBase::new(SL_CONSTANTS, 2),
-        // (DLSS's upscaling reads the jitter and the motion vectors; the
-        // camera's matrices and vectors are for frame generation: neutral
-        // values.)
-        camera_view_to_clip: IDENTITY,
-        clip_to_camera_view: IDENTITY,
-        clip_to_lens_clip: IDENTITY,
-        clip_to_prev_clip: IDENTITY,
-        prev_clip_to_clip: IDENTITY,
-        // (DLSS's jitter: the image's shift, as rendered.)
-        jitter_offset: [jx * sx, jy * sy],
-        mvec_scale: [-mx, -my],
-        camera_pinhole_offset: [0.0, 0.0],
-        camera_pos: [0.0, 0.0, 0.0],
-        camera_up: [0.0, 1.0, 0.0],
-        camera_right: [1.0, 0.0, 0.0],
-        camera_fwd: [0.0, 0.0, 1.0],
-        camera_near: 0.1,
-        camera_far: 10000.0,
-        camera_fov: 1.0,
-        camera_aspect_ratio: inp.in_width as f32 / inp.in_height.max(1) as f32,
-        motion_vectors_invalid_value: 0.0,
-        // (The title's depth is reversed: near 1, far 0.)
-        depth_inverted: SL_TRUE,
-        camera_motion_included: SL_TRUE,
-        motion_vectors_3d: SL_FALSE,
-        reset: if reset { SL_TRUE } else { SL_FALSE },
-        orthographic_projection: SL_FALSE,
-        motion_vectors_dilated: SL_FALSE,
-        motion_vectors_jittered: SL_FALSE,
-        min_relative_linear_depth_object_separation: 40.0,
-    };
+    let consts = frame_constants(sl_jitter(inp), inp.in_width as f32 / inp.in_height.max(1) as f32, reset);
     let opts = SlDlssOptions {
-        base: SlBase::new(SL_DLSS_OPTIONS, 3),
+        base: SlBase::new(sl::SL_DLSS_OPTIONS, 3),
         mode,
         output_width: inp.width,
         output_height: inp.height,
@@ -1884,7 +1230,7 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
     let res = [sl_resource(&inp.depth), sl_resource(&inp.velocity), sl_resource(&inp.color), sl_resource(&inp.output)];
     let extent = SlExtent { top: 0, left: 0, width: inp.in_width, height: inp.in_height };
     let out_extent = SlExtent { top: 0, left: 0, width: inp.width, height: inp.height };
-    let (frame_token, set_constants, evaluate) = (s.frame_token, s.set_constants, s.evaluate);
+    let frame = inp.frame;
     // Recorded into the command buffer the deferred list is played into (`cb`), not the one it was
     // recorded for (`cmd`): a batch fused into an earlier one's buffer at submission plays there,
     // and its own buffer is never begun. Until 2026-11-25 the upscalers recorded into `cmd`: with
@@ -1898,26 +1244,25 @@ fn dlss_record(cmd: vk::CommandBuffer, inp: &Inputs, reset: bool) -> bool {
             static N_CONST: AtomicU32 = AtomicU32::new(0);
             static N_OPT: AtomicU32 = AtomicU32::new(0);
             static N_EVAL: AtomicU32 = AtomicU32::new(0);
-            let viewport = SlViewport { base: SlBase::new(SL_VIEWPORT, 1), value: 0 };
-            let mut token: *const c_void = std::ptr::null();
+            let viewport = sl::viewport();
             EVAL_OK.store(false, Relaxed);
-            let r = frame_token(&mut token, std::ptr::null());
-            if r != SL_OK || token.is_null() {
-                warn_some(&N_TOKEN, "slGetNewFrameToken", r);
+            // (The frame's token by the port's index, the flip that shows it: the same frame
+            // DLSS Frame Generation and Reflex name, `gpu::streamline`.)
+            let Some(token) = sl::token(frame) else {
+                warn_some(&N_TOKEN, "slGetNewFrameToken", -1);
                 return;
-            }
-            let r = set_constants(&consts, token, &viewport);
-            if r != SL_OK {
-                warn_some(&N_CONST, "slSetConstants", r);
+            };
+            if !sl::set_constants(frame, token, &consts) {
+                warn_some(&N_CONST, "slSetConstants", -1);
             }
             let r = set_options(&viewport, &opts);
             if r != SL_OK {
                 warn_some(&N_OPT, "slDLSSSetOptions", r);
             }
-            let tag = |i: usize, ty: u32| SlResourceTag { base: SlBase::new(SL_RESOURCE_TAG, 1), resource: &res[i], ty, lifecycle: SL_VALID_UNTIL_EVALUATE, extent: if i == 3 { out_extent } else { extent } };
-            let tags = [tag(0, SL_DEPTH), tag(1, SL_MOTION_VECTORS), tag(2, SL_SCALING_INPUT_COLOR), tag(3, SL_SCALING_OUTPUT_COLOR)];
+            let tag = |i: usize, ty: u32| SlResourceTag::new(&res[i], ty, sl::SL_VALID_UNTIL_EVALUATE, if i == 3 { out_extent } else { extent });
+            let tags = [tag(0, sl::SL_DEPTH), tag(1, sl::SL_MOTION_VECTORS), tag(2, sl::SL_SCALING_INPUT_COLOR), tag(3, sl::SL_SCALING_OUTPUT_COLOR)];
             let inputs: [*const SlBase; 5] = [&viewport.base, &tags[0].base, &tags[1].base, &tags[2].base, &tags[3].base];
-            let r = evaluate(SL_FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, cb);
+            let r = sl::evaluate(sl::FEATURE_DLSS, token, &inputs, cb);
             EVAL_OK.store(r == SL_OK, Relaxed);
             if r != SL_OK {
                 warn_some(&N_EVAL, "slEvaluateFeature (DLSS)", r);
@@ -2145,7 +1490,7 @@ fn fsr_device_needs(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Optio
     let have = device_features(instance, pdev, &want);
     let features: Vec<String> = want.iter().zip(have).filter(|(_, h)| *h == Some(true)).map(|(n, _)| n.to_string()).collect();
     crate::info!("upscaler: FSR gets the device features {features:?}");
-    Some(DeviceNeeds { extensions: Vec::new(), mutable_descriptor: false, features })
+    Some(DeviceNeeds { extensions: Vec::new(), mutable_descriptor: false, features, extra_graphics_queues: 0 })
 }
 
 unsafe extern "C" fn ffx_log(ty: u32, msg: *const u16) {
@@ -2361,39 +1706,6 @@ mod tests {
             let (x, y) = (halton(i, 2), halton(i, 3));
             assert!((-0.5..0.5).contains(&x) && (-0.5..0.5).contains(&y));
         }
-    }
-
-    /// Streamline's structures as its MSVC build lays them out (offsets
-    /// from the SDK's headers, e.g. its own static_assert on VulkanInfo).
-    #[test]
-    fn streamline_layouts() {
-        use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<SlBase>(), 32);
-        assert_eq!(size_of::<SlPreferences>(), 144);
-        assert_eq!(offset_of!(SlPreferences, flags), 88);
-        assert_eq!(offset_of!(SlPreferences, render_api), 136);
-        assert_eq!(size_of::<SlResource>(), 112);
-        assert_eq!(offset_of!(SlResource, native), 40);
-        assert_eq!(offset_of!(SlResource, state), 64);
-        assert_eq!(offset_of!(SlResource, gpu_virtual_address), 88);
-        assert_eq!(size_of::<SlResourceTag>(), 64);
-        assert_eq!(offset_of!(SlResourceTag, extent), 48);
-        assert_eq!(size_of::<SlViewport>(), 40);
-        assert_eq!(size_of::<SlFeatureRequirements>(), 184);
-        assert_eq!(offset_of!(SlFeatureRequirements, vk_device_extensions), 120);
-        assert_eq!(offset_of!(SlFeatureRequirements, vk_optical_flow_queues), 176);
-        assert_eq!(size_of::<SlAdapterInfo>(), 56);
-        assert_eq!(size_of::<SlVulkanInfo>(), 96);
-        assert_eq!(offset_of!(SlVulkanInfo, use_native_optical_flow), 80);
-        assert_eq!(size_of::<SlConstants>(), 456);
-        assert_eq!(offset_of!(SlConstants, jitter_offset), 352);
-        assert_eq!(offset_of!(SlConstants, depth_inverted), 444);
-        assert_eq!(offset_of!(SlConstants, min_relative_linear_depth_object_separation), 452);
-        assert_eq!(size_of::<SlDlssOptions>(), 88);
-        assert_eq!(offset_of!(SlDlssOptions, dlaa_preset), 60);
-        assert_eq!(offset_of!(SlDlssOptions, use_auto_exposure), 84);
-        assert_eq!(size_of::<SlFeatureVersion>(), 56);
-        assert_eq!(SL_SDK_VERSION, 0x0002_000e_0010_fedc);
     }
 
     /// FSR's structures (natural C layout, checked against the headers).

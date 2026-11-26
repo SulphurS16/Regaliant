@@ -121,8 +121,8 @@ The launcher
   space"), what your PC brings, and safe mode for the next start.
 - Display: window mode, monitor, fullscreen resolution and refresh rate, render scale and
   frame rate limit for the next start. The game's PC tab changes the same settings.
-  Safe mode starts the game in a window with the default settings and without an upscaler. Use
-  it when the game does not start.
+  Safe mode starts the game in a window with the default settings and without an upscaler,
+  Frame Generation or Reflex. Use it when the game does not start.
 - Shaders: prepares the game's shaders ahead. Without them the game compiles each shader the
   first time it needs it. An object can then be missing for a moment, and some compiles make
   play stutter. Prepared shaders make the stutters much shorter, but some remain on first

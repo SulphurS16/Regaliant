@@ -133,6 +133,10 @@ struct Shared {
     hold_done: AtomicU64,
     hold_n: AtomicU64,
     hold_runs: [[AtomicU64; 3]; HOLD_RUNS],
+    /// dsport's run folder (its log's), UTF-16, and its length (written once by dsport:
+    /// `note_run_dir`): where the host notes how the game ended when the game could not.
+    run_dir: [std::sync::atomic::AtomicU16; 520],
+    run_dir_len: AtomicU32,
     /// (page | 1 for a write, the faulting instruction).
     ring: [[AtomicU64; 2]; RING],
     leaves: [[AtomicU64; (LEAF_PAGES / 64) as usize]; MAX_LEAVES],
@@ -259,6 +263,63 @@ pub fn init() {
             last = now;
         }
     });
+}
+
+/// The run folder (where the log is) for the host's note of how the game ended (`run_host`).
+pub fn note_run_dir(dir: &std::path::Path) {
+    let Some(s) = shared() else { return };
+    let w: Vec<u16> = dir.as_os_str().to_string_lossy().encode_utf16().collect();
+    if w.len() > s.run_dir.len() {
+        return;
+    }
+    for (a, c) in s.run_dir.iter().zip(&w) {
+        a.store(*c, Ordering::Relaxed);
+    }
+    s.run_dir_len.store(w.len() as u32, Ordering::Release);
+}
+
+/// The host: how the game ended when no handler of the game's own reported it (an exception it
+/// did not handle, second chance, the debugger's to see: one inside a library such as NVIDIA's,
+/// whose own crash handler or a fast fail ends the process before the game's can run), appended
+/// to the game's log and written to `host-exit.txt` beside it. (2026-11-26: the first Frame
+/// Generation test ended with nothing in the log.)
+fn note_end(s: &Shared, text: &str) {
+    let n = (s.run_dir_len.load(Ordering::Acquire) as usize).min(s.run_dir.len());
+    if n == 0 {
+        eprintln!("{text}");
+        return;
+    }
+    let w: Vec<u16> = s.run_dir[..n].iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    let dir = std::path::PathBuf::from(String::from_utf16_lossy(&w));
+    let _ = std::fs::write(dir.join("host-exit.txt"), format!("{text}\n"));
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(dir.join("dsport.log")) {
+        let _ = writeln!(f, "[host] E: {text}");
+    }
+}
+
+/// The name of the debuggee's module that holds `addr` and the offset into it, from the DLL load
+/// events seen (the nearest base below: modules do not overlap).
+fn module_at(mods: &[(u64, String)], addr: u64) -> String {
+    match mods.iter().filter(|(b, _)| *b <= addr).max_by_key(|(b, _)| *b) {
+        Some((b, n)) => format!("{n}+{:#x}", addr - b),
+        None => format!("{addr:#x}"),
+    }
+}
+
+/// A file handle's path (a debug event's image file), its file name.
+fn handle_file_name(f: HANDLE) -> String {
+    let mut buf = [0u16; 520];
+    let n = unsafe { windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(f, buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+    let p = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+    // (Numbered copies under NVIDIA's folders keep their folder's name: NGX's models and
+    // Streamline's plugin overrides.)
+    let parts: Vec<&str> = p.rsplit('\\').take(4).collect();
+    match parts.as_slice() {
+        [file, ..] if p.to_ascii_lowercase().contains("\\nvidia\\ngx") => format!("{} ({file})", parts.iter().rev().cloned().collect::<Vec<_>>().join("\\")),
+        [file, ..] => file.to_string(),
+        [] => "?".into(),
+    }
 }
 
 /// A view split has unmapped guest [lo, hi) until the next call (hi 0:
@@ -942,6 +1003,9 @@ pub fn run_host() -> ! {
     let mut spinning: Vec<(u32, u64)> = Vec::new();
     let mut first_bp = true;
     let mut code = 0u32;
+    // The debuggee's modules (base, name) and the last exception no handler took.
+    let mut mods: Vec<(u64, String)> = Vec::new();
+    let mut fatal: Option<String> = None;
     loop {
         // (Hold requests between events: `hold_by_host`. Waits of 1 ms so
         // that a request waits no longer than that for a quiet process.)
@@ -960,14 +1024,22 @@ pub fn run_host() -> ! {
             CREATE_PROCESS_DEBUG_EVENT => unsafe {
                 let f = ev.u.CreateProcessInfo.hFile;
                 if !f.is_null() {
+                    mods.push((ev.u.CreateProcessInfo.lpBaseOfImage as u64, handle_file_name(f)));
                     CloseHandle(f);
                 }
             },
             LOAD_DLL_DEBUG_EVENT => unsafe {
                 let f = ev.u.LoadDll.hFile;
+                let base = ev.u.LoadDll.lpBaseOfDll as u64;
+                mods.retain(|(b, _)| *b != base);
                 if !f.is_null() {
+                    mods.push((base, handle_file_name(f)));
                     CloseHandle(f);
                 }
+            },
+            UNLOAD_DLL_DEBUG_EVENT => unsafe {
+                let base = ev.u.UnloadDll.lpBaseOfDll as u64;
+                mods.retain(|(b, _)| *b != base);
             },
             EXCEPTION_DEBUG_EVENT => unsafe {
                 let t = std::time::Instant::now();
@@ -1054,6 +1126,16 @@ pub fn run_host() -> ! {
                     first_bp = false;
                 } else {
                     status = DBG_EXCEPTION_NOT_HANDLED;
+                    // (Second chance: no handler in the game took it; the process ends now.)
+                    if e.dwFirstChance == 0 {
+                        let at = module_at(&mods, rec.ExceptionAddress as u64);
+                        let detail = match exc {
+                            0xC000_0005 => format!(" ({} of {addr:#x})", match rec.ExceptionInformation[0] { 0 => "read", 1 => "write", 8 => "execute", _ => "access" }),
+                            0xC000_0409 => format!(" (fast fail, code {})", rec.ExceptionInformation[0]),
+                            _ => String::new(),
+                        };
+                        fatal = Some(format!("the game ended on exception {exc:#010x}{detail} at {at}, thread {}, which no handler of its own took", ev.dwThreadId));
+                    }
                     let k = s.passed.fetch_add(1, Ordering::Relaxed) as usize;
                     if k < PASSED_LOG {
                         let l = &s.passed_log[k];
@@ -1066,6 +1148,13 @@ pub fn run_host() -> ! {
             },
             EXIT_PROCESS_DEBUG_EVENT => unsafe {
                 code = ev.u.ExitProcess.dwExitCode;
+                // (A status code as the exit code without an exception seen: a library's crash
+                // handler ended the process, or Windows did.)
+                match &fatal {
+                    Some(f) => note_end(s, &format!("{f}; exit code {code:#x}")),
+                    None if code >= 0xC000_0000 => note_end(s, &format!("the game ended with exit code {code:#010x} and no report of its own (ended by a library's crash handler, a fast fail or Windows)")),
+                    None => {}
+                }
                 ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
                 break;
             },
