@@ -1687,6 +1687,9 @@ fn mark_dwords_once(tr: &mut T, r: usize, d0: Word, n: u32) -> R<()> {
         if tr.spec.marks_part {
             return mark_partitioned(tr, marks, w, m0, m1, n);
         }
+        if tr.spec.marks_wf {
+            return mark_waterfall(tr, marks, w, m0, m1, n);
+        }
         // Lanes whose words lie within four of the first active lane's
         // (consecutive stores: usually all) combine their bits: one lane
         // stores at most five words for them. The others store their own.
@@ -1888,6 +1891,74 @@ fn mark_part_lanes(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32)
     let me = tr.subgroup_lane()?;
     let is_lead = e(tr.b.i_equal(b, None, me, lead))?;
     tr.guarded(is_lead, &mut |tr| mark_lead(tr, marks, w, or0, or1))
+}
+
+/// `Spec::marks_wf`: at most this many rounds of `mark_waterfall` (a map word
+/// each).
+const WF_ROUNDS: u32 = 4;
+
+/// `Spec::marks_wf` (devices without partitioned subgroups): the active lanes
+/// peel off by map word `w` in a loop uniform over the subgroup. Each round
+/// takes the lowest pending lane's word `w0` (a ballot of the pending lanes,
+/// its lowest bit, a shuffle): the pending lanes marking `w0` OR their bits
+/// (a reduction over the subgroup, zeros from the others), the lowest of them
+/// stores them and touches the pages (`mark_lead`), and those lanes are done.
+/// Lanes still pending after `WF_ROUNDS` rounds mark their own words. The
+/// same bits and pages as the other forms; a store whose lanes write one to
+/// four words (the usual) makes one map store a word, where the near path
+/// makes five reductions and each far lane its own.
+fn mark_waterfall(tr: &mut T, marks: Word, w: Word, m0: Word, m1: Word, n: u32) -> R<()> {
+    tr.b.capability(spirv::Capability::GroupNonUniform);
+    tr.b.capability(spirv::Capability::GroupNonUniformBallot);
+    tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
+    tr.b.capability(spirv::Capability::GroupNonUniformShuffle);
+    let (u, b) = (tr.t.u32, tr.t.bool_);
+    let sg = tr.u(spirv::Scope::Subgroup as u32);
+    let (z, one, rounds) = (tr.u(0), tr.u(1), tr.u(WF_ROUNDS));
+    let t = tr.bool_c(true);
+    let me = tr.subgroup_lane()?;
+    let (pre, head, body, cont, merge) = (tr.b.id(), tr.b.id(), tr.b.id(), tr.b.id(), tr.b.id());
+    let (pending_next, round_next) = (tr.b.id(), tr.b.id());
+    // (A block of its own before the loop: the phis' entry edge.)
+    ok(tr.b.branch(pre))?;
+    e(tr.b.begin_block(Some(pre)))?;
+    ok(tr.b.branch(head))?;
+    e(tr.b.begin_block(Some(head)))?;
+    let pending = e(tr.b.phi(b, None, [(t, pre), (pending_next, cont)]))?;
+    let round = e(tr.b.phi(u, None, [(z, pre), (round_next, cont)]))?;
+    let ballot = e(tr.b.group_non_uniform_ballot(tr.t.v4u, None, sg, pending))?;
+    let left = e(tr.b.group_non_uniform_ballot_bit_count(u, None, sg, spirv::GroupOperation::Reduce, ballot))?;
+    let some = e(tr.b.u_greater_than(b, None, left, z))?;
+    let under = e(tr.b.u_less_than(b, None, round, rounds))?;
+    let go = e(tr.b.logical_and(b, None, some, under))?;
+    // (The merge instruction right before the header's branch.)
+    ok(tr.b.loop_merge(merge, cont, spirv::LoopControl::NONE, []))?;
+    ok(tr.b.branch_conditional(go, body, merge, []))?;
+    e(tr.b.begin_block(Some(body)))?;
+    let lead = e(tr.b.group_non_uniform_ballot_find_lsb(u, None, sg, ballot))?;
+    let w0 = e(tr.b.group_non_uniform_shuffle(u, None, sg, w, lead))?;
+    let same = e(tr.b.i_equal(b, None, w, w0))?;
+    let mine = e(tr.b.logical_and(b, None, pending, same))?;
+    let c0 = e(tr.b.select(u, None, mine, m0, z))?;
+    let or0 = e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, c0, None))?;
+    let or1 = if n > 1 {
+        let c1 = e(tr.b.select(u, None, mine, m1, z))?;
+        Some(e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, c1, None))?)
+    } else {
+        None
+    };
+    let is_lead = e(tr.b.i_equal(b, None, me, lead))?;
+    tr.guarded(is_lead, &mut |tr| mark_lead(tr, marks, w0, or0, or1))?;
+    let not_mine = e(tr.b.logical_not(b, None, mine))?;
+    e(tr.b.logical_and(b, Some(pending_next), pending, not_mine))?;
+    e(tr.b.i_add(u, Some(round_next), round, one))?;
+    ok(tr.b.branch(cont))?;
+    e(tr.b.begin_block(Some(cont)))?;
+    ok(tr.b.branch(head))?;
+    e(tr.b.begin_block(Some(merge)))?;
+    // (Past the rounds: each lane still pending marks its own word.)
+    let m1 = (n > 1).then_some(m1);
+    tr.guarded(pending, &mut |tr| mark_lead(tr, marks, w, m0, m1))
 }
 
 /// The leader's part of a mark: the OR of the lanes' bits into map word
