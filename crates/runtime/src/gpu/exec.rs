@@ -21783,6 +21783,9 @@ impl Exec {
             None => shaders::prepare_compute(cp, wave64)?,
         };
         taa_probe(&p);
+        if super::passmap::armed() {
+            super::passmap::dispatch(&self.name, &p, groups);
+        }
         // (`atprobe <n> <hex cs> <hex image base> <u> <v>` (diagnosis): before each of the next n
         // dispatches of that program, the frame's work before it completed, a 4x4 block of the
         // image at that base.)

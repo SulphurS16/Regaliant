@@ -3107,6 +3107,9 @@ impl Exec {
             if draw_traces() {
                 trace_ps_targets(ps_addr, &colors, &depth);
             }
+            if super::super::passmap::armed() {
+                super::super::passmap::draw(&self.name, vs.addr, ps.as_ref(), &colors, &depth, !same);
+            }
             if (!same || feedback) && expect.is_some() {
                 delta_mismatch(3, vs.addr, ps_addr);
             }

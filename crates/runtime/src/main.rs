@@ -1312,6 +1312,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                     _ => Err("usage: fillimg <hex address>|cs=<hex shader> <value>".into()),
                 }
             }
+            "passmap" => {
+                // Diagnosis: `passmap <flips>` (at most 4): the queues' passes in order (`gpu::passmap`).
+                gpu::passmap::arm(parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1))
+            }
             "upscaler" => {
                 // `upscaler off|dlss|fsr|xess`: the Anti-Aliasing's upscaler, live (tests).
                 let v = parts.next().unwrap_or("off");
