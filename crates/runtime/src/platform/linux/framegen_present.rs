@@ -21,8 +21,9 @@ impl Drop for Pair {
 }
 #[derive(Clone)]
 struct Frame { pair: Arc<Pair>, at: u64, flip: u64, generated: bool, shot: bool }
-struct Queue { frames: VecDeque<Frame>, interval: u64, previous: Option<u64>, paused: bool }
-static QUEUE: Mutex<Queue> = Mutex::new(Queue { frames: VecDeque::new(), interval: 33_333_333, previous: None, paused: false });
+// plain: packets in a row without an interpolation (history resets, no TAA): no playback lag then.
+struct Queue { frames: VecDeque<Frame>, interval: u64, previous: Option<u64>, paused: bool, plain: u32 }
+static QUEUE: Mutex<Queue> = Mutex::new(Queue { frames: VecDeque::new(), interval: 33_333_333, previous: None, paused: false, plain: 0 });
 struct Copies { pool: v::CommandPool, cmd: v::CommandBuffer, fence: v::Fence, pairs: Vec<Arc<Pair>> }
 static COPIES: Mutex<Option<Copies>> = Mutex::new(None);
 
@@ -37,6 +38,7 @@ fn select(times: impl Iterator<Item = (usize, u64, bool)>, due: u64, last: Optio
     }
     real.or(generated).map(|(i, _)| i)
 }
+const PLAIN_RUN: u32 = 3;
 fn delay(interval: u64) -> u64 { interval.clamp(8_000_000, 96_000_000) + 4_000_000 }
 
 pub fn pause() {
@@ -112,6 +114,7 @@ pub fn enqueue(real: v::Image, size: (u32, u32), generated: Option<v::Image>, at
             q.frames.push_back(Frame { pair: pair.clone(), at: prev + interval / 2, flip, generated: true, shot });
         }
     }
+    q.plain = if generated.is_some() { 0 } else { q.plain.saturating_add(1) };
     q.previous = Some(at); q.paused = false;
     q.frames.push_back(Frame { pair, at, flip, generated: false, shot });
     while q.frames.len() > 8 { q.frames.pop_front(); STATS[4].fetch_add(1, Relaxed); }
@@ -140,7 +143,9 @@ fn worker() {
         if q.paused || q.frames.is_empty() && last.is_none() {
             WAKE.wait_for(&mut q, tick); next = Instant::now(); continue;
         }
-        let slot = ns(now); let lag = delay(q.interval);
+        // Without interpolations to place between real frames, holding real frames back only
+        // adds latency and uneven repeats: show each as soon as it is ready.
+        let slot = ns(now); let lag = if q.plain >= PLAIN_RUN { 0 } else { delay(q.interval) };
         let index = select(q.frames.iter().enumerate().map(|(i,f)| (i,f.at,f.generated)), slot.saturating_sub(lag), last_time);
         let repeat = index.is_none();
         if let Some(i) = index {

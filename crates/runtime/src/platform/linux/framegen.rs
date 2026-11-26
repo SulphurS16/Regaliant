@@ -121,6 +121,11 @@ pub fn apply_features(supported: &v::PhysicalDeviceFeatures, enabled: &mut v::Ph
     DEVICE_INPUTS_SUPPORTED.store(supported, Relaxed);
     note("device features", format_args!("shaderStorageImageExtendedFormats={supported}; required by FSR3 FI/OF"));
 }
+/// Whether the PC setting `value`, with DS_FRAME_GENERATION deciding where it is set, asks for
+/// frame generation (`pcsettings` keeps the title's TAA on for it: FG's inputs are TAA's).
+pub fn wanted(value: u32) -> bool {
+    std::env::var("DS_FRAME_GENERATION").ok().map_or(value != 0, |v| v == "fsr3" || v == "1")
+}
 pub fn set_choice(value: u32) {
     let mut value = std::env::var("DS_FRAME_GENERATION")
         .ok()
@@ -1120,6 +1125,16 @@ pub fn present_pair(src: &vk::present::Source) -> bool {
             let epoch = EPOCH.load(Relaxed);
             let reset = reset_history(g.last_id, cap.id, cap.constants.history,
                 g.epoch != epoch, real_ms, cap.at.elapsed());
+            if reset {
+                // (Diagnosis: which rule reset it; a run of resets shows no generated frames.)
+                let why = if !cap.constants.history { "reset: title history off" }
+                    else if g.last_id == 0 { "reset: first frame" }
+                    else if cap.id != g.last_id.saturating_add(1) { "reset: TAA id gap" }
+                    else if g.epoch != epoch { "reset: epoch moved" }
+                    else if real_ms > 150.0 { "reset: long real interval" }
+                    else { "reset: old input" };
+                note(why, format_args!("TAA {} after {}, epoch {} -> {epoch}, real {real_ms:.1}ms, input age {:.1}ms", cap.id, g.last_id, g.epoch, cap.at.elapsed().as_secs_f64() * 1000.0));
+            }
             c.device
                 .reset_command_pool(g.pool, v::CommandPoolResetFlags::empty())
                 .map_err(|e| e.to_string())?;
