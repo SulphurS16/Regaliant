@@ -154,6 +154,19 @@ pub fn flip_time(n: u64) -> Option<Instant> {
 static FLIP_CV: Condvar = Condvar::new();
 static VBLANK_CV: Condvar = Condvar::new();
 
+/// The title's Bink movies' frame rate: all four (the PlayStation Studios logo, the attract
+/// movie, the title logo and the main menu's background) are 3840x2160 at 30/1 by their
+/// headers.
+const MOVIE_FPS: u64 = 30;
+
+/// `tune frame_cap`, except while a movie plays: then the movie's own rate whatever the frame
+/// rate limit (uncapped is left the same way, `period_now`), so on the display's grid each movie
+/// frame stays a whole number of refreshes (two at 60 Hz) instead of one or two as frames
+/// landed (the attract movie at ~44 uncapped, the logo at ~85).
+fn movie_cap() -> u64 {
+    if crate::thread::movie_playing() { MOVIE_FPS } else { crate::gpu::tune::frame_cap() }
+}
+
 fn vblank_thread() {
     crate::log::set_thread_name("vblank");
     // (`DS_SIM_HANG_AT=<s>`, a test: this thread stops that long after it began, no flip from
@@ -174,7 +187,8 @@ fn vblank_thread() {
     // The uncapped frame rate (`tune uncapped`): on the thread's own timer the vblanks come at
     // UNCAPPED_HZ while it is on (an explicit DS_VBLANK_HZ stays the rate).
     let uncapped_period = Duration::from_nanos((1e9 / UNCAPPED_HZ) as u64);
-    let period_now = || if hz.is_none() && crate::gpu::tune::uncapped() { uncapped_period } else { base };
+    // (While a movie plays, the display's refresh whatever the limit: `movie_cap`.)
+    let period_now = || if hz.is_none() && crate::gpu::tune::uncapped() && !crate::thread::movie_playing() { uncapped_period } else { base };
     let mut period = period_now();
     if period != base {
         crate::info!("vblank at {:.2} Hz (the frame rate uncapped)", 1.0 / period.as_secs_f64());
@@ -264,7 +278,7 @@ fn vblank_thread() {
             if uncapped {
                 return Duration::ZERO;
             }
-            let cap = crate::gpu::tune::frame_cap();
+            let cap = movie_cap();
             let own = base * (flip_rate + 1);
             if cap > 0 { own.max(Duration::from_secs_f64(1.0 / cap as f64)) } else { own }
         };
@@ -327,7 +341,7 @@ fn vblank_thread() {
                 p.vblank_time = crate::hle::kernel::time::process_time_us();
                 p.vblank_tsc = unsafe { core::arch::x86_64::_rdtsc() };
             }
-            let cap = crate::gpu::tune::frame_cap();
+            let cap = movie_cap();
             // The frame limit in frames a second (None: uncapped): the title's own flip rate
             // (every vblank of its 59.94 Hz, or every second or third), `tune frame_cap` under it.
             let limit_fps: Option<f64> = (!uncapped).then(|| {

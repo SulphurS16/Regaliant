@@ -146,12 +146,15 @@ pub fn enabled() -> bool {
     static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
     let gate = if CHOICE.load(Relaxed) != 1 { 0 }
         else if FAILED.load(Relaxed) { 1 }
-        else if !vk::present::active() { 2 } else { 3 };
+        else if !vk::present::active() { 2 }
+        // (Movies are shown frame for frame at the display's refresh: `thread::movie_playing`.)
+        else if crate::thread::movie_playing() { 4 } else { 3 };
     if LAST.swap(gate, Relaxed) != gate {
         note("gate", match gate {
             0 => "setting is off; no context requested",
             1 => "disabled after an error; restart to retry; real frames continue",
             2 => "waiting for visible presenter; offscreen/headless cannot generate",
+            4 => "off while a movie plays; real frames at the display's refresh",
             _ => "enabled; waiting for paired TAA and SDR composite inputs",
         });
     }

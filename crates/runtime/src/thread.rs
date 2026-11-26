@@ -230,6 +230,16 @@ mod host;
 mod host;
 pub use host::*;
 
+/// Live Bink I/O threads: the title's movie player makes one per movie and it exits with it.
+static MOVIE_THREADS: AtomicU64 = AtomicU64::new(0);
+
+/// A Bink movie is playing (the PlayStation Studios logo, the attract movie, ...): presentation
+/// then follows the display's refresh whatever the frame rate limit (`videoout`), and frame
+/// generation stays off.
+pub fn movie_playing() -> bool {
+    MOVIE_THREADS.load(Ordering::Relaxed) != 0
+}
+
 /// Starts a host thread that runs a guest thread function.
 pub fn spawn(t: &'static GuestThread) -> std::io::Result<()> {
     let host_stack = (t.stack_size as usize).max(256 << 10) + (1 << 20);
@@ -239,8 +249,18 @@ pub fn spawn(t: &'static GuestThread) -> std::io::Result<()> {
         Box::new(move || {
             enter(t);
             crate::debug!("thread '{}' start entry={:#x} arg={:#x}", t.name(), t.entry, t.arg);
+            // (A movie plays while its Bink I/O thread lives: `movie_playing`.)
+            let movie = t.name() == "Bink IO";
+            if movie {
+                let n = MOVIE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+                crate::info!("movie playing (Bink I/O thread {} began; {n} live)", t.id);
+            }
             let v = run_entry(t, t.entry, t.arg, 0);
             run_key_destructors(t);
+            if movie {
+                let n = MOVIE_THREADS.fetch_sub(1, Ordering::SeqCst) - 1;
+                crate::info!("movie ended (Bink I/O thread {} exited; {n} live)", t.id);
+            }
             finish(t, v);
         }),
     )
