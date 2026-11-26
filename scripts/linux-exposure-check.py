@@ -33,6 +33,21 @@ SWITCHES = {'DS_LINUX_WRITE_WATCH': {'uffd', 'mprotect'},
             'DS_MAX_RECONV': {'0', '1'}, 'DS_META_CLAIMS': {'0', '1', '2', '3'},
             'DS_META_CLAIM_REBIND': {'0', '1'}}
 
+PLAY_CASES = ('off', 'fg', 'fg-real-only', 'depth-off', 'cpu-detile', 'vertices', 'fg-adaptive', 'fg-adaptive-vertices')
+def play_environment(case, flips):
+    if case not in PLAY_CASES: raise ValueError('unknown play case')
+    env=dict(DS_PLAY_TELEMETRY='1', DS_FRAME_GENERATION='fsr3' if case.startswith('fg') else 'off',
+        DS_FG_REAL_ONLY='1' if case == 'fg-real-only' else '0', DS_FG_SHOTS='1' if case in ('fg','fg-adaptive','fg-adaptive-vertices') else '0',
+        DS_FG_INPUT_DUMP='1' if case in ('fg','fg-adaptive','fg-adaptive-vertices') else '0', DS_SCENE_PROBE='1',
+        DS_LINUX_HIDDEN='0', DS_LINUX_WINDOW_SIZE='960x540', DS_PRESENT_STATS='1', DS_LINUX_PRESENT_MODE='fifo',
+        DS_FRAME_CAP='0', DS_UNCAPPED='1', DS_RELAY_FPS_LIMIT='0', DS_META_CLAIMS='0' if case == 'depth-off' else '2')
+    env['DS_FG_PACING']='adaptive' if case.startswith('fg-adaptive') else 'legacy'
+    if case == 'cpu-detile': env['DS_GPU_DETILE']='0'
+    if case.endswith('vertices'):
+        env.update(DS_VS_OUTLIER='10000', DS_CAPTURE=str(flips[0]), DS_CAPTURE_COUNT='1',
+                   DS_CAPTURE_TARGETS_FRAME='1', DS_CAPTURE_CODE='1')
+    return env
+
 
 def overrides(items):
     result = {}
@@ -106,6 +121,10 @@ def evidence(text, result=None):
             h = re.search(r'Linux heartbeat:.*?\bflips=(\d+)',line)
             if h: result['begin_upper_flip'] = int(h[1])
         if 'relay step: gameplay-measure-end;' in line: result['ended'] = True; active = False
+        base=re.search(r'relay measure captures: base flip (\d+)',line)
+        if base: result['measure_base']=int(base[1])
+        if 'capture:' in line and 'shader binaries in shaders/' in line: result['capture_completed']=True
+        if 'vertex link: supplied mask 0x7 ' in line and ' ps 0x1009767d00' in line: result['nexus_interface']=True
         if 'Linux self-play result: FAILED' in line or 'FATAL' in line: result['failed'] = True
         shot = re.search(r'screenshot of flip (\d+) \(buffer .*?\): (.+\.png)',line)
         if shot: result['shots'][int(shot[1])] = shot[2]
@@ -150,6 +169,9 @@ def brightness(path):
 
 def report(run, flips, env, code, text, stop_reason):
     data=evidence(text); failures=[]; samples=[]
+    if env.get('DS_MEASURE_SHOTS'):
+        if 'measure_base' not in data: failures.append('no measurement-relative capture base')
+        flips=[data.get('measure_base',0)+f for f in flips]
     # Old and current bootstraps deliberately use 75 for the stop-file protocol. Only
     # accept that exit for our completed captures AND the runtime's completed shutdown;
     # thermal cancellation, a timeout/kill, or an unrelated 75 must still fail.
@@ -158,14 +180,18 @@ def report(run, flips, env, code, text, stop_reason):
     if code != 0 and not capture_stop: failures.append(f'runtime exit {code}')
     if data['failed']: failures.append('runtime/self-play failure')
     begin=data['begin_upper_flip']
+    if begin is not None and env.get('DS_MEASURE_SHOTS') and data.get('measure_base') is not None:
+        begin=data['measure_base']
     if begin is None: failures.append('no confirmed stationary gameplay heartbeat')
     if data['ended']: failures.append('180s stationary window ended; samples are not a fixed stationary comparison')
     if env.get('DS_TAP_CS') and not data['exposure']: failures.append('no TAA exposure taps; verify the program address before drawing a conclusion')
     wanted=env['DS_LINUX_WRITE_WATCH']
     if not any('Linux write watch: '+wanted in l for l in data['tracking']): failures.append('requested tracker was not active (possible uffd fallback)')
     if any(k in env for k in ('DS_META_CLAIMS','DS_META_CLAIM_REBIND')):
-        policy=f"images: metadata claim mask {env.get('DS_META_CLAIMS','3')} (1 colour, 2 depth; 3 upstream default); claim rebind invalidation {'true' if env.get('DS_META_CLAIM_REBIND') == '1' else 'false'}"
-        if policy not in text: failures.append('metadata control not confirmed (binary may predate these switches)')
+        policies=re.findall(r'images: metadata claim mask ([0-3]) \([^\n]*?\); claim rebind invalidation (true|false)',text)
+        if not any((mask == env['DS_META_CLAIMS'] if 'DS_META_CLAIMS' in env else True)
+                   and flag == ('true' if env.get('DS_META_CLAIM_REBIND') == '1' else 'false') for mask,flag in policies):
+            failures.append('metadata control not confirmed (binary may predate these switches)')
     thermal_path=run/'thermal.json'
     thermal=json.loads(thermal_path.read_text()) if thermal_path.exists() else {}
     if thermal.get('aborted'): failures.append('thermal guard aborted')
@@ -200,6 +226,13 @@ def main():
     p.add_argument('--env',action='append',default=[],metavar='DS_NAME=VALUE')
     p.add_argument('--tap-exposure',action='store_true',help='separate diagnostic: GPU/guest TAA exposure taps (changes synchronization)')
     p.add_argument('--trace-clears',action='store_true',help='log metadata fills/transfers/resolves for three flips ending at the first capture')
+    p.add_argument('--play-case',choices=PLAY_CASES,help='visible 960x540, silent native4K play diagnosis; uncapped, unlike the default hidden exposure check')
+    p.add_argument('--load-shots',default='',help='flip offsets after saved-load gameplay readiness, e.g. 300,600,900,1200')
+    p.add_argument('--nexus-replay',action='store_true',help='match preparation device features and omit blocking GPU debug dumps')
+    p.add_argument('--driver-seed',type=Path,help='copy an earlier run’s driver caches into the private run')
+    p.add_argument('--relative-measure',action='store_true',help='--flips are offsets after stationary measurement begins')
+    p.add_argument('--validation',action='store_true',help='diagnostic only; not a performance measurement')
+    p.add_argument('--warm-required',action='store_true',help='fail if a stationary 30s window creates more than two source pipelines')
     p.add_argument('--label',default='check')
     p.add_argument('--dry-run',action='store_true')
     args=p.parse_args()
@@ -211,19 +244,38 @@ def main():
     repo=Path(__file__).resolve().parent.parent
     binary=args.binary.resolve(strict=True); game=Path(args.app).resolve(strict=True); seed=args.save_seed.resolve(strict=True)
     shader=args.shader_seed.resolve(strict=True) if args.shader_seed else None
+    driver=args.driver_seed.resolve(strict=True) if args.driver_seed else None
+    if driver and not driver.is_dir(): p.error('driver seed must be a directory')
     if not binary.is_file() or not os.access(binary,os.X_OK) or not (seed/'saves').is_dir(): p.error('executable binary and save seed containing saves/ required')
     if shader is not None and not shader.is_dir(): p.error('shader seed must be a directory')
     run=repo/'local-data/linux-port/exposure'/f'run-{time.strftime("%Y%m%dT%H%M%SZ",time.gmtime())}-{os.getpid()}-{args.label}'
     prepare.protect_output(run.parent,game,os.environ)
-    if any(run.is_relative_to(s) for s in (seed, binary, *((shader,) if shader else ()))): p.error('output must not be inside an input seed')
+    if any(run.is_relative_to(s) for s in (seed,binary,shader,driver) if s is not None): p.error('output must not be inside an input seed')
     env=environment(os.environ,run,game,flips,extra,args.tap_exposure)
+    if args.play_case: env.update(play_environment(args.play_case,flips))
+    if args.load_shots:
+        early=sorted(set(int(v) for v in args.load_shots.split(',')))
+        if not early or len(early)>8 or early[0]<1 or early[-1]>10000: p.error('invalid load offsets')
+        env['DS_LOAD_SHOTS']=','.join(map(str,early))
+    if args.relative_measure:
+        env['DS_SCREENSHOT']='';env['DS_MEASURE_SHOTS']=','.join(map(str,flips))
+        if args.play_case and args.play_case.endswith('vertices'):
+            env.pop('DS_CAPTURE',None);env['DS_CAPTURE_MEASURE']='1'
+    if args.nexus_replay:
+        env.update(DS_PRESENT_STATS='0', DS_FG_SHOTS='0', DS_FG_INPUT_DUMP='0', DS_SCENE_PROBE='0')
+        for key in ('DS_CAPTURE_MEASURE','DS_CAPTURE','DS_CAPTURE_TARGETS_FRAME','DS_CAPTURE_CODE'):
+            env.pop(key,None)
+        if not args.warm_required and not args.validation: env['DS_PB_VERIFY_CAPTURE']='1'
+    if args.validation: env['DS_VK_VALIDATION']='1'
     if args.trace_clears: env['DS_TRACE_CLEARS_FLIPS']=f'{max(1,flips[0]-2)}:{flips[0]}'
     env['CARGO_HOME']=str(repo/'.cargo-home')
     command=['timeout','-k','5s',str(args.seconds+15)+'s',str(binary),'--app',str(game),'--offscreen','--relay-continue','--run-seconds',str(args.seconds)]
-    plan=dict(label=args.label,binary=str(binary),binary_sha256=digest(binary),game=str(game),save_seed=str(seed),shader_seed=str(shader) if shader else None,
+    if args.play_case: command.remove('--offscreen')
+    plan=dict(label=args.label,binary=str(binary),binary_sha256=digest(binary),game=str(game),save_seed=str(seed),driver_seed=str(driver) if driver else None,shader_seed=str(shader) if shader else None,
         save_hashes={str(p.relative_to(seed)):digest(p) for p in sorted((seed/'saves').rglob('*')) if p.is_file()},
         flips=flips,command=command,environment={k:v for k,v in env.items() if k.startswith(('DS_','DSPORT_','SDL_','XDG_','__GL_','MESA_','CUDA_','VK_','CARGO_'))},output=str(run),
-        note='No build, hidden offscreen native4K, FG off, 30fps, stationary <=180s after readiness. Stop after fixed captures; bootstrap polls stop file, so final flip may overshoot. Not a performance test.')
+        play_case=args.play_case,
+        note='No build; stationary <=180s after readiness. Stop after fixed captures. Default: hidden FGoff cap30. Play cases: visible, uncapped, diagnostic captures perturb timing.')
     if args.dry_run: print(json.dumps(plan,indent=2)); return 0
     import numpy  # Fail before launching if image dependencies are missing.
     from PIL import Image
@@ -238,8 +290,10 @@ def main():
             if src.is_file(): (run/'user'/name).write_bytes(src.read_bytes())
         pc=run/'user/pcsettings.txt'
         pc.write_text(settings(pc.read_text() if pc.exists() else ''))
+        if args.play_case: pc.write_text(pc.read_text().replace('Setting_PC_FrameRateLimit=0','Setting_PC_FrameRateLimit=2'))
         if shader: linux_snapshot.copy_tree(shader,run/'shaders')
         else: (run/'shaders').mkdir()
+        if driver: linux_snapshot.copy_tree(driver,run/'driver')
         for d in ('tmp','driver/nvidia','driver/mesa','driver/cuda','xdg-cache','xdg-config','xdg-data','xdg-state'): (run/d).mkdir(parents=True,exist_ok=True)
         reason='runtime ended before fixed captures'; process=None
         tail=LogTail(run/'user'); state=None
@@ -249,7 +303,11 @@ def main():
                 stop_at=None
                 while process.poll() is None:
                     state=evidence(tail.read(),state)
-                    complete=all(n in state['shots'] for n in flips)
+                    expected=[state.get('measure_base',0)+n for n in flips] if args.relative_measure else flips
+                    complete=(not args.relative_measure or 'measure_base' in state) and all(n in state['shots'] for n in expected)
+                    if env.get('DS_CAPTURE_MEASURE'): complete=complete and state.get('capture_completed',False)
+                    if args.nexus_replay and args.validation:
+                        complete=complete and state.get('nexus_interface',False) and state['begin_upper_flip'] is not None
                     if stop_at is None and (complete or state['ended'] or state['failed']):
                         reason='fixed captures complete' if complete else 'stationary window ended or runtime failed'
                         process.stop_file.write_text('exposure check finished\n'); stop_at=time.monotonic()
@@ -273,9 +331,52 @@ def main():
         result['clear_trace_lines']=len(clear_lines)
         if args.trace_clears and not clear_lines:
             result['valid']=False;result['failures'].append('no bounded clear trace; verify binary supports DS_TRACE_CLEARS_FLIPS')
+        from linux_play_metrics import analyze, adaptive_report
+        result['play_metrics']=analyze(text)
+        result['adaptive']=adaptive_report(run,result['stationary_begin_upper_flip'] or 0,max((x['flip'] for x in result['samples']),default=2**64))
+        if args.play_case: result['presentation']=module('linux-present-times').analyze(run)
+        checkpoints=re.findall(r'relay load checkpoint: \+(\d+) at flip (\d+)',text)
+        result['load_captures']=[dict(offset=int(o),flip=int(f),path=evidence(text)['shots'].get(int(f))) for o,f in checkpoints]
+        if args.load_shots and set(map(int,args.load_shots.split(','))) != {r['offset'] for r in result['load_captures'] if r['path']}:
+            result['valid']=False;result['failures'].append('early load captures incomplete')
+        warm=[w for w in result['play_metrics']['windows'] if w['first_flip'] >= (result['stationary_begin_upper_flip'] or 10**12)]
+        reports=result['pipeline_reuse']
+        if args.nexus_replay and not args.validation:
+            if not reports or any(not q.get('binary_mode') or q.get('store_write_failures') or q.get('fresh_replay_failed') for q in reports):
+                result['valid']=False;result['failures'].append('binary mode, store write, or immediate replay check failed')
+            if args.warm_required and not any(q.get('binary_hits',0)>0 for q in reports):
+                result['valid']=False;result['failures'].append('warm run replayed zero stored binaries')
+        if args.nexus_replay and args.validation:
+            result['interface_verified']=evidence(text).get('nexus_interface',False)
+            if not result['interface_verified']:
+                result['valid']=False;result['failures'].append('previously mismatched fragment shader never exercised')
+            result['outlier_files']=[str(p.relative_to(run)) for p in (run/'user').glob('linux-runs/*/outliers.txt') if p.stat().st_size]
+            if not result['outlier_files']:
+                result['valid']=False;result['failures'].append('missing vertex census output')
+        if args.warm_required and (not warm or any(w.get('pb_source_calls',10**9)>2 for w in warm)):
+            result['valid']=False;result['failures'].append('stationary phase not warm (more than two source creates/30s, or missing telemetry)')
+        result['validation_lines']=[l for l in text.splitlines() if 'VUID-' in l or 'E: vulkan' in l]
+        if result['validation_lines']:
+            result['valid']=False;result['failures'].append('Vulkan validation errors')
+        if args.play_case and args.play_case.startswith('fg') and 'FSR3 FG context:' not in text:
+            result['valid']=False;result['failures'].append('FG context never created')
+        if args.play_case in ('fg','fg-adaptive','fg-adaptive-vertices') and not any(w.get('fg_generated',0)>0 for w in result['play_metrics']['windows']):
+            result['valid']=False;result['failures'].append('no generated frames in one-second telemetry')
+        if 'frame generation disabled for this session' in text:
+            result['valid']=False;result['failures'].append('FG disabled during session')
         (run/'summary.json').write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
-        lines=[f"{args.label}: {'VALID' if result['valid'] else 'INVALID'}; exit {code}; {reason}",f"binary sha256 {plan['binary_sha256']}",f"requested tracker {env['DS_LINUX_WRITE_WATCH']}; FG OFF; native4K offscreen"]
+        lines=[f"{args.label}: {'VALID' if result['valid'] else 'INVALID'}; exit {code}; {reason}",f"binary sha256 {plan['binary_sha256']}",f"requested tracker {env['DS_LINUX_WRITE_WATCH']}; FG {env['DS_FRAME_GENERATION']}; native4K; play case {args.play_case}"]
         lines += [f"flip {s['flip']}: RGB mean {s['full']['mean_rgb']:.6f}, centre {s['centre']['mean_rgb']:.6f}, white {s['full']['near_white_fraction']:.4%}; {s['path']}" for s in result['samples']]
+        if args.play_case:
+            for w in result['play_metrics']['windows']:
+                if w['first_flip'] >= (result['stationary_begin_upper_flip'] or 10**12):
+                    lines.append(f"Gameplay {w['start_s']}..{w['end_s']}s: {w['fps']:.2f} real fps; source creates {w.get('pb_source_calls','?')}; FG compute {w.get('fg_compute_ms_per_flip',0):.2f} ms/flip, pacing {w.get('fg_pace_ms_per_flip',0):.2f} ms/flip (captures perturb timing)")
+        if args.play_case:
+            pacing=result.get('presentation',{}).get('exit',{}).get('pacing',{})
+            if pacing.get('samples'):
+                lines.append(f"KHR completions: {pacing.get('presented_fps',0):.2f}/s; p50/p90/p99 {pacing['p50_ms']:.2f}/{pacing['p90_ms']:.2f}/{pacing['p99_ms']:.2f} ms (CPU-observed, includes capture stalls)")
+        if result['adaptive'].get('fresh_fps') is not None:
+            a=result['adaptive'];lines.append(f"Adaptive: {a['fresh_fps']:.2f} fresh images/s at {a['slot_fps']:.2f} slots/s; counts {a['counts']}; content age ms {a['content_age_ms']} (not input-to-photon)")
         lines += ['Exposure samples: '+str(len(result['exposure']))+(' (diagnostic ring, see summary.json)' if args.tap_exposure else ' (use --tap-exposure in a separate run)'),*result['failures'],result['note']]
         (run/'summary.txt').write_text('\n'.join(lines)+'\n')
         print('\n'.join(lines));print(run)

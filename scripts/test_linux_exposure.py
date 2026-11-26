@@ -11,6 +11,27 @@ e=importlib.util.module_from_spec(spec);spec.loader.exec_module(e)
 
 
 class ExposureTests(unittest.TestCase):
+    def test_play_cases_keep_exposure_default_separate_and_do_not_enable_bad_colour_claim(self):
+        for case in e.PLAY_CASES:
+            env=e.play_environment(case,[3600])
+            self.assertIn(env['DS_META_CLAIMS'],('0','2'))
+            self.assertEqual(env['DS_FRAME_CAP'],'0')
+            self.assertEqual(env['DS_LINUX_HIDDEN'],'0')
+        self.assertEqual(e.play_environment('fg-real-only',[3600])['DS_FG_REAL_ONLY'],'1')
+        self.assertEqual(e.play_environment('cpu-detile',[3600])['DS_GPU_DETILE'],'0')
+        self.assertEqual(e.play_environment('off',[3600])['DS_FRAME_GENERATION'],'off')
+
+    def test_relative_capture_waits_for_measurement_base(self):
+        text='relay measure captures: base flip 5000, offsets [300, 600]\n'
+        self.assertEqual(e.evidence(text)['measure_base'],5000)
+        with tempfile.TemporaryDirectory() as d:
+            run=Path(d);(run/'user').mkdir();shot=run/'sample.png';shot.write_bytes(b'fixture')
+            text+='Linux write watch: uffd\nrelay step: gameplay-measure-begin; menu stack Some(0), HUD bytes Some(880)\nLinux heartbeat: 100s flips=5001\n'
+            text+=f'screenshot of flip 5300 (buffer 0x100): {shot}\n'
+            with patch.object(e,'brightness',return_value=dict(width=3840,height=2160)):
+                r=e.report(run,[300],{'DS_LINUX_WRITE_WATCH':'uffd','DS_MEASURE_SHOTS':'300'},0,text,'done')
+            self.assertTrue(r['valid'],r['failures']);self.assertEqual(r['samples'][0]['flip'],5300)
+
     def test_overrides_cannot_reenable_fg_or_redirect_output(self):
         self.assertEqual(e.overrides(['DS_LINUX_WRITE_WATCH=mprotect','DS_NAN_PRESERVE=0']),
                          {'DS_LINUX_WRITE_WATCH':'mprotect','DS_NAN_PRESERVE':'0'})
@@ -121,7 +142,7 @@ class ExposureTests(unittest.TestCase):
             env={'DS_LINUX_WRITE_WATCH':'uffd','DS_META_CLAIMS':'1','DS_META_CLAIM_REBIND':'1'}
             with patch.object(e,'brightness',return_value=dict(width=3840,height=2160)):
                 self.assertFalse(e.report(run,[3600],env,0,text,'done')['valid'])
-                text+='images: metadata claim mask 1 (1 colour, 2 depth; 3 upstream default); claim rebind invalidation true\n'
+                text+='images: metadata claim mask 1 (1 colour, 2 depth; 3 upstream default, 2 the Linux default); claim rebind invalidation true\n'
                 self.assertTrue(e.report(run,[3600],env,0,text,'done')['valid'])
 
 

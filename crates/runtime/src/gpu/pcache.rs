@@ -84,6 +84,12 @@ fn reuse_event(kind: char, key: u64, fp: u64, reason: &str) {
     let mut events = PB_EVENTS.lock();
     if events.len() < 256 { events.push(serde_json::json!({"key":format!("{kind}{key:016x}"), "fingerprint":format!("{fp:016x}"), "reason":reason})); }
 }
+/// Cheap cumulative counters for Linux's per-second play telemetry; no ledger lock/copy.
+#[cfg(target_os = "linux")]
+pub fn play_counters() -> [u64; 6] {
+    [PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed), PB_MISSING.load(Ordering::Relaxed),
+        SOURCE_CALLS.load(Ordering::Relaxed), SOURCE_NS.load(Ordering::Relaxed), SOURCE_ACTIVE.load(Ordering::Relaxed)]
+}
 /// Machine-readable actual binary reuse, independent of asynchronous scheduling counters.
 #[cfg(target_os = "linux")]
 pub fn reuse_report() -> serde_json::Value {
@@ -1324,11 +1330,14 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                 if decoded.is_none() {
                     let reason = pb_rejection(&b, &pb.global, fp);
                     match reason {
-                        "old_schema" => &PB_SCHEMA, "other_driver" => &PB_OTHER_KEY,
+                        "old_schema" => &PB_SCHEMA, "other_driver" | "other_device_contract" => &PB_OTHER_KEY,
                         "other_code_or_contract" => &PB_STALE, _ => &PB_INVALID,
                     }.fetch_add(1, Ordering::Relaxed);
                     reuse_record(kind, key, fp, reason, 0.0);
                     reuse_event(kind, key, fp, reason);
+                    if matches!(reason, "other_driver" | "other_device_contract") && PB_OTHER_KEY.load(Ordering::Relaxed) <= 4 {
+                        crate::warn!("pipeline {kind}{key:016x}: {reason}, current compatibility {}; binaries not replayed", hex(&pb.global));
+                    }
                 }
                 decoded
             }
@@ -1375,6 +1384,7 @@ pub fn create_with(kind: char, key: u64, fp: u64, create: impl Fn(Via) -> Result
                     if PB[2].fetch_add(1, Ordering::Relaxed) < 8 {
                         crate::warn!("pipeline cache: the binaries of {kind}{key:016x} were not used ({e}); made anew");
                     }
+                    #[cfg(windows)]
                     if !keep {
                         note_refusal();
                     }
@@ -1575,7 +1585,11 @@ fn pb_rejection(b: &[u8], global: &[u8], fp: u64) -> &'static str {
     if fnv64(body) != u64::from_le_bytes(tail.try_into().unwrap()) { return "invalid"; }
     let n = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
     let Some(g) = body.get(12..12usize.saturating_add(n)) else { return "invalid" };
-    if g != global { return "other_driver"; }
+    if g != global {
+        return if g.len() == 36 && global.len() == 36 && g[..28] == global[..28] {
+            "other_device_contract"
+        } else { "other_driver" };
+    }
     let Some(f) = body.get(12+n..20+n) else { return "invalid" };
     if u64::from_le_bytes(f.try_into().unwrap()) != fp { return "other_code_or_contract"; }
     "invalid"
@@ -1868,8 +1882,27 @@ fn mode_file() -> Option<PathBuf> {
 /// Why the store's binaries are off for this device and cache id (None: they are not).
 pub fn binaries_off_for(device: &str, cache_id: &str) -> Option<String> {
     let t = std::fs::read_to_string(mode_file()?).ok()?;
+    binary_override(&t, device, cache_id)
+}
+
+fn binary_override(t: &str, device: &str, cache_id: &str) -> Option<String> {
     let get = |k: &str| t.lines().find_map(|l| l.split_once('=').filter(|(a, _)| a.trim() == k).map(|(_, b)| b.trim().to_string()));
+    // An old store can contain stale entries alongside freshly rebuilt binaries.
+    // Let each entry be replaced independently and keep explicit device overrides.
+    #[cfg(target_os = "linux")]
+    if get("why").is_some_and(|why| why.starts_with("a session's driver refused ")) {
+        return None;
+    }
     (get("binaries").as_deref() == Some("off") && get("device").as_deref() == Some(device) && get("cache_id").as_deref() == Some(cache_id)).then(|| get("why").unwrap_or_default())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn legacy_session_refusals_do_not_disable_fresh_binaries() {
+    let header = "binaries = off\ndevice = gpu\ncache_id = id\n";
+    assert_eq!(binary_override(&format!("{header}why = a session's driver refused 24 of its stored binaries and took 0"), "gpu", "id"), None);
+    assert_eq!(binary_override(&format!("{header}why = explicit probe"), "gpu", "id").as_deref(), Some("explicit probe"));
+    assert_eq!(binary_override(header, "gpu", "different"), None);
 }
 
 /// Writes the mode file: binaries off for this device and cache id, and why.
@@ -1881,6 +1914,7 @@ pub fn turn_binaries_off(why: &str) -> bool {
 
 /// A session's own count of refused binaries: once 24 were refused and at most a quarter as many
 /// used, the next sessions keep cache data (`turn_binaries_off`).
+#[cfg(windows)]
 fn note_refusal() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let (made, refused) = (PB[0].load(Ordering::Relaxed), PB[2].load(Ordering::Relaxed));
@@ -2085,4 +2119,19 @@ pub fn pb_test() -> i32 {
     }
     crate::info!("pb-test: done");
     0
+}
+
+#[cfg(test)]
+mod compatibility_rejection_tests {
+    #[test]
+    fn shader_contract_mismatch_is_not_reported_as_a_driver_upgrade() {
+        let global = vec![7; 36];
+        let bytes = super::encode_pb_with(&global, 123, &[(vec![1], vec![2])], |_,_| true).unwrap();
+        let mut changed = global.clone(); changed[35] ^= 1;
+        assert!(super::decode_pb(&bytes, &changed, 123).is_none());
+        assert_eq!(super::pb_rejection(&bytes, &changed, 123), "other_device_contract");
+        changed[0] ^= 1;
+        assert_eq!(super::pb_rejection(&bytes, &changed, 123), "other_driver");
+        assert_eq!(super::pb_rejection(&bytes, &global, 124), "other_code_or_contract");
+    }
 }

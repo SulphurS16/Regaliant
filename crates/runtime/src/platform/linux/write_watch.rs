@@ -55,6 +55,14 @@ struct Watch {
 static WATCH: OnceLock<Option<Mutex<Watch>>> = OnceLock::new();
 // takes, scans, dirty pages, ns taking (including lock), registrations, failures, host writes
 static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+// Optional 1/64 samples: count, mapping wait ns, watch mutex wait ns, take work ns;
+// followed by last sampled gauges: region intervals, journal intervals, active writers.
+static DETAIL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+pub fn detail() -> [u64; 7] { DETAIL.each_ref().map(|v| v.load(Relaxed)) }
+pub fn play_telemetry() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_PLAY_TELEMETRY").ok().as_deref() == Some("1"))
+}
 
 pub fn enabled() -> bool { WATCH.get().is_some_and(Option::is_some) }
 pub fn initialize() {
@@ -188,9 +196,14 @@ pub fn take(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     let (lo, hi) = (base & !(PAGE-1), base.checked_add(size)?.checked_next_multiple_of(PAGE)?);
     if lo < crate::mem::GUEST_BASE || hi > crate::mem::GUEST_END { return None; }
     // Same mapping lock/order as the mprotect backend. No signal calls this module.
+    thread_local! { static SAMPLE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    let sampled = play_telemetry() && SAMPLE.with(|n| { let x = n.get().wrapping_add(1); n.set(x); x % 64 == 0 });
+    let before = sampled.then(crate::gpu::record_opts::Timer::start);
     let _mapping = crate::gpu::resident::arm_guard();
+    let mapping_ns = before.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
     let t = crate::gpu::record_opts::Timer::start();
     let mut w = WATCH.get()?.as_ref()?.lock();
+    let lock_ns = if sampled { t.elapsed().as_nanos() as u64 } else { 0 };
     let first = out.len();
     if let Err(e) = w.take(lo, hi, out) {
         // A partial scan can already have reset dirty bits. Keep the whole request dirty
@@ -202,7 +215,16 @@ pub fn take(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     }
     STATS[0].fetch_add(1, Relaxed);
     STATS[2].fetch_add((out.len()-first) as u64, Relaxed);
-    STATS[3].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    let total_ns = t.elapsed().as_nanos() as u64;
+    STATS[3].fetch_add(total_ns, Relaxed);
+    if sampled {
+        for (i, value) in [1, mapping_ns, lock_ns, total_ns.saturating_sub(lock_ns)].into_iter().enumerate() {
+            DETAIL[i].fetch_add(value, Relaxed);
+        }
+        for (i, value) in [w.regions.len(), w.dirty.len(), w.writers.len()].into_iter().enumerate() {
+            DETAIL[i+4].store(value as u64, Relaxed);
+        }
+    }
     Some(())
 }
 

@@ -1583,6 +1583,84 @@ const ATTACHLESS_AREA: u32 = 16384;
 /// Draws recorded without attachments (status).
 pub static ATTACHLESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// PerVertexKHR arrays in the fragment stage consume one vec4 per vertex at
+// each location. Supply the same zero fallback as the geometry-stage linkers.
+fn link_vertex_outputs(code: &[u32], missing: u32) -> Result<std::borrow::Cow<'_, [u32]>, String> {
+    use rspirv::{binary::Assemble, dr::{Builder, Instruction, Operand}, spirv::{Decoration, Op, StorageClass}};
+    if missing == 0 { return Ok(code.into()); }
+    let module = rspirv::dr::load_words(code).map_err(|e| format!("vertex link: {e}"))?;
+    let mut b = Builder::new_from_module(module);
+    let scalar = b.type_float(32, None);
+    let vec4 = b.type_vector(scalar, 4);
+    let ptr = b.type_pointer(None, StorageClass::Output, vec4);
+    let zero = b.constant_null(vec4);
+    let entry = b.module_ref().entry_points.first().and_then(|ep| ep.operands.get(1)).and_then(|op|
+        if let Operand::IdRef(id) = op { Some(*id) } else { None }).ok_or("missing vertex entry")?;
+    let mut stores = Vec::new();
+    for location in 0..32 {
+        if missing & (1 << location) == 0 { continue; }
+        let var = b.variable(ptr, None, StorageClass::Output, None);
+        b.decorate(var, Decoration::Location, [Operand::LiteralBit32(location)]);
+        b.module_mut().entry_points[0].operands.push(Operand::IdRef(var));
+        stores.push(Instruction::new(Op::Store, None, None, vec![Operand::IdRef(var), Operand::IdRef(zero)]));
+    }
+    let main = b.module_mut().functions.iter_mut().find(|f| f.def.as_ref().and_then(|i| i.result_id) == Some(entry)).ok_or("missing vertex function")?;
+    for block in &mut main.blocks {
+        if block.instructions.last().is_some_and(|i| i.class.opcode == Op::Return) {
+            let at = block.instructions.len()-1;
+            block.instructions.splice(at..at, stores.iter().cloned());
+        }
+    }
+    Ok(b.module().assemble().into())
+}
+
+#[cfg(test)]
+#[test]
+fn link_missing_vertex_outputs() {
+    use rspirv::{binary::Assemble, dr::{Builder, Operand}, spirv::*};
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let ft = b.type_function(void, []);
+    let f = b.type_float(32, None);
+    let v = b.type_vector(f, 4);
+    let ptr = b.type_pointer(None, StorageClass::Output, v);
+    let pos = b.variable(ptr, None, StorageClass::Output, None);
+    b.decorate(pos, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
+    let zero = b.constant_null(v);
+    let main = b.begin_function(void, None, FunctionControl::NONE, ft).unwrap();
+    b.begin_block(None).unwrap();
+    b.store(pos, zero, None, []).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::Vertex, main, "main", [pos]);
+    let original = b.module().assemble();
+    assert!(matches!(link_vertex_outputs(&original, 0).unwrap(), std::borrow::Cow::Borrowed(_)));
+    let linked = link_vertex_outputs(&original, 7).unwrap();
+    let module = rspirv::dr::load_words(&linked).unwrap();
+    for loc in 0..3 {
+        let dec = module.annotations.iter().find(|i| i.operands.get(1..) == Some(&[
+            Operand::Decoration(Decoration::Location), Operand::LiteralBit32(loc)])).unwrap();
+        assert!(module.entry_points[0].operands[3..].contains(&dec.operands[0]));
+        assert!(module.functions[0].blocks[0].instructions.iter().any(|i|
+            i.class.opcode == Op::Store && i.operands[0] == dec.operands[0]));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::{io::Write, process::{Command, Stdio}};
+        match Command::new("spirv-val").args(["--target-env","vulkan1.1","-"]).stdin(Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                child.stdin.take().unwrap().write_all(&linked.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => panic!("spirv-val: {e}"),
+        }
+    }
+}
+
 fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, push_mode: bool) -> Result<Pipe, String> {
     let c = ctx();
     // (A pipeline whose compile crashed this driver: refused before its layouts and modules are
@@ -1590,6 +1668,11 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
     if crate::gpu::pcache::crashed_skip('g', hkey) {
         return Err(format!("g{hkey:016x} left out: its compile crashed this graphics driver before (crashed.txt)"));
     }
+    let batch = if vs.0.out.batched { 1u32 << rdna::translate::BATCH_VARYING } else { 0 };
+    let missing = if key.rect_gs.is_none() && bary_gs_of(key, vs, ps).is_none() {
+        ps.map_or(0, |p| p.0.out.in_mask & !vs.0.out.param_mask & !batch)
+    } else { 0 };
+    let linked_vs = link_vertex_outputs(&vs.0.out.spirv, missing)?;
     unsafe {
         let mut stages_p = vec![(vs.0, vk::ShaderStageFlags::VERTEX)];
         if let Some(p) = ps {
@@ -1608,7 +1691,7 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             m
         };
         let g = super::super::vk::creating(|| format!("vs {:#x}", vs.1));
-        let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&vs.0.out.spirv)?)];
+        let mut modules = vec![(vk::ShaderStageFlags::VERTEX, module(&linked_vs)?)];
         drop(g);
         super::super::vk::name_object(modules[0].1, &format!("vs {:#x}", vs.1));
         if let Some(mask) = key.rect_gs {
@@ -1620,17 +1703,6 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             super::super::vk::name_object(modules[modules.len() - 1].1, &format!("barycentric gs for ps {:#x}", p.1));
         }
         if let Some(p) = ps {
-            let from_gs = if key.rect_gs.is_none() { bary_gs_of(key, vs, ps).map_or(0, |(io, _)| io.added()) } else { 0 };
-            // (A batched vertex stage writes the batch varying besides its parameters, which
-            // `param_mask` leaves out by design.)
-            let batch = if vs.0.out.batched { 1u32 << rdna::translate::BATCH_VARYING } else { 0 };
-            let missing = p.0.out.in_mask & !vs.0.out.param_mask & !from_gs & !batch;
-            if key.rect_gs.is_none() && missing != 0 {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
-                    crate::info!("gfx pipeline: ps {:#x} reads locations {missing:#x} vs {:#x} does not write (vs writes {:#x}, ps reads {:#x})", p.1, vs.1, vs.0.out.param_mask, p.0.out.in_mask);
-                }
-            }
             let g = super::super::vk::creating(|| format!("ps {:#x}", p.1));
             modules.push((vk::ShaderStageFlags::FRAGMENT, module(&p.0.out.spirv)?));
             drop(g);
@@ -1729,15 +1801,15 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
             // (The barycentric geometry shader's version and inputs: pipelines
             // without one keep their fingerprints.)
             match bary_gs_of(key, vs, ps) {
-                Some((_, batch)) => crate::gpu::pcache::translated_fingerprint(&[&vs.0.out.spirv, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
-                None => crate::gpu::pcache::translated_fingerprint(&[&vs.0.out.spirv, &gs, ps_code]),
+                Some((_, batch)) => crate::gpu::pcache::translated_fingerprint(&[&linked_vs, &gs, ps_code, &[BARY_GS_VERSION, batch as u32]]),
+                None => crate::gpu::pcache::translated_fingerprint(&[&linked_vs, &gs, ps_code]),
             }
         };
         let _crumb = crate::gpu::pcache::Crumb::set(
             || format!("graphics pipeline g{hkey:016x}: vs {:#x} (translation {:016x}), ps {}, rect-list gs {:?}, barycentric gs {}", vs.1, vs.0.key, ps.map_or("none".to_string(), |p| format!("{:#x} (translation {:016x})", p.1, p.0.key)), key.rect_gs, bary_gs_of(key, vs, ps).is_some()),
             || {
                 // (The modules as the driver gets them: `module_code`'s declaration included.)
-                let mut v = vec![("vs", super::module_code(&vs.0.out.spirv).into_owned())];
+                let mut v = vec![("vs", super::module_code(&linked_vs).into_owned())];
                 if let Some(p) = ps {
                     v.push(("ps", super::module_code(&p.0.out.spirv).into_owned()));
                 }
@@ -1767,6 +1839,9 @@ fn graphics_pipeline(key: &GfxKey, hkey: u64, vs: StageTr, ps: Option<StageTr>, 
                 return Err(e);
             }
         };
+        if c.validation && missing != 0 {
+            crate::info!("vertex link: supplied mask {missing:#x} vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1));
+        }
         crate::gpu::pstats::report(pipeline, &format!("vs {:#x} ps {:#x}", vs.1, ps.map_or(0, |p| p.1)));
         Ok(Pipe { pipeline, layout, set_layout, push })
     }

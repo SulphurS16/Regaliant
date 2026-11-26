@@ -23,12 +23,51 @@ use constants::FrameConstants;
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 static CHOICE: AtomicU32 = AtomicU32::new(0);
 static FAILED: AtomicBool = AtomicBool::new(false);
-static PRESENTING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static PRESENT_KIND: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+struct PresentScope(Option<bool>);
+impl PresentScope { fn new(generated: bool) -> Self { Self(PRESENT_KIND.with(|s| s.replace(Some(generated)))) } }
+impl Drop for PresentScope { fn drop(&mut self) { PRESENT_KIND.with(|s| s.set(self.0)); } }
+#[path = "framegen_present.rs"]
+mod adaptive;
+pub fn adaptive_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FG_PACING").ok().as_deref() == Some("adaptive")) && !real_only() && !adaptive::stopped()
+        && CHOICE.load(Relaxed) == 1 && !FAILED.load(Relaxed)
+}
+pub fn adaptive_counters() -> [u64; 7] { adaptive::counters() }
+pub fn stop_presenter() { adaptive::stop(); }
+pub fn bypass_present_hook() -> bool { PRESENT_KIND.with(|s| s.get().is_some()) }
+pub fn adaptive_present(src: &vk::present::Source) -> Option<bool> {
+    if !adaptive_mode() { return None; }
+    if present_pair(src) { return Some(true); }
+    if !adaptive_mode() { return None; }
+    if let vk::present::Source::Image { image, width, height, layout: v::ImageLayout::GENERAL, hdr: false, .. } = src {
+        if let Err(e) = adaptive::enqueue(*image, (*width,*height), None, Instant::now(), false) {
+            adaptive::disable(); fail(e); return None;
+        }
+        Some(true)
+    } else { adaptive::pause(); None }
+}
 static DUMP_REQUEST: AtomicBool = AtomicBool::new(false);
 static GENERATED: AtomicU64 = AtomicU64::new(0);
 static INPUT_AGE: AtomicU64 = AtomicU64::new(0);
 static COMPUTE_MS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
+static RETIRED: AtomicU64 = AtomicU64::new(0);
+static POOL_DEFERRED: AtomicU64 = AtomicU64::new(0);
+static DISPATCH_NS: AtomicU64 = AtomicU64::new(0);
+static PACE_NS: AtomicU64 = AtomicU64::new(0);
+static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+pub fn telemetry() -> [u64; 7] {
+    [GENERATED.load(Relaxed), DISPATCHES.load(Relaxed), DISPATCH_NS.load(Relaxed),
+        PACE_NS.load(Relaxed), RETIRED.load(Relaxed), POOL_DEFERRED.load(Relaxed), FAILED.load(Relaxed) as u64]
+}
+fn real_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_FG_REAL_ONLY").ok().as_deref() == Some("1"))
+}
 // Bounded, stage-specific diagnostics: no per-draw logging when FG is off.
 static NOTES: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
 pub fn note(stage: &'static str, detail: impl std::fmt::Display) {
@@ -92,6 +131,7 @@ pub fn set_choice(value: u32) {
     }
     note("setting", format_args!("requested {value}, env {:?}, failed {}, presenter {}", std::env::var("DS_FRAME_GENERATION").ok(), FAILED.load(Relaxed), vk::present::active()));
     if CHOICE.swap(value.min(1), Relaxed) != value.min(1) {
+        if value == 0 { adaptive::pause(); }
         EPOCH.fetch_add(1, Relaxed);
         if let Some(s) = INPUTS.lock().as_mut() { s.current = None; s.ready.clear(); }
         crate::info!("Linux frame generation: {} (experimental, native resolution; whole-run recording must be off)",if value==0 {"off"} else {"FSR3"});
@@ -120,10 +160,11 @@ pub fn timing() -> (bool, f64, f64) {
     )
 }
 pub fn presenting() -> bool {
-    PRESENTING.load(Relaxed)
+    PRESENT_KIND.with(|s| s.get() == Some(true))
 }
 fn fail(e: impl std::fmt::Display) {
     if !FAILED.swap(true, Relaxed) {
+        adaptive::pause();
         crate::error!("FSR3 frame generation disabled for this session: {e}; real frames continue");
         diagnostic_state();
     }
@@ -229,6 +270,8 @@ fn api() -> Result<&'static Api, String> {
 struct Image {
     desc: ImageDesc,
     memory: v::DeviceMemory,
+    // MAX pins immediate-recorded resources whose submission is not known yet.
+    last_use: AtomicU64,
 }
 impl Image {
     fn image(&self) -> v::Image {
@@ -289,6 +332,7 @@ impl Image {
                     height: h,
                 },
                 memory,
+                last_use: AtomicU64::new(0),
             })
         }
     }
@@ -541,6 +585,35 @@ struct Inputs {
     ready: HashMap<u64, Captured>,
     id: u64,
 }
+fn can_retire(owners: usize, last_use: u64, completed: u64) -> bool {
+    owners == 1 && last_use != u64::MAX && completed >= last_use
+}
+fn stamp(image: &Image) {
+    // An immediate-recorded use pins this allocation permanently, even if a later use has
+    // a numbered batch. Never let a newer stamp hide an earlier unsubmitted use.
+    image.last_use.fetch_max(crate::gpu::exec::replay_completion::get().unwrap_or(u64::MAX), Relaxed);
+}
+impl Inputs {
+    fn retire(&mut self, size: (u32, u32), format: v::Format) {
+        // Unpresented old display handles must not retain every historical render size.
+        // Dropping the CPU reference is safe; GPU destruction still requires completion.
+        let oldest = self.id.saturating_sub(3);
+        self.ready.retain(|_, c| c.id >= oldest);
+        let completed = crate::gpu::exec::completed_seq();
+        self.pool.retain(|p| {
+            let differs = (p.depth.desc.width, p.depth.desc.height) != size || p.depth.desc.format != format.as_raw() as u32;
+            if differs && can_retire(Arc::strong_count(p), p.depth.last_use.load(Relaxed), completed) {
+                unsafe {
+                    p.depth.destroy(); p.motion.destroy();
+                    ctx().device.destroy_buffer(p.buffer, None);
+                    ctx().device.free_memory(p._memory, None);
+                }
+                RETIRED.fetch_add(1, Relaxed);
+                false
+            } else { true }
+        });
+    }
+}
 static INPUTS: Mutex<Option<Inputs>> = Mutex::new(None);
 /// Resolve the same pointer table used by TAA. Copy now: deferred replay must never
 /// reread a guest per-frame allocation after the CPU has recycled it.
@@ -606,6 +679,7 @@ pub fn capture_taa(cmd: v::CommandBuffer, depth: Tex, motion: Tex, constants: Fr
         let mut g = INPUTS.lock();
         let s = g.get_or_insert_with(Inputs::default);
         s.current = None;
+        s.retire(depth.size, format);
         let found = s
             .pool
             .iter()
@@ -618,12 +692,12 @@ pub fn capture_taa(cmd: v::CommandBuffer, depth: Tex, motion: Tex, constants: Fr
         let snap = match found {
             Some(p) => p,
             None => {
-                // Bounded process-lifetime pool: never free an image referenced by deferred work.
+                // Bounded pool: old sizes retire only after numbered GPU work and CPU owners finish.
                 if s.pool.len() >= 8 {
-                    return Err(
-                        "snapshot pool full; disable FG before changing render size repeatedly"
-                            .into(),
-                    );
+                    POOL_DEFERRED.fetch_add(1, Relaxed);
+                    EPOCH.fetch_add(1, Relaxed);
+                    note("snapshot pool pending", "eight referenced or unfinished snapshots; retry next TAA");
+                    return Ok(());
                 }
                 let d = Image::new(depth.size.0, depth.size.1, format)?;
                 let m = Image::new(motion.size.0, motion.size.1, motion.format)?;
@@ -641,6 +715,7 @@ pub fn capture_taa(cmd: v::CommandBuffer, depth: Tex, motion: Tex, constants: Fr
                 p
             }
         };
+        stamp(&snap.depth);
         unsafe {
             // Order reuse of the intermediate transfer buffer as well as the images.
             let reuse = v::MemoryBarrier::default()
@@ -768,6 +843,15 @@ pub fn capture_hudless(cmd: v::CommandBuffer, target: crate::gpu::images::Target
         note("HUDless duplicate", format_args!("image {:#x}, TAA {}", target.image.as_raw(), captured.id));
         return;
     }
+    let completed = crate::gpu::exec::completed_seq();
+    s.huds.retain(|h| {
+        if (h.desc.width, h.desc.height) != (target.width, target.height)
+            && can_retire(Arc::strong_count(h), h.last_use.load(Relaxed), completed) {
+            unsafe { h.destroy(); }
+            RETIRED.fetch_add(1, Relaxed);
+            false
+        } else { true }
+    });
     let hud = s
         .huds
         .iter()
@@ -780,7 +864,9 @@ pub fn capture_hudless(cmd: v::CommandBuffer, target: crate::gpu::images::Target
         Some(h) => h,
         None => {
             if s.huds.len() >= 8 {
-                fail("pre-UI snapshot pool full");
+                POOL_DEFERRED.fetch_add(1, Relaxed);
+                EPOCH.fetch_add(1, Relaxed);
+                note("pre-UI pool pending", "eight referenced snapshots; real frame only");
                 return;
             }
             match Image::new(target.width, target.height, COLOR) {
@@ -796,6 +882,7 @@ pub fn capture_hudless(cmd: v::CommandBuffer, target: crate::gpu::images::Target
             }
         }
     };
+    stamp(&hud);
     blit(cmd, target.image, (target.width, target.height), &hud);
     captured.hudless = Some(hud);
     captured.linear = matches!(
@@ -950,6 +1037,7 @@ fn pace(next: &mut Option<Instant>, period: Duration) {
     let due = next.unwrap_or(now);
     if due > now {
         crate::thread::short_sleep(due - now);
+        PACE_NS.fetch_add(now.elapsed().as_nanos() as u64, Relaxed);
     }
     *next = Some(if now.saturating_duration_since(due) > period {
         now + period
@@ -1102,8 +1190,15 @@ pub fn present_pair(src: &vk::present::Source) -> bool {
                 return Err(format!("native dispatch stage/code {e}"));
             }
             let gen_ms = now.elapsed().as_secs_f64() * 1000.0;
+            DISPATCHES.fetch_add(1, Relaxed);
+            DISPATCH_NS.fetch_add((gen_ms * 1e6) as u64, Relaxed);
             if !dumps.is_empty() {
                 save_readbacks(dumps, next_n, &params, cap.id, g.history.as_ref().map_or(0, |h| h.id), &cap.constants);
+            }
+            if adaptive_mode() {
+                if DISPATCHES.load(Relaxed) % 120 == 0 { diagnostic_state(); }
+                adaptive::enqueue(g.color.image(), (width, height), (!reset).then(|| g.output.image()), now,
+                    shots() && (DISPATCHES.load(Relaxed) % 300 == 0 || dump_now))?;
             }
             let refresh = crate::displayclock::MODE_MILLIHZ.load(Relaxed) as f64 / 1000.0;
             let tick = period(if refresh > 1.0 { refresh } else { 60.0 }, real_ms);
@@ -1115,6 +1210,14 @@ pub fn present_pair(src: &vk::present::Source) -> bool {
             g.last = now;
             g.last_id = cap.id;
             g.epoch = epoch;
+            // Diagnostic: keep identical FSR work/history but remove its extra WSI present
+            // and both pacing sleeps. This separates interpolation cost from the 2x FIFO cap.
+            if real_only() || adaptive_mode() {
+                g.next = None;
+                COMPUTE_MS.store(gen_ms.to_bits(), Relaxed);
+                INPUT_AGE.store((cap.at.elapsed().as_secs_f64() * 1000.0).to_bits(), Relaxed);
+                return Ok(adaptive_mode());
+            }
             if reset {
                 note("history reset", format_args!("TAA {}, arrival {real_ms:.3}ms, input age {:.3}ms; SDK dispatched, real frame only", cap.id, cap.at.elapsed().as_secs_f64()*1000.0));
                 g.next = None;
@@ -1123,7 +1226,7 @@ pub fn present_pair(src: &vk::present::Source) -> bool {
             pace(&mut g.next, tick);
             COMPUTE_MS.store(gen_ms.to_bits(), Relaxed);
             INPUT_AGE.store((cap.at.elapsed().as_secs_f64() * 1000.0).to_bits(), Relaxed);
-            PRESENTING.store(true, Relaxed);
+            let present_scope = PresentScope::new(true);
             let n = GENERATED.fetch_add(1, Relaxed) + 1;
             if shots() && (n <= 3 || n % 300 == 0 || dump_now) {
                 vk::present::shot_next();
@@ -1136,7 +1239,7 @@ pub fn present_pair(src: &vk::present::Source) -> bool {
                 height,
                 hdr: false,
             });
-            PRESENTING.store(false, Relaxed);
+            drop(present_scope);
             if shots() && (n <= 3 || n % 300 == 0 || dump_now) {
                 vk::present::shot_next();
             }
@@ -1172,6 +1275,25 @@ fn shots() -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retirement_requires_all_batch_and_present_owners_to_finish() {
+        assert!(!super::can_retire(2, 10, 10)); // Presenter or an unconsumed display image.
+        assert!(!super::can_retire(1, 10, 9)); // Queued capture on either GPU queue.
+        assert!(super::can_retire(1, 10, 10));
+        assert!(!super::can_retire(1, u64::MAX, u64::MAX)); // Immediate recording is pinned.
+        // Known uses cannot hide an earlier unnumbered use.
+        let use_seq = std::sync::atomic::AtomicU64::new(10);
+        use_seq.fetch_max(u64::MAX, super::Relaxed);
+        use_seq.fetch_max(20, super::Relaxed);
+        assert!(!super::can_retire(1, use_seq.load(super::Relaxed), 30));
+        // Repeated size changes can retire the previous allocation once it is completed.
+        let mut pool = Vec::new();
+        for seq in 1..40 {
+            pool.retain(|&last| !super::can_retire(1, last, seq-1));
+            pool.push(seq);
+            assert_eq!(pool.len(), 1);
+        }
+    }
     use super::*;
     #[test]
     fn bridge_layout() {

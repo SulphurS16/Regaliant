@@ -3140,8 +3140,17 @@ fn record_upload(cmd: vk::CommandBuffer, image: vk::Image, first: bool, buf: vk:
 }
 
 fn partial_residency_note(key: ImageKey, skipped: usize, first: bool) -> String {
+    PARTIAL_NOTES[usize::from(!first)].fetch_add(skipped as u64, std::sync::atomic::Ordering::Relaxed);
     format!("partially resident texture: {skipped} (mip, layer) not mapped, {}; image {:#x} {}x{} layers {} levels {} {:?}",
         if first { "zero-filled" } else { "left as they were" }, key.base, key.width, key.height, key.layers, key.levels, key.format)
+}
+// Counts unavailable subresources reported by upload jobs, not distinct resident textures.
+static PARTIAL_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(target_os = "linux")]
+pub fn play_counters() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [PARTIAL_NOTES[0].load(Relaxed), PARTIAL_NOTES[1].load(Relaxed), GPU_DETILE[2].load(Relaxed),
+        GPU_DETILE[5].load(Relaxed), REMAP_UPLOADS.iter().map(|v| v[0].load(Relaxed)).sum()]
 }
 
 /// A texture's re-upload left by `refresh` for after the image cache's lock

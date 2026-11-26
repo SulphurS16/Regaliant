@@ -147,3 +147,15 @@ Presentation IDs distinguish real/generated KHR completions from guest flips. Sn
 and interpolation/completion cost are reported, not physical input-to-photon latency.
 Validation, capture, cold pipelines and thermal pauses invalidate performance comparisons;
 physical latency requires an external measurement.
+
+For fixed-camera comparisons of real/generated artifacts, depth handoff and texture detiling,
+see [play diagnostics](linux-play-diagnostics.md). Optional `DS_PLAY_TELEMETRY=1` logs
+per-second work and pacing counters. Completed snapshots from obsolete render sizes can now
+retire; temporary pool pressure skips generation and retries rather than permanently disabling
+FG. Immediate-recorded uses without a known completion sequence remain pinned for safety.
+
+`DS_FG_PACING=adaptive` is an opt-in display-thread implementation; the default remains
+`legacy`. It removes the second present from guest flip completion, uses private completed
+image copies, and delays playback by one real interval plus 4 ms to preserve temporal order.
+See the [Nexus check](linux-nexus-check.md) for the three-run comparison, source-age/repeat
+telemetry and validation requirements.

@@ -10,6 +10,8 @@ fn utc_stamp() -> String { dsconfig::utc_stamp() }
 const EXIT_CPU: u32 = 8;
 fn player_error(message: &str) { eprintln!("{message}"); }
 fn shutdown(code: i32) -> ! {
+    gpu::framegen::stop_presenter();
+    platform::present_timing::end("exit");
     hle::libs::videoout::wait_shots();
     platform::stalls::flush();
     info!("{}", platform::sparse::status());
@@ -328,13 +330,14 @@ fn run() -> Result<(), String> {
     }).map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
     let mut reported = 0;
+    let heartbeat_period = if platform::write_watch::play_telemetry() { 1 } else { 5 };
     let close_via_window = relay && std::env::var("DS_RELAY_CLOSE_WINDOW").ok().as_deref() == Some("1");
     let mut close_requested = false;
     let relay_stop = std::env::var_os("DS_RELAY_STOP_FILE").map(PathBuf::from);
     while !thread.is_finished() {
         let seconds = started.elapsed().as_secs();
-        if seconds / 5 > reported {
-            reported = seconds / 5;
+        if seconds / heartbeat_period > reported {
+            reported = seconds / heartbeat_period;
             use std::sync::atomic::Ordering::Relaxed;
             let [upload_bytes, writeback_bytes, upload_runs] = gpu::fe2::traffic_counters();
             let [uffd_takes, uffd_scans, uffd_pages, uffd_ns, _, uffd_errors, _] = platform::write_watch::counters();
@@ -343,7 +346,16 @@ fn run() -> Result<(), String> {
             info!("Linux heartbeat: {seconds}s flips={} submits={} draws={} dispatches={} recovered_faults={} direct_faults={} kernel_io_retries={} kernel_read_shorts={kernel_read_shorts} kernel_read_eof={kernel_read_eof} kernel_read_errors={kernel_read_errors} upload_bytes={upload_bytes} writeback_bytes={writeback_bytes} upload_runs={upload_runs} dirty_pages={dirty_pages} unarmable_pages={unarmable_pages} uffd_takes={uffd_takes} uffd_scans={uffd_scans} uffd_pages={uffd_pages} uffd_ns={uffd_ns} uffd_errors={uffd_errors}",
                 gpu::FRAMES.load(Relaxed), gpu::SUBMITS.load(Relaxed), gpu::cp::DRAWS.load(Relaxed), gpu::cp::DISPATCHES.load(Relaxed),
                 platform::signals::RECOVERED.load(Relaxed), platform::signals::DIRECT.load(Relaxed), mem::KERNEL_IO[1].load(Relaxed));
-            if !headless && reported % 3 == 0 && std::env::var("DS_LINUX_INTERVAL_SHOTS").ok().as_deref() != Some("0") {
+            if platform::write_watch::play_telemetry() {
+                let [fg_generated, fg_dispatches, fg_ns, fg_pace_ns, fg_retired, fg_pool_deferred, fg_failed] = gpu::framegen::telemetry();
+                let [fg_packets, fg_real_shown, fg_generated_shown, fg_repeats, fg_drops, fg_copy_ns, fg_age_ns] = gpu::framegen::adaptive_counters();
+                info!("Linux adaptive: {seconds}s fg_packets={fg_packets} fg_real_shown={fg_real_shown} fg_generated_shown={fg_generated_shown} fg_repeats={fg_repeats} fg_drops={fg_drops} fg_copy_ns={fg_copy_ns} fg_age_ns={fg_age_ns}");
+                let [pb_hits, pb_refused, pb_missing, pb_source_calls, pb_source_ns, pb_active] = gpu::pcache::play_counters();
+                let [ww_samples, ww_mapping_ns, ww_lock_ns, ww_work_ns, ww_regions, ww_journal, ww_writers] = platform::write_watch::detail();
+                let [texture_zero_parts, texture_missing_parts, texture_gpu_upload_bytes, texture_upload_ns, texture_remaps] = gpu::images::play_counters();
+                info!("Linux play: {seconds}s fg_generated={fg_generated} fg_dispatches={fg_dispatches} fg_ns={fg_ns} fg_pace_ns={fg_pace_ns} fg_retired={fg_retired} fg_pool_deferred={fg_pool_deferred} fg_failed={fg_failed} pb_hits={pb_hits} pb_refused={pb_refused} pb_missing={pb_missing} pb_source_calls={pb_source_calls} pb_source_ns={pb_source_ns} pb_active={pb_active} ww_samples={ww_samples} ww_mapping_ns={ww_mapping_ns} ww_lock_ns={ww_lock_ns} ww_work_ns={ww_work_ns} ww_regions={ww_regions} ww_journal={ww_journal} ww_writers={ww_writers} texture_zero_parts={texture_zero_parts} texture_missing_parts={texture_missing_parts} texture_gpu_upload_bytes={texture_gpu_upload_bytes} texture_upload_ns={texture_upload_ns} texture_remaps={texture_remaps}");
+            }
+            if !headless && seconds % 15 == 0 && std::env::var("DS_LINUX_INTERVAL_SHOTS").ok().as_deref() != Some("0") {
                 let mut shot = hle::libs::videoout::SHOT_REQUEST.lock();
                 if shot.is_none() { *shot = Some(format!("elapsed-{seconds:04}s")); }
             }

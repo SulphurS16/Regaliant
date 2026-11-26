@@ -5339,6 +5339,21 @@ fn note_run_order(seams: &[super::vk::defer::Seams]) {
 /// is idle while the batch timeline is there.
 static LAST_MAIN_SUBMITTED: AtomicU64 = AtomicU64::new(0);
 
+// Linux FG snapshot retirement uses the sequence of already-numbered driver replay.
+// Immediate recording (including an early defer flush) deliberately returns None.
+#[cfg(target_os = "linux")]
+pub(crate) mod replay_completion {
+    thread_local! {
+        static SEQUENCE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+    pub fn get() -> Option<u64> { SEQUENCE.with(|s| s.get()) }
+    pub struct Scope(Option<u64>);
+    pub fn enter(sequence: Option<u64>) -> Scope { Scope(SEQUENCE.with(|s| s.replace(sequence))) }
+    impl Drop for Scope {
+        fn drop(&mut self) { SEQUENCE.with(|s| s.set(self.0)); }
+    }
+}
+
 /// Submits batches in sequence order: consecutive ones on the main queue
 /// without a copy-queue part go to Vulkan in one call (`tune
 /// submit_coalesce`: at most that many; the GPU then starts each right
@@ -5348,6 +5363,8 @@ fn submit_specs(mut specs: Vec<(u64, SubmitSpec)>) {
     if specs.is_empty() || DEVICE_LOST.load(Ordering::Relaxed) {
         return;
     }
+    #[cfg(target_os = "linux")]
+    let _replay = replay_completion::enter(specs.iter().map(|s| s.0).max());
     let fail = |e: String, name: &str| {
         if lose_device() {
             crate::error!("gpu[{name}]: {e}; GPU execution stops; checkpoints: {}", super::vk::checkpoint_report());

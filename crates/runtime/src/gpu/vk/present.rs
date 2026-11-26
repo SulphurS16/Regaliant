@@ -813,7 +813,8 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
 /// Presents one frame. Returns false if presentation is not possible (minimized).
 pub fn present(src: Source) -> bool {
     #[cfg(target_os = "linux")]
-    if !crate::gpu::framegen::presenting() && ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+    if !crate::gpu::framegen::bypass_present_hook() && ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(ok) = crate::gpu::framegen::adaptive_present(&src) { return ok; }
         crate::gpu::framegen::present_pair(&src);
     }
     let c = ctx();
@@ -1028,6 +1029,12 @@ pub fn present(src: Source) -> bool {
         }
         #[cfg(target_os = "linux")]
         let ready_end = std::time::Instant::now();
+        // The census used to drain only through optional framewatch. Instrumentation
+        // alone then logged shader identities but never any measured positions.
+        #[cfg(target_os = "linux")]
+        if p.watch.is_none() && crate::gpu::shaders::vs_outlier().is_some() {
+            crate::gpu::exec::outlier_note(crate::log::elapsed_ms(), crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+        }
         if let Some((buf, mem, ptr, w, h)) = shot {
             #[cfg(windows)]
             c.device.wait_for_fences(&[p.fences[f]], true, 5_000_000_000).ok();

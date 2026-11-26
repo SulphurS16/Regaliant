@@ -1003,7 +1003,8 @@ fn init_inner() -> Result<(), String> {
         // Driver UUID/version alone does not distinguish enabled robustness/subgroup features.
         let mut binary_extensions: Vec<_> = dexts.iter().map(|&p| CStr::from_ptr(p).to_string_lossy().into_owned()).collect();
         binary_extensions.sort();
-        let binary_features = format!("{features:?}|{f11:?}|{f12:?}|{f13:?}|{}|{:?}|{barycentric}|{max_reconv}|{}|{pbins}|{has_pw}|{has_fault}|{has_stats}",
+        let binary_present_wait = has_pw;
+        let binary_features = format!("{features:?}|{f11:?}|{f12:?}|{f13:?}|{}|{:?}|{barycentric}|{max_reconv}|{}|{pbins}|{binary_present_wait}|{has_fault}|{has_stats}",
             has_robust2, if has_robust2 { Some(r2) } else { None }, up_dev.mutable_descriptor);
         let binary_compatibility = format!("contract1|{binary_extensions:?}|{binary_features}");
         crate::info!("Vulkan pipeline compatibility: {binary_compatibility}");

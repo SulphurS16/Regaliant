@@ -1195,6 +1195,8 @@ impl Play {
                 self.measuring = true;
                 self.shot("gameplay-measure-begin");
                 #[cfg(target_os = "linux")]
+                crate::hle::libs::videoout::arm_relative_shots("measure", "DS_MEASURE_SHOTS");
+                #[cfg(target_os = "linux")]
                 crate::platform::present_timing::begin();
                 // Wall time: a slow renderer must not extend the measurement.
                 #[cfg(target_os = "linux")]
@@ -1332,7 +1334,10 @@ impl Play {
                     crate::info!("relay saved-load: confirming the same Continue Offline dialog");
                     self.press_flips("cross", 2);
                 }
-                ResumeAction::Ready => { self.step("saved-load gameplay observed"); return Ok(()); }
+                ResumeAction::Ready => {
+                    crate::hle::libs::videoout::arm_relative_shots("load", "DS_LOAD_SHOTS");
+                    self.step("saved-load gameplay observed"); return Ok(());
+                }
                 ResumeAction::Wait => {}
             }
             if seconds >= 300.0 {

@@ -427,7 +427,12 @@ fn vblank_thread() {
                 crate::gpu::capture::note_display_size(a.width, a.height);
             }
             maybe_screenshot(&b, n);
+            #[cfg(windows)]
             crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(target_os = "linux")]
+            if !crate::gpu::framegen::adaptive_mode() {
+                crate::gpu::vk::framewatch::SHOWN_FLIP.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             crate::displayclock::note_present();
             present_buffer(&b);
             crate::gpu::timeline::end("vblank", present_mark, || "present/readback/overlay".into());
@@ -839,6 +844,26 @@ pub fn wait_shots() {
 /// at each of them (`Images::probe_used`).
 pub static PROBE: Mutex<Option<(u32, f32, f32)>> = Mutex::new(None);
 
+#[cfg(target_os = "linux")]
+static RELATIVE_SHOTS: Mutex<Vec<(&'static str, u64, Vec<u64>)>> = Mutex::new(Vec::new());
+#[cfg(target_os = "linux")]
+static RELATIVE_SHOTS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+pub fn arm_relative_shots(kind: &'static str, variable: &str) {
+    let mut offsets: Vec<u64> = std::env::var(variable).unwrap_or_default().split(',')
+        .filter_map(|x| x.trim().parse().ok()).filter(|n| (1..=10000).contains(n)).take(8).collect();
+    offsets.sort_unstable(); offsets.dedup();
+    if offsets.is_empty() { return; }
+    let base = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    crate::info!("relay {kind} captures: base flip {base}, offsets {offsets:?}");
+    let mut g = RELATIVE_SHOTS.lock(); g.retain(|(k,_,_)| *k != kind); g.push((kind, base, offsets));
+    RELATIVE_SHOTS_ON.store(true, std::sync::atomic::Ordering::Release);
+}
+#[cfg(target_os = "linux")]
+fn load_offset(base: u64, flip: u64, offsets: &[u64]) -> Option<u64> {
+    flip.checked_sub(base).filter(|n| offsets.contains(n))
+}
+
 fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
     let probe = {
         let mut g = PROBE.lock();
@@ -875,6 +900,21 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64) {
             b.left = b.left.saturating_sub(1);
             if b.left == 0 {
                 *g = None;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if RELATIVE_SHOTS_ON.load(std::sync::atomic::Ordering::Acquire) {
+        let g = RELATIVE_SHOTS.lock();
+        for (kind, base, offsets) in g.iter() {
+            if let Some(offset) = load_offset(*base, flip, offsets) {
+                crate::info!("relay {kind} checkpoint: +{offset} at flip {flip}");
+                if requested.is_none() { requested = Some(format!("after-{kind}-{offset:04}")); }
+                crate::gpu::framegen::request_dump();
+                if *kind == "measure" && Some(&offset) == offsets.first()
+                    && std::env::var("DS_CAPTURE_MEASURE").ok().as_deref() == Some("1") {
+                    crate::gpu::capture::arm_next();
+                }
             }
         }
     }
@@ -939,5 +979,15 @@ mod shot_lifetime_tests {
         assert!(!super::shots_idle()); // writer queued but has not started
         drop(writer); // spawn failure also drops its closure
         assert!(super::shots_idle());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod load_shot_tests {
+    #[test]
+    fn checkpoints_are_relative_to_observed_gameplay_not_startup() {
+        assert_eq!(super::load_offset(2400, 2700, &[300, 600]), Some(300));
+        assert_eq!(super::load_offset(2400, 300, &[300, 600]), None);
+        assert_eq!(super::load_offset(2400, 2701, &[300, 600]), None);
     }
 }

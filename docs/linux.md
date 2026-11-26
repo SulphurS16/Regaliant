@@ -205,3 +205,10 @@ For fixed-flip brightness comparisons across binaries and tracking backends, use
 [exposure checker and revision matrix](linux-exposure-check.md).
 
 Implementation constraints and regression rationale are in [linux-notes.md](linux-notes.md).
+
+For a bounded six-case comparison of frame generation, depth clears and texture detiling,
+see [play-session diagnostics](linux-play-diagnostics.md).
+
+The [three-run Nexus check](linux-nexus-check.md) verifies prepared pipeline reuse, captures
+early streaming, and compares the opt-in `DS_FG_PACING=adaptive` presenter. Legacy FG pacing
+remains the default pending visual and latency validation.
