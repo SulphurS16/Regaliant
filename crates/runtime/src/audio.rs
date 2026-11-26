@@ -440,12 +440,17 @@ fn soft_knee(v: f32) -> f32 {
 /// scale (`mix_into`).
 const SOFT_KNEE: f32 = 0.8;
 
-/// No sound at all (the shader preparation's self-play, `prepplay`): the streams drain on the
-/// null device's clock and no output device is opened.
+/// No sound at all (the shader preparation's self-play, `prepplay`; test runs, `DS_SILENT=1`,
+/// which scripts/gpu-run.ps1 and the test drivers set unless a test asks for sound): the streams
+/// drain on the null device's clock and no output device is opened. The mix is made as in play,
+/// so `audio capture` and the stream statistics still work.
 pub static SILENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn output_thread() {
     crate::log::set_thread_name("audio-out");
+    if std::env::var("DS_SILENT").is_ok_and(|v| v.trim() == "1") {
+        SILENT.store(true, Ordering::Relaxed);
+    }
     if SILENT.load(Ordering::Relaxed) {
         crate::info!("audio: silent (no output device opened)");
         null_device();
