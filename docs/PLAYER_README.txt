@@ -1,4 +1,4 @@
-Regaliant 0.1.2 - an unofficial PC port of Demon's Souls for Windows (64-bit)
+Regaliant {VERSION} - an unofficial PC port of Demon's Souls for Windows (64-bit)
 =============================================================================
 
 Regaliant is an unofficial PC port of Demon's Souls (PS5, PPSA01341). It is not rebuilt from the game's

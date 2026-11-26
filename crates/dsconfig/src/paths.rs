@@ -244,20 +244,22 @@ pub struct Launch {
     pub safe_mode: bool,
     /// Prepare the game's shaders before the first start (the launcher's job).
     pub prepare_shaders: bool,
+    /// Ask GitHub for a newer release at every start (the launcher's updates, docs/UPDATES.md).
+    pub check_updates: bool,
 }
 
 impl Launch {
     pub fn load(p: &Paths) -> Launch {
         let kv = read_kv(&p.launch_file());
         let get = |k: &str| kv.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
-        Launch { safe_mode: get("safe_mode") == Some("1"), prepare_shaders: get("prepare_shaders") != Some("0") }
+        Launch { safe_mode: get("safe_mode") == Some("1"), prepare_shaders: get("prepare_shaders") != Some("0"), check_updates: get("check_updates") != Some("0") }
     }
 
     pub fn save(&self, p: &Paths) -> std::io::Result<()> {
         std::fs::create_dir_all(&p.user)?;
         let t = format!(
-            "# The launcher's options for the next start; written by the launcher\nsafe_mode = {}\nprepare_shaders = {}\n",
-            self.safe_mode as u8, self.prepare_shaders as u8
+            "# The launcher's options for the next start; written by the launcher\nsafe_mode = {}\nprepare_shaders = {}\ncheck_updates = {}\n",
+            self.safe_mode as u8, self.prepare_shaders as u8, self.check_updates as u8
         );
         std::fs::write(p.launch_file(), t)
     }
@@ -318,8 +320,8 @@ mod tests {
     fn launch_options() {
         let tmp = std::env::temp_dir().join(format!("dsconfig-launch-{}", std::process::id()));
         let p = Paths { layout: Layout::Portable, exe_dir: tmp.clone(), user: tmp.clone(), cache: tmp.clone(), root: None };
-        assert_eq!(Launch::load(&p), Launch { safe_mode: false, prepare_shaders: true });
-        let l = Launch { safe_mode: true, prepare_shaders: false };
+        assert_eq!(Launch::load(&p), Launch { safe_mode: false, prepare_shaders: true, check_updates: true });
+        let l = Launch { safe_mode: true, prepare_shaders: false, check_updates: false };
         l.save(&p).unwrap();
         assert_eq!(Launch::load(&p), l);
         let _ = std::fs::remove_dir_all(&tmp);

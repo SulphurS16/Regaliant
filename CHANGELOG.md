@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The launcher checks for a new version of Regaliant at every start. When one is out, Update
+  downloads it, checks that it is a genuine Regaliant release and restarts the launcher. Nothing
+  changes until you press it, and your saves, settings and prepared shaders are kept. Until a game
+  session of the new version ends normally, Roll back puts the earlier version back. A check box
+  on the Game page turns the check off. This version still has to be installed by hand once.
+- The README's first line names the version it came with. Before, it always said 0.1.2.
+
 ## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale

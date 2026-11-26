@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// The files a package holds besides the launcher itself (`scripts\package.ps1`'s allowlist), and
 /// the portable layout's marker.
-const PACKAGE_FILES: &[&str] = &[
+pub(crate) const PACKAGE_FILES: &[&str] = &[
     "regaliant.exe",
     "README.txt",
     "portable.txt",

@@ -1276,6 +1276,11 @@ pub fn start(app: &mut App, play_after: bool) {
     if running(app) || app.running.is_some() || !app.game.ok {
         return;
     }
+    // (Not while an update is being downloaded: it replaces the game's program file at its end.)
+    if crate::update::downloading(app) {
+        app.set_status("An update is being downloaded. Prepare the shaders when it is done.");
+        return;
+    }
     let exe = dsconfig::paths::game_exe_in(&app.paths.exe_dir);
     if !exe.is_file() {
         unsafe { ui::message(app.hwnd, &format!("{} was not found next to the launcher.", dsconfig::paths::GAME_EXE), crate::TITLE, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR) };

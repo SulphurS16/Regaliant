@@ -153,7 +153,10 @@ $read = { param($p) ([IO.File]::ReadAllText($p)).Replace("`r`n", "`n").TrimEnd()
 $rule = '=' * 78
 $license = Join-Path $root 'release\LICENSE'
 if (-not (Test-Path $license)) { $license = Join-Path $root 'LICENSE' }
-$readme = (& $read (Join-Path $root 'docs\PLAYER_README.txt')) + "`n`n`n$rule`nThird-party notices`n$rule`n`n" + (& $read (Join-Path $root 'THIRD_PARTY_NOTICES.txt')) + "`n`n`n$rule`nLicense: GNU General Public License, version 3`n$rule`n`n" + (& $read $license) + "`n"
+# (The README's title line carries this version, its underline as long: until 0.1.9 it said 0.1.2.)
+$player = (& $read (Join-Path $root 'docs\PLAYER_README.txt')).Replace('{VERSION}', $ver) -split "`n"
+$player[1] = '=' * $player[0].Length
+$readme = ($player -join "`n") + "`n`n`n$rule`nThird-party notices`n$rule`n`n" + (& $read (Join-Path $root 'THIRD_PARTY_NOTICES.txt')) + "`n`n`n$rule`nLicense: GNU General Public License, version 3`n$rule`n`n" + (& $read $license) + "`n"
 [IO.File]::WriteAllText((Join-Path $out 'README.txt'), $readme.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding $true))
 # Allowlist: nothing else may be in the package.
 $allowed = @($programs.Keys) + @('README.txt') + @($upNames | ForEach-Object { "upscalers\$_" })
@@ -213,3 +216,23 @@ if (-not (Test-Path $final)) {
 }
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 Write-Host ("package {0}: {1} files, {2:N1} MB; zip {3:N1} MB, SHA-256 {4}; build {5}, symbols in {6}" -f $out, $count, ($size / 1MB), ((Get-Item $zip).Length / 1MB), $hash, $buildId, $symDir)
+# The update signature (docs/UPDATES.md): the zip signed with the update key (Ed25519; its private
+# half kept privately, never in Git), then checked against the public key the launcher holds.
+# Launchers from 0.1.9 on offer a release as an update only with its <zip>.sig.
+$key = $env:REGALIANT_SIGNING_KEY
+$pub = Join-Path $root 'crates\launcher\update-public-key.pem'
+$sig = "$zip.sig"
+if (Test-Path $sig) { Remove-Item -Force $sig }
+$openssl = @((Get-Command openssl -ErrorAction SilentlyContinue).Source, 'C:\Program Files\Git\usr\bin\openssl.exe', 'C:\Program Files\Git\mingw64\bin\openssl.exe') | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not (Test-Path $key)) {
+  Write-Host "no update key ($key): the zip is not signed, and launchers will not offer it as an update"
+} elseif (-not $openssl) {
+  Write-Host "no openssl found (Git for Windows has one): the zip is not signed"; exit 1
+} else {
+  & $openssl pkeyutl -sign -inkey $key -rawin -in $zip -out $sig
+  $verified = (& $openssl pkeyutl -verify -pubin -inkey $pub -rawin -in $zip -sigfile $sig 2>&1) -join ' '
+  if (-not (Test-Path $sig) -or (Get-Item $sig).Length -ne 64 -or $verified -notmatch 'Signature Verified Successfully') {
+    Write-Host "the zip's signature does not check against the launcher's key ($verified)"; exit 1
+  }
+  Write-Host "signed: $sig (checked against the launcher's key)"
+}

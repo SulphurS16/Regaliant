@@ -291,6 +291,47 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// The processes (other than this one) whose program file is in `dir`, with their file names: a
+/// game started without the launcher keeps its program files in use.
+pub fn processes_in(dir: &std::path::Path) -> Vec<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+    let want = dir.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase();
+    let me = std::process::id();
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+        pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut pe) != 0;
+        while ok {
+            if pe.th32ProcessID != me && pe.th32ProcessID != 0 {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pe.th32ProcessID);
+                if !h.is_null() {
+                    let mut buf = [0u16; 1024];
+                    let mut n = buf.len() as u32;
+                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) != 0 {
+                        let path = String::from_utf16_lossy(&buf[..n as usize]);
+                        if let Some((d, name)) = path.rsplit_once('\\') {
+                            if d.to_ascii_lowercase() == want {
+                                out.push((pe.th32ProcessID, name.to_string()));
+                            }
+                        }
+                    }
+                    CloseHandle(h);
+                }
+            }
+            ok = Process32NextW(snap, &mut pe) != 0;
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
 /// `DS_SIM_BATTERY=<percent>|<file>` (a test): on battery at that charge, or at the charge the
 /// file holds while it exists (none: on mains power), so that a test can unplug a running PC.
 fn sim_battery() -> Option<Option<u8>> {

@@ -22,6 +22,7 @@ mod shot;
 mod sys;
 mod ui;
 mod uninstall;
+mod update;
 
 use dsconfig::paths::{Launch, Paths};
 use std::cell::RefCell;
@@ -84,6 +85,7 @@ pub struct App {
     pub display: display::Page,
     pub shaders: shaders::Page,
     pub saves: saves::Page,
+    pub update: update::Page,
     /// The game's process id while it runs.
     pub running: Option<u32>,
 }
@@ -165,6 +167,10 @@ impl App {
 /// Play: the shaders first when they are not prepared (unless turned off), then the game.
 pub fn play(app: &mut App) {
     if app.running.is_some() || !app.game.ok || game::compressing(app) {
+        return;
+    }
+    if update::downloading(app) {
+        app.set_status("An update is being downloaded. Press Play when it is done.");
         return;
     }
     if shaders::running(app) {
@@ -289,7 +295,12 @@ fn game_exited(app: &mut App, code: i32) {
         ui::redraw(app.hwnd);
     }
     match code {
-        0 => app.set_status(shaders::battery_note(app).unwrap_or("")),
+        0 => {
+            app.set_status(shaders::battery_note(app).unwrap_or(""));
+            // (The update's backup is no longer needed once a session of the new version ended
+            // normally.)
+            update::session_ok(app);
+        }
         EXIT_GAME_FILES => app.set_status("The game could not use its game files. The Game page shows why."),
         EXIT_NO_GPU => app.set_status("The game could not start the graphics card. Restart Windows, or update the graphics driver."),
         EXIT_CPU | EXIT_DEVICE_LOST | EXIT_MEMORY | EXIT_RUNNING | EXIT_EARLY | 0xD500..=0xD5FF => app.set_status(&format!("The game stopped with an error (code {code:#x}). Open logs shows its log.")),
@@ -369,6 +380,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_LOGS => open_logs(app),
                 ID_DISCORD => ui::open_url(DISCORD),
                 ID_UNINSTALL => uninstall::run(app),
+                update::ID_UPDATE | update::ID_CHECK_UPDATES => update::command(app, id),
                 100..=199 => game::command(app, id, code),
                 200..=299 => shaders::command(app, id, code),
                 300..=399 => saves::command(app, id, code),
@@ -400,6 +412,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER if wp == shaders::TIMER => with_app(shaders::tick).is_some(),
         WM_TIMER if wp == shaders::CHECK_TIMER => with_app(shaders::check_tick).is_some(),
         WM_TIMER if wp == game::TIMER => with_app(game::tick).is_some(),
+        WM_TIMER if wp == update::TIMER => with_app(update::tick).is_some(),
+        update::WM_CHECKED => with_app(update::checked).is_some(),
         WM_GAME_EXIT => {
             handle_exit(hwnd, wp);
             true
@@ -459,6 +473,11 @@ fn main() {
         InitCommonControlsEx(&icc);
         let hinst = GetModuleHandleW(std::ptr::null());
         let class = wide("regaliant_launcher");
+        // (Started by an update or a roll back: the launcher that started it closes first.)
+        let after_update = arg("--after-update").and_then(|p| p.parse::<u32>().ok());
+        if let Some(pid) = after_update {
+            update::wait_for(pid);
+        }
         // One launcher at a time (two could prepare the shaders twice): a second start brings
         // the first one to the front. (`--shot` runs are layout checks: they may run beside one.)
         if arg("--shot").is_none() {
@@ -518,6 +537,7 @@ fn main() {
             display: display::Page::default(),
             shaders: shaders::Page::default(),
             saves: saves::Page::default(),
+            update: update::Page::default(),
             running: None,
         };
         let b = app.builder();
@@ -548,6 +568,7 @@ fn main() {
         game::build(&mut app);
         display::build(&mut app);
         shaders::build(&mut app);
+        update::build(&mut app);
         let first = arg("--page").and_then(|n| n.parse::<usize>().ok()).unwrap_or(0).min(3);
         SendMessageW(app.tabs, TCM_SETCURSEL, first, 0);
         app.show_page(first);
@@ -561,11 +582,26 @@ fn main() {
             shaders::start_check(&app);
             SetTimer(hwnd, shaders::CHECK_TIMER, 500, None);
         }
+        // (A newer release asked for at every start, the player's check box allowing.)
+        if arg("--shot").is_none() {
+            update::start_check(&app);
+        }
         // `--shot <file>`: each page as <file>-<page>.png, then exit (layout checks).
         let shot = arg("--shot").map(PathBuf::from);
         APP.with(|a| *a.borrow_mut() = Some(app));
-        ShowWindow(hwnd, SW_SHOW);
+        // (`DS_WINDOW_BEHIND=1`, tests on a shared desktop, as the game's: shown without taking
+        // the focus, below the other windows.)
+        if std::env::var("DS_WINDOW_BEHIND").is_ok_and(|v| v.trim() == "1") {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
         ui::redraw(hwnd);
+        // (What the update changed, once, over the shown window; its leftovers removed.)
+        if after_update.is_some() {
+            with_app(update::after_start);
+        }
         if let Some(file) = shot {
             for n in 0..4 {
                 with_app(|app| {
