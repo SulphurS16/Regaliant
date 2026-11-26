@@ -121,26 +121,28 @@ impl Watch {
         Ok(())
     }
 
-    fn scan(&self, lo: u64, hi: u64, out: &mut Vec<u64>) -> Result<(), String> {
-        let mut at = lo;
-        let mut regions = [PageRegion::default(); 128];
-        while at < hi {
-            let mut arg = Scan { size: size_of::<Scan>() as u64, flags: 3, // WP_MATCHING | CHECK_WPASYNC
-                start: at, end: hi, vec: regions.as_mut_ptr() as u64, vec_len: regions.len() as u64,
-                category_mask: WRITTEN, return_mask: WRITTEN, ..Default::default() };
-            let n = unsafe { libc::ioctl(self.pagemap.as_raw_fd(), SCAN, &mut arg) };
-            STATS[1].fetch_add(1, Relaxed);
-            if n < 0 { return Err(error("PAGEMAP_SCAN")); }
-            if n as usize > regions.len() || arg.walk_end <= at || arg.walk_end > hi { return Err("PAGEMAP_SCAN invalid progress".into()); }
-            for r in &regions[..n as usize] {
-                if r.start < at || r.end > arg.walk_end || r.start >= r.end || r.categories & WRITTEN == 0 {
-                    return Err("PAGEMAP_SCAN invalid region".into());
-                }
-                out.extend((r.start..r.end).step_by(PAGE as usize));
-            }
-            at = arg.walk_end;
+    /// The bookkeeping half of a take, under the watch mutex: registers what the range needs,
+    /// and returns the committed parts to scan plus the journal's dirty pages over the range
+    /// (removed from the journal: this take reports them). The kernel scans happen after the
+    /// mutex is released (`scan_fd`): PAGEMAP_SCAN is safe to run concurrently, and the
+    /// caller's mapping guard keeps remaps (`forget`) out while it runs.
+    fn plan(&mut self, lo: u64, hi: u64, parts: &mut Vec<(u64, u64)>, dirty: &mut Vec<(u64, u64)>) -> Result<(), String> {
+        self.ensure(lo, hi)?;
+        // A syscall/host write can use an untracked alias, or span this take. Announced
+        // writes remain conservatively dirty until end, which journals them once again.
+        dirty.extend(self.dirty.intersect(lo, hi-lo));
+        for (&(a, e), _) in &self.writers {
+            if a < hi && e > lo { dirty.push((a.max(lo), e.min(hi)-a.max(lo))); }
         }
+        for (&a, r) in self.regions.range(..hi).rev().take_while(|(_, r)| r.end > lo) {
+            if r.committed { parts.push((a.max(lo), r.end.min(hi))); }
+        }
+        self.dirty.remove(lo, hi-lo);
         Ok(())
+    }
+
+    fn scan(&self, lo: u64, hi: u64, out: &mut Vec<u64>) -> Result<(), String> {
+        scan_fd(self.pagemap.as_raw_fd(), lo, hi, out)
     }
 
     fn take(&mut self, lo: u64, hi: u64, out: &mut Vec<u64>) -> Result<(), String> {
@@ -191,7 +193,107 @@ impl Watch {
     }
 }
 
+/// PAGEMAP_SCAN over [lo, hi): appends the pages written since their last scan and
+/// write-protects them again (WP_MATCHING | CHECK_WPASYNC). Needs no watch mutex.
+fn scan_fd(fd: i32, lo: u64, hi: u64, out: &mut Vec<u64>) -> Result<(), String> {
+    let mut at = lo;
+    let mut regions = [PageRegion::default(); 128];
+    while at < hi {
+        let mut arg = Scan { size: size_of::<Scan>() as u64, flags: 3,
+            start: at, end: hi, vec: regions.as_mut_ptr() as u64, vec_len: regions.len() as u64,
+            category_mask: WRITTEN, return_mask: WRITTEN, ..Default::default() };
+        let n = unsafe { libc::ioctl(fd, SCAN, &mut arg) };
+        STATS[1].fetch_add(1, Relaxed);
+        if n < 0 { return Err(error("PAGEMAP_SCAN")); }
+        if n as usize > regions.len() || arg.walk_end <= at || arg.walk_end > hi { return Err("PAGEMAP_SCAN invalid progress".into()); }
+        for r in &regions[..n as usize] {
+            if r.start < at || r.end > arg.walk_end || r.start >= r.end || r.categories & WRITTEN == 0 {
+                return Err("PAGEMAP_SCAN invalid region".into());
+            }
+            out.extend((r.start..r.end).step_by(PAGE as usize));
+        }
+        at = arg.walk_end;
+    }
+    Ok(())
+}
+
+/// Whether takes scan outside the watch mutex (default; DS_LINUX_WW_UNLOCKED_SCAN=0: the
+/// whole take under it, as before).
+fn unlocked_scan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("DS_LINUX_WW_UNLOCKED_SCAN").ok().as_deref() != Some("0"))
+}
+
+/// `take` with the kernel scans outside the watch mutex (`Watch::plan`, `scan_fd`).
+fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+    if size == 0 { return Some(()); }
+    let (lo, hi) = (base & !(PAGE-1), base.checked_add(size)?.checked_next_multiple_of(PAGE)?);
+    if lo < crate::mem::GUEST_BASE || hi > crate::mem::GUEST_END { return None; }
+    thread_local! {
+        static SAMPLE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PLAN: std::cell::RefCell<(Vec<(u64, u64)>, Vec<(u64, u64)>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    let sampled = play_telemetry() && SAMPLE.with(|n| { let x = n.get().wrapping_add(1); n.set(x); x % 64 == 0 });
+    let before = sampled.then(crate::gpu::record_opts::Timer::start);
+    // Shared: remaps (`remapped`, under the exclusive mapping guard) cannot run until the
+    // scans below are done, so the parts planned stay registered and mapped.
+    let _mapping = crate::gpu::resident::arm_guard();
+    let mapping_ns = before.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+    let t = crate::gpu::record_opts::Timer::start();
+    let watch = WATCH.get()?.as_ref()?;
+    PLAN.with(|plan| {
+        let (parts, dirty) = &mut *plan.borrow_mut();
+        parts.clear();
+        dirty.clear();
+        let (fd, lock_ns, gauges) = {
+            let mut w = watch.lock();
+            let lock_ns = if sampled { t.elapsed().as_nanos() as u64 } else { 0 };
+            if let Err(e) = w.plan(lo, hi, parts, dirty) {
+                w.dirty.insert(lo, hi-lo);
+                if STATS[5].fetch_add(1, Relaxed) < 8 { crate::warn!("Linux async write watch: {lo:#x}..{hi:#x}: {e}"); }
+                return None;
+            }
+            (w.pagemap.as_raw_fd(), lock_ns, [w.regions.len(), w.dirty.len(), w.writers.len()])
+        };
+        let first = out.len();
+        for &(a, e) in parts.iter() {
+            if let Err(err) = scan_fd(fd, a, e, out) {
+                // A partial scan can already have reset dirty bits: keep the whole request
+                // dirty for the next attempt; callers treat None conservatively now.
+                out.truncate(first);
+                watch.lock().dirty.insert(lo, hi-lo);
+                if STATS[5].fetch_add(1, Relaxed) < 8 { crate::warn!("Linux async write watch: {lo:#x}..{hi:#x}: {err}"); }
+                return None;
+            }
+            for &(d, n) in dirty.iter() {
+                out.extend((a.max(d)..e.min(d+n)).step_by(PAGE as usize));
+            }
+        }
+        out[first..].sort_unstable();
+        // Adjacent kernel runs don't overlap; the explicit host journal can.
+        let mut write = first;
+        for read in first..out.len() {
+            if write == first || out[read] != out[write-1] { out[write] = out[read]; write += 1; }
+        }
+        out.truncate(write);
+        STATS[0].fetch_add(1, Relaxed);
+        STATS[2].fetch_add((out.len()-first) as u64, Relaxed);
+        let total_ns = t.elapsed().as_nanos() as u64;
+        STATS[3].fetch_add(total_ns, Relaxed);
+        if sampled {
+            for (i, value) in [1, mapping_ns, lock_ns, total_ns.saturating_sub(lock_ns)].into_iter().enumerate() {
+                DETAIL[i].fetch_add(value, Relaxed);
+            }
+            for (i, value) in gauges.into_iter().enumerate() {
+                DETAIL[i+4].store(value as u64, Relaxed);
+            }
+        }
+        Some(())
+    })
+}
+
 pub fn take(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
+    if unlocked_scan() { return take_unlocked(base, size, out); }
     if size == 0 { return Some(()); }
     let (lo, hi) = (base & !(PAGE-1), base.checked_add(size)?.checked_next_multiple_of(PAGE)?);
     if lo < crate::mem::GUEST_BASE || hi > crate::mem::GUEST_END { return None; }

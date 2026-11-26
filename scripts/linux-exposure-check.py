@@ -31,7 +31,7 @@ prepare = module('linux-prepare-shaders')
 SWITCHES = {'DS_LINUX_WRITE_WATCH': {'uffd', 'mprotect'},
             'DS_NAN_PRESERVE': {'0', '1'}, 'DS_PLAIN_MODES': {'0', '1'},
             'DS_MAX_RECONV': {'0', '1'}, 'DS_META_CLAIMS': {'0', '1', '2', '3'},
-            'DS_META_CLAIM_REBIND': {'0', '1'}}
+            'DS_META_CLAIM_REBIND': {'0', '1'}, 'DS_PROFILE_GPU': {'0', '1'}, 'DS_LINUX_WW_UNLOCKED_SCAN': {'0', '1'}, 'DS_PAR_WEIGHT': {'500', '750', '1000', '1500'}, 'DS_GPU_CHAINS': {'0', '1', '2'}, 'DS_GPU_SLOTS_GFX': {'8', '12', '16', '24'}}
 
 PLAY_CASES = ('off', 'fg', 'fg-real-only', 'depth-off', 'cpu-detile', 'vertices', 'fg-adaptive', 'fg-adaptive-vertices')
 def play_environment(case, flips):
@@ -66,12 +66,14 @@ def digest(path):
     return h.hexdigest()
 
 
-def settings(text):
+def settings(text, render_scale=6):
     # Do not inherit imports/relocations or a saved FG/upscaler choice. No changes to seed.
-    values = dict(WindowMode=0, RenderScale=6, AntiAliasing=0, AspectRatio=1, FrameRateLimit=0,
-                  FrameGeneration=0)
-    skip = tuple('Setting_PC_'+k+'=' for k in [*values, 'SaveFolder', 'ImportSaves'])
-    lines = [l for l in text.splitlines() if not l.strip().startswith(skip)]
+    # SkipIntro: the logos cost every run time and measure nothing.
+    values = dict(WindowMode=0, RenderScale=render_scale, AntiAliasing=0, AspectRatio=1, FrameRateLimit=0,
+                  FrameGeneration=0, SkipIntro=1)
+    skip = {'Setting_PC_'+k for k in [*values, 'SaveFolder', 'ImportSaves']}
+    # Player files write "Key = value"; match the key with or without spaces.
+    lines = [l for l in text.splitlines() if l.split('=',1)[0].strip() not in skip]
     return '\n'.join(lines+[f'Setting_PC_{k}={v}' for k,v in values.items()])+'\n'
 
 
@@ -223,6 +225,7 @@ def main():
     p.add_argument('--shader-seed',type=Path,help='optional immutable store; otherwise start a private empty store')
     p.add_argument('--flips',default='3600,3900,4200',help='absolute video-flip captures; identical list for every matrix arm')
     p.add_argument('--seconds',type=int,default=600,help='wall bound including startup (30..1800)')
+    p.add_argument('--render-scale',type=int,default=6,choices=range(1,10),help='PC RenderScale option (6: 100%%, 4: 75%%, 1: 50%%)')
     p.add_argument('--env',action='append',default=[],metavar='DS_NAME=VALUE')
     p.add_argument('--tap-exposure',action='store_true',help='separate diagnostic: GPU/guest TAA exposure taps (changes synchronization)')
     p.add_argument('--trace-clears',action='store_true',help='log metadata fills/transfers/resolves for three flips ending at the first capture')
@@ -289,7 +292,7 @@ def main():
             src=seed/name
             if src.is_file(): (run/'user'/name).write_bytes(src.read_bytes())
         pc=run/'user/pcsettings.txt'
-        pc.write_text(settings(pc.read_text() if pc.exists() else ''))
+        pc.write_text(settings(pc.read_text() if pc.exists() else '', args.render_scale))
         if args.play_case: pc.write_text(pc.read_text().replace('Setting_PC_FrameRateLimit=0','Setting_PC_FrameRateLimit=2'))
         if shader: linux_snapshot.copy_tree(shader,run/'shaders')
         else: (run/'shaders').mkdir()

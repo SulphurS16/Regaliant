@@ -334,7 +334,48 @@ fn run() -> Result<(), String> {
     let close_via_window = relay && std::env::var("DS_RELAY_CLOSE_WINDOW").ok().as_deref() == Some("1");
     let mut close_requested = false;
     let relay_stop = std::env::var_os("DS_RELAY_STOP_FILE").map(PathBuf::from);
+    // A file `cpu-profile-now` in the run directory profiles gpu-gfx for the number of seconds
+    // it holds (default 10): the self-time profile (`gpu::cpu_profile`) and, with
+    // DS_PROFILE_GPU=1, the sampled profile report, written as `trigger-N-*`.
+    let mut cpu_window: Option<(std::time::Instant, u64, u32)> = None;
+    let mut cpu_draining: Option<(u64, u32)> = None;
+    let mut cpu_windows = 0u32;
     while !thread.is_finished() {
+        if let Some(dir) = crate::run_dir() {
+            let trigger = dir.join("cpu-profile-now");
+            if cpu_window.is_none() && cpu_draining.is_none() && trigger.exists() {
+                let secs = std::fs::read_to_string(&trigger).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(10).clamp(1, 120);
+                let _ = std::fs::remove_file(&trigger);
+                gpu::reset_profile();
+                match gpu::cpu_profile::start() {
+                    Ok(()) => {
+                        cpu_windows += 1;
+                        info!("cpu profile window {cpu_windows}: {secs}s from flip {}", gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
+                        cpu_window = Some((std::time::Instant::now() + std::time::Duration::from_secs(secs), gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed), cpu_windows));
+                    }
+                    Err(e) => warn!("cpu profile window: {e}"),
+                }
+            }
+            if let Some((end, first, n)) = cpu_window {
+                if std::time::Instant::now() >= end {
+                    gpu::cpu_profile::stop();
+                    let flips = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(first);
+                    let _ = std::fs::write(dir.join(format!("trigger-{n}-profile-report.txt")), gpu::profile_report());
+                    cpu_window = None;
+                    cpu_draining = Some((flips, n));
+                }
+            }
+            if let Some((flips, n)) = cpu_draining {
+                if !gpu::cpu_profile::pending() {
+                    let _ = std::fs::write(dir.join(format!("trigger-{n}-waits.txt")), gpu::cpu_profile::take_waits(flips));
+                    match gpu::cpu_profile::write(&format!("trigger-{n}"), flips) {
+                        Ok(()) => info!("cpu profile window {n}: {flips} flips written"),
+                        Err(e) => warn!("cpu profile window {n}: {e}"),
+                    }
+                    cpu_draining = None;
+                }
+            }
+        }
         let seconds = started.elapsed().as_secs();
         if seconds / heartbeat_period > reported {
             reported = seconds / heartbeat_period;

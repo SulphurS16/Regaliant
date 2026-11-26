@@ -117,6 +117,29 @@ mod linux {
     }
     pub fn stop() { STOP.store(ticks(), Release); STATE.store(2, Release); }
     pub fn pending() -> bool { STATE.load(Acquire) != 0 }
+    /// Whether gpu-gfx is being profiled now (its waits are tallied by reason, `note_wait`).
+    #[inline]
+    pub fn active() -> bool { STATE.load(Acquire) == 1 && GFX.with(|gfx| *gfx) }
+    static WAITS: parking_lot::Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> = parking_lot::Mutex::new(None);
+    /// A gpu-gfx wait of `ns` while profiling, by its reason (`timeline::Wait::end`'s name up
+    /// to its first parenthesis).
+    pub fn note_wait(name: &str, ns: u64) {
+        let mut key = name.split(" (").next().unwrap_or(name).split(" #").next().unwrap_or(name).to_string();
+        // Own-batch waits by their flush reason (`Exec::flush`).
+        if let Some(r) = name.split("reason ").nth(1) { key = format!("{key}: {}", r.split(", stages").next().unwrap_or(r)); }
+        // Slot waits by what the slot's batch was still doing (`Exec` batch slots).
+        if let Some(r) = name.split("initial ").nth(1) { key = format!("{key}: {}", r.split(',').next().unwrap_or(r)); }
+        let mut m = WAITS.lock();
+        let e = m.get_or_insert_with(Default::default).entry(key).or_default();
+        e.0 += 1;
+        e.1 += ns;
+    }
+    /// The waits noted since the last call, longest first, per flip.
+    pub fn take_waits(flips: u64) -> String {
+        let mut v: Vec<_> = WAITS.lock().take().unwrap_or_default().into_iter().collect();
+        v.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        v.iter().map(|(k, (n, ns))| format!("{:8.3} ms/flip {:8.1} calls/flip  {k}\n", *ns as f64 / 1e6 / flips.max(1) as f64, *n as f64 / flips.max(1) as f64)).collect()
+    }
     pub fn write(label: &str, flips: u64) -> Result<(), String> {
         let t = RESULT.lock().take().ok_or("no gpu-gfx CPU self profile")?;
         let hz = crate::hle::kernel::time::tsc_hz() as f64;
@@ -206,3 +229,8 @@ pub struct Scope;
 #[cfg(not(target_os = "linux"))]
 #[inline]
 pub fn scope(_: Part) -> Scope { Scope }
+#[cfg(not(target_os = "linux"))]
+#[inline]
+pub fn active() -> bool { false }
+#[cfg(not(target_os = "linux"))]
+pub fn note_wait(_: &str, _: u64) {}

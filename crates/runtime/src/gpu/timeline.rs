@@ -148,6 +148,13 @@ impl Wait {
     pub fn end(self, track: &str, name: impl FnOnce() -> String) -> std::time::Duration {
         let d = self.t0.elapsed();
         WAITED.with(|w| w.set(w.get() + d.as_nanos() as u64));
+        if super::cpu_profile::active() {
+            // (Profiling only: the name is built once for both uses.)
+            let n = name();
+            super::cpu_profile::note_wait(&n, d.as_nanos() as u64);
+            end(track, self.tl, || n);
+            return d;
+        }
         end(track, self.tl, name);
         d
     }
