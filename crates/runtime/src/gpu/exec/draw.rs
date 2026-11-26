@@ -1843,15 +1843,16 @@ impl Exec {
         let ps_now = ((cp.reg(Space::Sh, 0x08) as u64) | ((cp.reg(Space::Sh, 0x09) as u64 & 0xFF) << 32)) << 8;
         // Real upscaling's stage B (`gpu::upcomp`): the title's composite drawn again at the
         // upscaler's size after its own draw, and the output pass reading that.
+        let stage_b = (ps_now == super::super::upcomp::SCENE_COMPOSITE_PS || ps_now == super::super::uiscale::COMPOSITE_PS) && super::super::upcomp::size_for(crate::dispmode::render_size()).is_some();
+        if stage_b && self.deferred {
+            // (A worker stops here: the command processor records the composite and the output
+            // pass after the chunks before them, so the handovers follow program order.)
+            self.stop("the composite or output pass of an upscaled frame");
+            return "stopped (parallel run)".into();
+        }
         if ps_now == super::super::upcomp::SCENE_COMPOSITE_PS {
-            self.up_comp = true;
+            self.up_plan = super::super::upcomp::take_plan();
         } else if ps_now == super::super::uiscale::COMPOSITE_PS {
-            if self.deferred && super::super::upcomp::size_for(crate::dispmode::render_size()).is_some() {
-                // (A worker stops here: the command processor records the output pass after
-                // the chunk that holds the composite, so the handover follows program order.)
-                self.stop("the output pass of an upscaled frame");
-                return "stopped (parallel run)".into();
-            }
             // (A composite handed over while stage B still runs: one left from before it stopped,
             // the player back on the TAA, is dropped.)
             if let Some(d) = super::super::upcomp::take_done().filter(|_| super::super::upcomp::size_for(crate::dispmode::render_size()).is_some()) {
@@ -1868,7 +1869,7 @@ impl Exec {
         set_snap_verts(None);
         self.ui_sub = None;
         self.ui_job = None;
-        self.up_comp = false;
+        self.up_plan = None;
         self.out_sub = None;
         self.up_consts = None;
         if let Some(t) = t_prog {
@@ -1957,17 +1958,20 @@ impl Exec {
     /// tiles enlarged to match (nearest: its pixel stage reads them at its position / 16). True when
     /// recorded: the descriptors and dynamic state bound are then ours.
     #[allow(clippy::too_many_arguments)]
-    fn composite_up(&mut self, bounds: &mut [super::Bound], layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, push: bool, colors: &[Option<Target>; MAX_RT], depth: &Option<Target>, a: &DrawArgs, base_vertex: i32, ps: Option<&Prepared>, vp: vk::Viewport, sc: (i32, i32, i32, i32)) -> bool {
+    fn composite_up(&mut self, plan: super::super::upcomp::Plan, bounds: &mut [super::Bound], layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, push: bool, colors: &[Option<Target>; MAX_RT], depth: &Option<Target>, a: &DrawArgs, base_vertex: i32, ps: Option<&Prepared>, vp: vk::Viewport, sc: (i32, i32, i32, i32)) -> bool {
         use super::super::upcomp;
         let (Some(t0), Some(ps)) = (colors[0], ps) else { return false };
         let r = (t0.width, t0.height);
-        let Some(o) = upcomp::wanted(r) else { return false };
+        // (This frame's TAA replacement ran at this size and stage B still holds.)
+        if plan.r != r || upcomp::wanted(r) != Some(plan.o) {
+            return false;
+        }
+        let o = plan.o;
         if depth.is_some() || colors[1..].iter().any(Option::is_some) || a.index.is_some() || bounds.len() < 2 {
             upcomp::fail("the composite draws with other attachments or indices than expected");
             return false;
         }
-        let Some(up_view) = super::super::upmerge::current_view(o.0, o.1) else { return false };
-        let taa_base = upcomp::taa_base();
+        let (up_view, taa_base) = (plan.up_view, plan.taa_base);
         let (tw, th) = (r.0.div_ceil(16), r.1.div_ceil(16));
         let frame = super::super::FRAMES.load(Ordering::Relaxed);
         let (mut taa, mut tile) = (None, None);
@@ -3775,10 +3779,12 @@ impl Exec {
         }
         lap.mark(16);
         // Real upscaling's stage B: the title's composite drawn again at the upscaler's size.
-        let redone = self.up_comp && ps_addr == super::super::upcomp::SCENE_COMPOSITE_PS && {
-            self.up_comp = false;
-            let bv = a.base_vertex.unwrap_or(reg(0x28408) as i32);
-            self.composite_up(&mut bounds, layout, set_layout, push, &colors, &depth, a, bv, ps.as_ref(), vp, (x0, y0, x1, y1))
+        let redone = match self.up_plan.take().filter(|_| ps_addr == super::super::upcomp::SCENE_COMPOSITE_PS) {
+            Some(plan) => {
+                let bv = a.base_vertex.unwrap_or(reg(0x28408) as i32);
+                self.composite_up(plan, &mut bounds, layout, set_layout, push, &colors, &depth, a, bv, ps.as_ref(), vp, (x0, y0, x1, y1))
+            }
+            None => false,
         };
         // Another draw like it can be recorded on the state this one left
         // (`draw_repeat`): GPU-read arguments, indices and arguments in

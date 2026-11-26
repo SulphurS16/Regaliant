@@ -236,7 +236,10 @@ pub static SMALL_VIEWS: AtomicU64 = AtomicU64::new(0);
 pub fn main_view(w: u32, h: u32, frame: u64) -> bool {
     let mut m = MAIN_VIEW.lock();
     let (mw, mh, at) = *m;
-    if (w, h) == (mw, mh) || u64::from(w) * u64::from(h) > u64::from(mw) * u64::from(mh) || frame > at + MAIN_VIEW_HOLD {
+    // (A TAA at the render size in effect is the scene's at once: after the render size shrank,
+    // an Upscaling mode chosen, it was taken for a menu's smaller view for MAIN_VIEW_HOLD flips,
+    // ~3 s of the title's TAA alone.)
+    if (w, h) == (mw, mh) || (w, h) == crate::dispmode::render_size() || u64::from(w) * u64::from(h) > u64::from(mw) * u64::from(mh) || frame > at + MAIN_VIEW_HOLD {
         if (w, h) != (mw, mh) && mw != 0 {
             crate::info!("upscaler: the scene's view is {w}x{h} now (it was {mw}x{mh}, last at flip {at})");
         }

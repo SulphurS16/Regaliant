@@ -12138,8 +12138,9 @@ pub struct Exec {
     /// our image, the size, the scale and the filter (`uiscale::record`).
     pub(super) ui_job: Option<super::uiscale::Job>,
     /// Real upscaling's stage B (`gpu::upcomp`): this draw is the title's composite, to be drawn
-    /// again at the upscaler's size (`Exec::composite_up`).
-    pub(super) up_comp: bool,
+    /// again at the upscaler's size (`Exec::composite_up`) from what this frame's TAA replacement
+    /// left.
+    pub(super) up_plan: Option<super::upcomp::Plan>,
     /// The output pass reads our composite: the view of the title's in the draw's bindings and
     /// ours, and its size constants' sizes (the render size, ours).
     pub(super) out_sub: Option<(vk::ImageView, vk::ImageView)>,
@@ -13949,7 +13950,7 @@ impl Exec {
                 par_worker: false,
                 ui_sub: None,
                 ui_job: None,
-                up_comp: false,
+                up_plan: None,
                 out_sub: None,
                 up_consts: None,
                 run_writes: Vec::new(),
@@ -21071,7 +21072,7 @@ impl Exec {
             // (The TAA's output stays the title's TAA's: the depth of field, bloom and the next
             // frame's TAA read it; the composite drawn again reads ours.)
             super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record_up(cb, src, uw, uh, view, w, h, exposure)));
-            super::upcomp::note_taa_base(to.base);
+            super::upcomp::note_plan(super::upcomp::Plan { taa_base: to.base, r: (w, h), o: (uw, uh), up_view: src });
         } else {
             super::vk::defer::external(cmd, Box::new(move |cb| super::upmerge::record(cb, src, uw, uh, view, w, h, exposure)));
         }

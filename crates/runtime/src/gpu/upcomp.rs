@@ -8,9 +8,15 @@
 //! upscaler's output in the TAA output's place and the depth of field's tiles (read at the pixel's
 //! position / 16) enlarged to match. The output pass then reads that image in the composite's
 //! place, its size constants given for it (`Exec::output_up`). The title's own composite at the
-//! render size is left as it drew it, for whatever else reads it. While this runs, a parallel
-//! worker stops at the output pass, so the command processor records it after the chunk that
-//! holds the composite (`par`): the handover (`note_done`, `take_done`) follows program order.
+//! render size is left as it drew it, for whatever else reads it. Each frame hands over twice, each
+//! taken once: the TAA's replacement to the composite (`note_plan`, `take_plan`: only a frame whose
+//! upscaler ran gets the composite drawn again), the composite to the output pass (`note_done`,
+//! `take_done`). While this runs a parallel worker stops at the composite and at the output pass,
+//! so the command processor records each after the chunks before it (`par`): the handovers follow
+//! program order. (Until the evening's second check the composite took the upscaler's image
+//! whenever one of its size existed: right after the render size shrank the title's TAA ran alone
+//! for ~3 s, its smaller view taken for a menu's, and the composite drawn from an older frame's
+//! image without the TAA's exposure flashed bright and dark, 115-300 frames a session.)
 
 use super::vk::ctx;
 use ash::vk;
@@ -21,15 +27,25 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// layers and bloom into the scene image its output pass (`uiscale::COMPOSITE_PS`) scales.
 pub const SCENE_COMPOSITE_PS: u64 = 0x1008890d00;
 
-/// The TAA output's T# base as the TAA's replacement last saw it (0: none yet).
-static TAA_BASE: AtomicU64 = AtomicU64::new(0);
-
-pub fn note_taa_base(base: u64) {
-    TAA_BASE.store(base, Relaxed);
+/// What this frame's TAA replacement left for its composite: the TAA output's T# base, the render
+/// size, the upscaler's size and its output (the TAA's alpha laid in, `upmerge::record_up`).
+#[derive(Clone, Copy, Debug)]
+pub struct Plan {
+    pub taa_base: u64,
+    pub r: (u32, u32),
+    pub o: (u32, u32),
+    pub up_view: vk::ImageView,
 }
 
-pub fn taa_base() -> u64 {
-    TAA_BASE.load(Relaxed)
+static PLAN: Mutex<Option<Plan>> = Mutex::new(None);
+
+pub fn note_plan(p: Plan) {
+    *PLAN.lock() = Some(p);
+}
+
+/// The plan of the TAA replacement before this composite (taken once).
+pub fn take_plan() -> Option<Plan> {
+    PLAN.lock().take()
 }
 
 /// The upscaler's output size when it is larger than the render size `r` (the screen's), while
