@@ -68,7 +68,7 @@ pub fn title_id() -> String {
     }
     match super::app::param_sfo().get("TITLE_ID") {
         Some(super::app::SfoValue::Str(s)) => s.clone(),
-        _ => "PPSA01341".into(),
+        _ => dsconfig::game::TITLE_ID.into(),
     }
 }
 

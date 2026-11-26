@@ -5,7 +5,7 @@ name = "dsport"
 # here each release needed the profile trained again (~40 minutes); the release version reaches
 # the program through `REGALIANT_VERSION` (build.rs) instead. Never change it with a release.
 version = "0.1.7"
-description = "Regaliant's runtime: Demon's Souls (PS5, PPSA01341) on Windows x86-64, PS5 HLE + native CPU execution (shipped as regaliant.exe)"
+description = "Regaliant's runtime: Demon's Souls (PS5, PPSA01341 and PPSA01342) on Windows x86-64, PS5 HLE + native CPU execution (shipped as regaliant.exe)"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

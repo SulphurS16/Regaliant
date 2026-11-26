@@ -10,7 +10,7 @@
 
 Regaliant is an unofficial PC port of Demon's Souls (PS5) for Windows. It runs the game's own PS5 program from your copy of the game, with no CPU emulation. The PS5's system libraries are reimplemented for Windows, and the game's graphics run on Vulkan.
 
-**You need your own copy of the game.** Regaliant contains no game data, no game code and no keys, and it decrypts nothing. It needs Demon's Souls for PS5 (PPSA01341) at version 01.007.000, with its executable and two libraries decrypted. See the [install guide](docs/install.md).
+**You need your own copy of the game.** Regaliant contains no game data, no game code and no keys, and it decrypts nothing. It needs Demon's Souls for PS5 (PPSA01341 or the US PPSA01342) at version 01.007.000, with its executable and two libraries decrypted. The port was built and tested with the European executable; the launcher reports whether another copy's code matches it. See the [install guide](docs/install.md).
 
 Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, Bluepoint Games, FromSoftware or any other rights holder. Demon's Souls is a trademark of Sony Interactive Entertainment.
 

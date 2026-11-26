@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The launcher now accepts the US release of Demon's Souls for PS5 (PPSA01342) at version
+  01.007.000, alongside PPSA01341 (issue #17). It finds the US application folder, names the
+  release, and imports saves under the game's own title id. The US editions' bonus add-on packages
+  (the pre-order and Digital Deluxe gifts) are recognised. The port was built and tested with the
+  European executable, so the launcher now says when a release has no fingerprint on file instead
+  of calling its code a mismatch; the code patches are applied only where the game's bytes match.
+
 ## 0.1.8
 
 - Fixed the washed-out, too bright picture with ghosting and black blotches at Render Scale

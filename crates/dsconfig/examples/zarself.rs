@@ -6,14 +6,14 @@
 //! folder only; everything it makes is in a new `zarself-<process id>` folder under the given
 //! one, removed at the end (nothing else there is touched; a folder that is, holds or lies in
 //! the game folder is refused).
-//!     cargo run --release -p dsconfig --example zarself -- <PPSA01341-app0 folder> <scratch folder>
+//!     cargo run --release -p dsconfig --example zarself -- <PPSA01341-app0 or PPSA01342-app0 folder> <scratch folder>
 use dsconfig::game;
 use std::path::PathBuf;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let app = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
-    let parent = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 folder> <scratch folder>"));
+    let app = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 or PPSA01342-app0 folder> <scratch folder>"));
+    let parent = PathBuf::from(args.next().expect("usage: zarself <PPSA01341-app0 or PPSA01342-app0 folder> <scratch folder>"));
     std::fs::create_dir_all(&parent).unwrap();
     let (a, p) = (std::fs::canonicalize(&app).unwrap(), std::fs::canonicalize(&parent).unwrap());
     if a.starts_with(&p) || p.starts_with(&a) {
@@ -25,7 +25,8 @@ fn main() {
         eprintln!("refused: {} exists already", scratch.display());
         std::process::exit(2);
     }
-    let dir = scratch.join("PPSA01341-app0");
+    // (The copy's own application-folder name: the US release's is PPSA01342-app0.)
+    let dir = scratch.join(a.file_name().unwrap_or_default());
     std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
     std::fs::create_dir_all(dir.join("sce_module")).unwrap();
     std::fs::copy(app.join("sce_sys").join("param.json"), dir.join("sce_sys").join("param.json")).unwrap();

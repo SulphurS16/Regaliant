@@ -7,7 +7,7 @@
 - Windows 10 or 11, 64-bit.
 - A graphics card with a Vulkan 1.3 driver.
 - A processor with AVX2: Intel from the Haswell generation (2013) on, or AMD Ryzen.
-- Your own copy of Demon's Souls for PS5 (PPSA01341) at version 01.007.000, as a folder that holds sce_sys, the game's data folders and eboot.bin, or as a .zar archive of that folder (see [Save disk space](#save-disk-space-with-a-zar-archive)). The executable eboot.bin and the libraries libc.prx and libSceNpCppWebApi.prx in sce_module must be decrypted (in the folder itself or in its decrypted folder), as plain ELF files or in their SELF containers with the segments decrypted.
+- Your own copy of Demon's Souls for PS5 (PPSA01341, or the US release PPSA01342) at version 01.007.000, as a folder that holds sce_sys, the game's data folders and eboot.bin, or as a .zar archive of that folder (see [Save disk space](#save-disk-space-with-a-zar-archive)). The executable eboot.bin and the libraries libc.prx and libSceNpCppWebApi.prx in sce_module must be decrypted (in the folder itself or in its decrypted folder), as plain ELF files or in their SELF containers with the segments decrypted. Regaliant was built and tested with the European executable; when you choose a folder, the launcher says whether this copy's executable has the code the port knows.
 - Up to 5 GB of disk space for prepared shaders.
 
 See [System requirements](requirements.md) for what was tested.

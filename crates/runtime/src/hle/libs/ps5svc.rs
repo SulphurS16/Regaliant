@@ -212,9 +212,10 @@ fn labels_in_bytes(b: &[u8]) -> Vec<String> {
 }
 
 /// The entitlement label in a package's content ID as a file or folder name has it: the 16
-/// capital letters and digits after `PPSA0134<digit>_00-` (`EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg`
-/// gives `DEMONSSOULSGIFT1`); or a name that is the label alone (`DEMONSSOULSGIFT1.pkg`, a
-/// package renamed).
+/// capital letters and digits after `PPSA0134<digit>_00-` (`EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg`,
+/// the European release, or `UP9000-PPSA01342_00-DEMONSSOULSGIFT1.pkg`, the US release, both give
+/// `DEMONSSOULSGIFT1`); or a name that is the label alone (`DEMONSSOULSGIFT1.pkg`, a package
+/// renamed). The region's digit and the `EP`/`UP` prefix are not part of the label.
 fn addon_label(name: &str) -> Option<String> {
     let label_at = |s: &str| -> Option<String> {
         let label: String = s.chars().take(16).collect();
@@ -583,6 +584,7 @@ mod tests {
         assert_eq!(addon_label("EP9000-PPSA01341_00-DEMONSSOULSGIFT1.pkg").as_deref(), Some("DEMONSSOULSGIFT1"));
         assert_eq!(addon_label("EP9000-PPSA01341_00-DEMONSSOULSGIFT2").as_deref(), Some("DEMONSSOULSGIFT2"));
         assert_eq!(addon_label("UP9000-PPSA01342_00-DEMONSSOULSGIFT1").as_deref(), Some("DEMONSSOULSGIFT1"));
+        assert_eq!(addon_label("UP9000-PPSA01342_00-DEMONSSOULSGIFT2.pkg").as_deref(), Some("DEMONSSOULSGIFT2"));
         assert_eq!(addon_label("common"), None);
         assert_eq!(addon_label("playgo-chunk.dat"), None);
         assert_eq!(addon_label("EP9000-PPSA01341_00-SHORT"), None);
@@ -604,6 +606,9 @@ mod tests {
         let mut header = vec![0u8; 64];
         header.extend_from_slice(b"UP9000-PPSA01342_00-DEMONSSOULSGIFT1\0\0\0EP9000-PPSA01342_00-DEMONSSOULSGIFT1");
         assert_eq!(labels_in_bytes(&header), vec!["DEMONSSOULSGIFT1".to_string()]);
+        // (An unpacked US package's param.json: its own title id and bonus label.)
+        let us = br#"{"contentId":"UP9000-PPSA01342_00-DEMONSSOULSGIFT2","titleId":"PPSA01342"}"#;
+        assert_eq!(labels_in_bytes(us), vec!["DEMONSSOULSGIFT2".to_string()]);
         assert!(labels_in_bytes(b"PPSA01341 PPSA0134").is_empty());
         assert!(labels_in_bytes(b"EP9000-PPSA01341_00-DEMONSSOULSGIF").is_empty());
         assert!(labels_in_bytes(b"").is_empty());

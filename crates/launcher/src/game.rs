@@ -86,7 +86,7 @@ pub fn build(app: &mut App) {
         crate::shaders::log(app, &format!("this PC: {}", pc.replace('\n', " | ")));
     }
     if dir.is_empty() {
-        unsafe { ui::set_text(h(app.game.status), "Choose the game's folder or its .zar archive: the PS5 game Demon's Souls (PPSA01341), version 01.007.000, with its executable decrypted.") };
+        unsafe { ui::set_text(h(app.game.status), "Choose the game's folder or its .zar archive: the PS5 game Demon's Souls (PPSA01341 or PPSA01342), version 01.007.000, with its executable decrypted.") };
         app.game.ok = false;
     } else {
         check(app, Path::new(&dir), false);
@@ -158,11 +158,15 @@ pub fn check(app: &mut App, dir: &Path, keep: bool) {
             let what = if g.source.is_archive() { "Found in the archive" } else { "Found in" };
             let mut t = format!("Demon's Souls {} is ready.\n{what} {}.", g.version, ui::short(&g.app, 90));
             if g.id != dsconfig::game::TITLE_ID {
-                t.push_str(&format!("\nThis is the {} release. The port was tested with {}.", g.id, dsconfig::game::TITLE_ID));
+                match dsconfig::game::release_name(&g.id) {
+                    Some(name) => t.push_str(&format!("\nThis is the {name} release. The port was built and tested with {}.", dsconfig::game::TITLE_ID)),
+                    None => t.push_str(&format!("\nThis is the {} release. The port was tested with {}.", g.id, dsconfig::game::TITLE_ID)),
+                }
             }
-            match dsconfig::game::tested_executable(&g) {
-                Ok(true) => {}
-                Ok(false) => t.push_str("\nIts executable differs from the one this port was tested with. It may not work."),
+            match dsconfig::game::fingerprint(&g) {
+                Ok(dsconfig::game::Fingerprint::Tested) => {}
+                Ok(dsconfig::game::Fingerprint::Unverified) => t.push_str("\nNo executable fingerprint is on file for this release. Regaliant was built and tested with the European copy, so this one's code is unverified."),
+                Ok(dsconfig::game::Fingerprint::Different) => t.push_str("\nIts executable differs from the fingerprint on file for this release. It may not work."),
                 Err(e) => t.push_str(&format!("\nIts executable could not be read ({e}).")),
             }
             app.game.folder = (!g.source.is_archive()).then(|| g.app.clone());
@@ -387,13 +391,13 @@ pub fn command(app: &mut App, id: i32, code: u32) {
     match (id, code) {
         (ID_CHECK, 0) => check_field(app),
         (ID_BROWSE, 0) => {
-            if let Some(p) = ui::pick_folder(app.hwnd, "The Demon's Souls game folder (PPSA01341, 01.007.000)") {
+            if let Some(p) = ui::pick_folder(app.hwnd, "The Demon's Souls game folder (PPSA01341 or PPSA01342, 01.007.000)") {
                 unsafe { ui::set_text(h(app.game.dir), &p.display().to_string()) };
                 check_field(app);
             }
         }
         (ID_ZAR, 0) => {
-            if let Some(p) = ui::pick_file(app.hwnd, "The Demon's Souls game as a .zar archive (PPSA01341, 01.007.000)", ".zar archives", "*.zar", None) {
+            if let Some(p) = ui::pick_file(app.hwnd, "The Demon's Souls game as a .zar archive (PPSA01341 or PPSA01342, 01.007.000)", ".zar archives", "*.zar", None) {
                 unsafe { ui::set_text(h(app.game.dir), &p.display().to_string()) };
                 check_field(app);
             }
