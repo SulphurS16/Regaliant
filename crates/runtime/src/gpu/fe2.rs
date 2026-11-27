@@ -6338,7 +6338,7 @@ fn c4_wanted() -> bool {
 }
 
 /// The host serves C4's held pages: Windows' debugger host. Linux's in-process arming
-/// (`DS_LINUX_ARMING=1`) serves no held pages, so C4 stays off there: its translations
+/// (on unless `DS_LINUX_ARMING=0`) serves no held pages, so C4 stays off there: its translations
 /// (`Spec::marks_held`) stay the ones the pipeline store holds (turned on with arming, every
 /// affected pipeline was made anew in play, 3,412 of them in a 2.5-minute session).
 fn hosted_c4() -> bool {

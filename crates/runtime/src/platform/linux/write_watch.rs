@@ -413,7 +413,7 @@ pub fn check() -> Result<(), String> {
     Ok(())
 }
 
-/// `DS_LINUX_ARMING=1` with `--write-watch-check`: page arming over the check's mapping
+/// With page arming on (the default) and `--write-watch-check`: page arming over the check's mapping
 /// [a, a + pages*4K) (`hosted`): faults posted exactly once per written page, other pages
 /// still armed, writes landing, concurrent writers, kernel copies after `disarm_if_armed`,
 /// and the uffd take still seeing the armed pages' writes.
