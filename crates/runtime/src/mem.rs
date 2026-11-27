@@ -2567,6 +2567,8 @@ fn trace_map(op: &str, start: u64, end: u64, detail: std::fmt::Arguments) {
     }
 }
 
+static COMMIT_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Maps the views of a new mapping (`sections`): the guest view and its
 /// alias. Returns (alias slots, as `Vma::slots`; anonymous-section offset).
 fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> Result<(u8, u64), MemError> {
@@ -2576,6 +2578,8 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
     let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
     mapped_over_gpu_writes(addr, size, which == Sec::Dmem, off);
     let _arm = crate::gpu::resident::remap_guard_for(addr, size);
+    let t0 = std::time::Instant::now();
+    let z0 = sec::zeroed_bytes();
     if let Err(e) = sec::map_new_view(addr, size, which, off, win_prot(prot)) {
         crate::warn!("mem: {e}");
         if which == Sec::Anon {
@@ -2583,6 +2587,8 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
         }
         return Err(MemError::HostFailure(0));
     }
+    let t1 = std::time::Instant::now();
+    let view_phases = sec::VIEW_PHASES.with(|p| p.get());
     let slots = match sec::map_alias(addr, size, which, off) {
         Ok(s) => 1u8 << s,
         Err(e) => {
@@ -2590,7 +2596,13 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
             0
         }
     };
+    let t2 = std::time::Instant::now();
     crate::gpu::resident::settled(addr, size);
+    let total = t0.elapsed();
+    if total.as_micros() >= 5_000 && COMMIT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+        let [iso, map, zero, protect] = view_phases;
+        crate::info!("section commit {addr:#x}+{size:#x}: {} us under the mapping guard (view {} us: isolate {iso}, map {map}, zero {zero} for {} bytes, protect {protect}; alias {} us; settling {} us)", total.as_micros(), (t1 - t0).as_micros(), sec::zeroed_bytes() - z0, (t2 - t1).as_micros(), t2.elapsed().as_micros());
+    }
     Ok((slots, if which == Sec::Anon { off } else { 0 }))
 }
 

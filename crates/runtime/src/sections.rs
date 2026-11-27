@@ -110,6 +110,16 @@ fn rs_take(m: &mut BTreeMap<u64, u64>, a: u64, e: u64) -> Vec<(u64, u64)> {
 /// allocated again).
 static ZEROED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes zeroed through fresh views so far (both sections).
+pub fn zeroed_bytes() -> u64 {
+    ZEROED[0].load(Ordering::Relaxed) + ZEROED[1].load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// This thread's last `map_view_with`: us isolating, mapping, zeroing, protecting.
+    pub static VIEW_PHASES: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
 /// Direct memory [start, start+len) was allocated: what of it was mapped
 /// before is zeroed at its next mapping, as private pages were before
 /// sections (a mapping over the same pages without a new allocation keeps
@@ -406,7 +416,9 @@ fn stale_for(sec: Sec, off: u64, n: u64) -> Vec<(u64, u64)> {
 
 fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) -> Result<(), String> {
     let h = handle(sec).ok_or("sections not set up")?;
+    let t = std::time::Instant::now();
     isolate(va, n)?;
+    let t_iso = t.elapsed().as_micros() as u64;
     // Linux: one mmap at the view's own protection. Each mmap or mprotect waits for the
     // process's mm lock, which the write watch's scans (some 370,000 a second) keep
     // read-held: a writer gets it only once the kernel hands it over, ~4 ms. The
@@ -418,7 +430,9 @@ fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) ->
         let stale = if fresh { stale_for(sec, off, n) } else { Vec::new() };
         // (Writable while stale bytes are zeroed through it.)
         let first = if stale.is_empty() { prot } else { PAGE_EXECUTE_READWRITE };
+        let t = std::time::Instant::now();
         let v = MapViewOfFile3(h, GetCurrentProcess(), va as _, off, n as usize, MEM_REPLACE_PLACEHOLDER, first, std::ptr::null_mut(), 0);
+        let t_map = t.elapsed().as_micros() as u64;
         if v.Value.is_null() {
             // (Still to be zeroed at the next map.)
             if let Some(st) = STATE.lock().as_mut() {
@@ -428,14 +442,18 @@ fn map_view_with(va: u64, n: u64, sec: Sec, off: u64, prot: u32, fresh: bool) ->
             }
             return err(&format!("mapping a view at {va:#x}+{n:#x} (offset {off:#x})"));
         }
+        let t = std::time::Instant::now();
         for (a, e) in stale {
             std::ptr::write_bytes((va + (a - off)) as *mut u8, 0, (e - a) as usize);
             ZEROED[(sec == Sec::Anon) as usize].fetch_add(e - a, Ordering::Relaxed);
         }
+        let t_zero = t.elapsed().as_micros() as u64;
+        let t = std::time::Instant::now();
         let mut old = 0u32;
         if first != prot && VirtualProtect(va as _, n as usize, prot, &mut old) == 0 {
             return err(&format!("protecting the view at {va:#x}"));
         }
+        VIEW_PHASES.with(|p| p.set([t_iso, t_map, t_zero, t.elapsed().as_micros() as u64]));
         return Ok(());
     }
     #[cfg(windows)]

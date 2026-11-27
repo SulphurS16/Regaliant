@@ -243,9 +243,10 @@ fn take_unlocked(base: u64, size: u64, out: &mut Vec<u64>) -> Option<()> {
     }
     let sampled = play_telemetry() && SAMPLE.with(|n| { let x = n.get().wrapping_add(1); n.set(x); x % 64 == 0 });
     let before = sampled.then(crate::gpu::record_opts::Timer::start);
-    // Shared: remaps (`remapped`, under the exclusive mapping guard) cannot run until the
-    // scans below are done, so the parts planned stay registered and mapped.
-    let _mapping = crate::gpu::resident::arm_guard();
+    // Remaps of this range (`remapped`, under the exclusive mapping guard) cannot run until
+    // the scans below are done, so the parts planned stay registered and mapped; remaps of
+    // other ranges go on (`ranged_guard`: they change no region or page of this one).
+    let _mapping = crate::gpu::resident::ranged_guard(lo, hi);
     let mapping_ns = before.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
     let t = crate::gpu::record_opts::Timer::start();
     let watch = WATCH.get()?.as_ref()?;
@@ -516,6 +517,54 @@ fn arming_check(a: u64, pages: u64) -> Result<(), String> {
             return Err("arming: no fault was answered during a remap outside its range".into());
         }
         println!("arming check: remaps beside armed writes: {outside} faults answered during remaps outside their range");
+    }
+    // 5. Ranged readers (`ranged_guard`, the takes' guard): a remap of another range goes
+    // on while one is held; a remap of its range waits for it; a reader of a range being
+    // remapped waits for the remap.
+    if pages >= 512 && crate::gpu::resident::RANGED_TAKES.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::sync::atomic::{AtomicBool, Ordering::*};
+        use std::time::{Duration, Instant};
+        let half = 256*PAGE;
+        let g = crate::gpu::resident::ranged_guard(a, a + half);
+        let t = Instant::now();
+        drop(crate::gpu::resident::remap_guard_for(a + half, half));
+        if t.elapsed() > Duration::from_millis(20) { return Err("ranged: a remap of another range waited for a reader".into()); }
+        let done = AtomicBool::new(false);
+        let early = std::thread::scope(|sc| {
+            let done = &done;
+            sc.spawn(move || { drop(crate::gpu::resident::remap_guard_for(a + PAGE, PAGE)); done.store(true, Release); });
+            std::thread::sleep(Duration::from_millis(30));
+            let early = done.load(Acquire);
+            drop(g);
+            early
+        });
+        if early { return Err("ranged: a remap of a reader's range went on during it".into()); }
+        let done = AtomicBool::new(false);
+        let early = std::thread::scope(|sc| {
+            let r = crate::gpu::resident::remap_guard_for(a, PAGE);
+            let done = &done;
+            sc.spawn(move || { drop(crate::gpu::resident::ranged_guard(a, a + 2*PAGE)); done.store(true, Release); });
+            sc.spawn(move || { drop(crate::gpu::resident::ranged_guard(a + half, a + half + PAGE)); });
+            std::thread::sleep(Duration::from_millis(30));
+            let early = done.load(Acquire);
+            drop(r);
+            early
+        });
+        if early { return Err("ranged: a reader of a range being remapped went on during it".into()); }
+        // Many readers and remaps at once, disjoint and not: no deadlock, every one ends.
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for k in 0..6u64 { sc.spawn(move || for i in 0..20000u64 {
+                let p = a + ((i * 7 + k * 31) % 512) * PAGE;
+                let _g = crate::gpu::resident::ranged_guard(p, p + 3*PAGE);
+            }); }
+            for k in 0..2u64 { sc.spawn(move || for i in 0..2000u64 {
+                let p = a + ((i * 13 + k * 101) % 500) * PAGE;
+                let _r = crate::gpu::resident::remap_guard_for(p, 8*PAGE);
+            }); }
+        });
+        let [waited, straight] = crate::gpu::resident::RANGED_STATS.each_ref().map(|x| x.load(Relaxed));
+        println!("ranged check passed: {straight} readers straight through, {waited} waited for their range's remap; stress {:.0} ms", t.elapsed().as_secs_f64()*1e3);
     }
     // 4b. Cost: arm all, one write per page, timed.
     crate::hosted::disarm(a, size);

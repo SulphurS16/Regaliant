@@ -429,6 +429,8 @@ pub fn init_linux_faults() {
     LINUX_FAULT_TIMING.store(std::env::var("DS_LINUX_FAULT_TIMING").ok().as_deref() == Some("1"), Ordering::Release);
     LINUX_DIRECT.store(on, Ordering::Release);
     REMAP_RANGE_GATE.store(std::env::var("DS_REMAP_RANGE_GATE").ok().as_deref() != Some("0"), Ordering::Release);
+    RANGED_TAKES.store(std::env::var("DS_RANGED_TAKES").ok().as_deref() != Some("0"), Ordering::Release);
+    crate::info!("Linux write-watch takes during mapping changes: {}", if RANGED_TAKES.load(Ordering::Relaxed) { "wait only for a change of their own range" } else { "wait for every change (DS_RANGED_TAKES=0)" });
     crate::info!("Linux signal readers during remaps: {}", if REMAP_RANGE_GATE.load(Ordering::Relaxed) { "admitted outside the remap's range" } else { "all wait (DS_REMAP_RANGE_GATE=0)" });
     crate::info!("Linux resident direct write-fault recovery: {on} (section tracking only)");
     crate::info!("Linux resident volatile backoff: {backoff} (false: exact dirty tracking; true: legacy 32..1024-frame cooldown)");
@@ -909,7 +911,7 @@ fn arm_with(base: u64, len: u64, extra: u8) -> u64 {
     #[cfg(windows)]
     let _arming = ARM_LOCK.read();
     #[cfg(target_os = "linux")]
-    let _arming = ARM_LOCK.read_recursive();
+    let _arming = arm_read(true);
     // Write tracking through the host (`via_host`): no other arm or disarm
     // between a page's host bit and protection being looked at and its
     // marks (`hosted::arm_lock`; the host itself only makes pages
@@ -1136,6 +1138,7 @@ impl Drop for RemapGuard {
     fn drop(&mut self) {
         // (Readers of pages outside the range may still be in: only the writer bit goes.)
         LINUX_REMAP.fetch_and(!LINUX_WRITER, Ordering::AcqRel);
+        REMAP_WORD.store(0, Ordering::SeqCst);
         // Every take and check waits while this is held (`arm_guard`): a long hold is a
         // hitch on all of them at once (2026-11-26: four gfx workers' one-page checks
         // at 107-108 ms together, after mapping changes).
@@ -1185,6 +1188,19 @@ fn remap_guard_at(lo: u64, hi: u64, at: &'static std::panic::Location<'static>) 
     // later remap's, `signal_admit_page`.)
     REMAP_LO.store(lo, Ordering::Release);
     REMAP_HI.store(hi, Ordering::Release);
+    // Ranged readers (`ranged_guard`): the range is published, then their slots read
+    // (SeqCst both sides: a reader registered before this store is seen here, one after
+    // sees the range and waits).
+    let word = REMAP_ACTIVE | pack_range(lo, hi);
+    REMAP_WORD.store(word, Ordering::SeqCst);
+    let slots = RANGED_NEXT.load(Ordering::SeqCst).min(RANGED_SLOTS as u32) as usize;
+    for slot in &RANGED[..slots] {
+        let mut spins = 0u32;
+        while overlaps(slot.load(Ordering::SeqCst), word) {
+            spins += 1;
+            if spins > 64 { std::thread::yield_now(); } else { std::hint::spin_loop(); }
+        }
+    }
     // Only one writer holds ARM_LOCK. Stop admitting signal readers, then wait for the
     // at most one syscall each already admitted reader performs.
     LINUX_REMAP.fetch_or(LINUX_WRITER, Ordering::AcqRel);
@@ -1223,7 +1239,7 @@ pub fn fault_may_wait(addr: u64) -> bool {
 
 pub fn on_fault(addr: u64, write: bool) -> bool {
     #[cfg(target_os = "linux")]
-    let _remap = LINUX_DIRECT.load(Ordering::Acquire).then(|| ARM_LOCK.read());
+    let _remap = LINUX_DIRECT.load(Ordering::Acquire).then(|| arm_read(false));
     use crate::platform::os::Win32::System::Memory::PAGE_READWRITE;
     if !tracking() {
         return false;
@@ -1741,8 +1757,126 @@ pub fn make_for_fe2() -> Result<String, String> {
 }
 
 /// Shared while pages are armed: mapping changes exclude it (`remap_guard`).
+#[track_caller]
 pub fn arm_guard() -> parking_lot::RwLockReadGuard<'static, ()> {
-    ARM_LOCK.read_recursive()
+    arm_read(true)
+}
+
+/// Readers' waits behind mapping changes: [count over 1 ms, total us, longest us].
+pub static ARM_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static ARM_WAIT_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// `ARM_LOCK` shared (`recursive`: even while a writer waits), its wait counted and the
+/// long ones logged with their caller.
+#[track_caller]
+fn arm_read(recursive: bool) -> parking_lot::RwLockReadGuard<'static, ()> {
+    let fast = if recursive { ARM_LOCK.try_read_recursive() } else { ARM_LOCK.try_read() };
+    if let Some(g) = fast {
+        return g;
+    }
+    let at = std::panic::Location::caller();
+    let t = std::time::Instant::now();
+    let g = if recursive { ARM_LOCK.read_recursive() } else { ARM_LOCK.read() };
+    let us = t.elapsed().as_micros() as u64;
+    if us >= 1_000 {
+        ARM_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        ARM_WAITS[1].fetch_add(us, Ordering::Relaxed);
+        ARM_WAITS[2].fetch_max(us, Ordering::Relaxed);
+        if us >= 3_000 && ARM_WAIT_LOGGED.fetch_add(1, Ordering::Relaxed) < 400 {
+            crate::info!("waited {us} us behind a mapping change at {}:{} ({})", at.file().rsplit('/').next().unwrap_or(""), at.line(), std::thread::current().name().unwrap_or("?"));
+        }
+    }
+    g
+}
+
+/// A reader of guest mappings over [lo, hi) alone (Linux): it waits only for a mapping
+/// change of an overlapping range, and such a change waits only for readers like it
+/// (`remap_guard_at`). Each thread registers its range in its own slot, then reads the
+/// change in progress; a change publishes its range, then reads the slots. Not nested
+/// within itself, nor taken by a thread holding `remap_guard`; a thread past the slots,
+/// or `DS_RANGED_TAKES=0`, takes `arm_guard`.
+#[cfg(target_os = "linux")]
+pub enum RangedGuard {
+    Slot(&'static AtomicU64),
+    Whole(parking_lot::RwLockReadGuard<'static, ()>),
+}
+#[cfg(target_os = "linux")]
+impl Drop for RangedGuard {
+    fn drop(&mut self) {
+        if let RangedGuard::Slot(s) = self {
+            s.store(0, Ordering::SeqCst);
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+const RANGED_SLOTS: usize = 1024;
+#[cfg(target_os = "linux")]
+static RANGED: [AtomicU64; RANGED_SLOTS] = [const { AtomicU64::new(0) }; RANGED_SLOTS];
+#[cfg(target_os = "linux")]
+static RANGED_NEXT: AtomicU32 = AtomicU32::new(0);
+/// The mapping change in progress: `REMAP_ACTIVE` | its packed range (`pack_range`); 0: none.
+#[cfg(target_os = "linux")]
+static REMAP_WORD: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+const REMAP_ACTIVE: u64 = 1 << 63;
+/// `DS_RANGED_TAKES=0`: takes wait for every mapping change (`arm_guard`), as before.
+#[cfg(target_os = "linux")]
+pub static RANGED_TAKES: AtomicBool = AtomicBool::new(true);
+/// Ranged readers that met a change of their own range and waited for it; that did not.
+#[cfg(target_os = "linux")]
+pub static RANGED_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [lo, hi) as first page << 32 | end page (31 bits each; an end past them: unbounded).
+#[cfg(target_os = "linux")]
+fn pack_range(lo: u64, hi: u64) -> u64 {
+    const M: u64 = 0x7fff_ffff;
+    let a = (lo / PAGE).min(M - 1);
+    let e = hi.div_ceil(PAGE).clamp(a + 1, M);
+    a << 32 | e
+}
+
+/// Whether packed slot `slot` (0: free) overlaps change word `word` (0: none).
+#[cfg(target_os = "linux")]
+fn overlaps(slot: u64, word: u64) -> bool {
+    if slot == 0 || word & REMAP_ACTIVE == 0 {
+        return false;
+    }
+    let end = |x: u64| if x & 0x7fff_ffff == 0x7fff_ffff { u64::MAX } else { x & 0x7fff_ffff };
+    let (sa, se) = ((slot >> 32) & 0x7fff_ffff, end(slot));
+    let (wa, we) = ((word >> 32) & 0x7fff_ffff, end(word));
+    sa < we && wa < se
+}
+
+#[cfg(target_os = "linux")]
+#[track_caller]
+pub fn ranged_guard(lo: u64, hi: u64) -> RangedGuard {
+    thread_local! {
+        static SLOT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    }
+    if !RANGED_TAKES.load(Ordering::Relaxed) {
+        return RangedGuard::Whole(arm_guard());
+    }
+    let mut i = SLOT.with(|s| s.get());
+    if i == u32::MAX {
+        i = RANGED_NEXT.fetch_add(1, Ordering::SeqCst);
+        SLOT.with(|s| s.set(i));
+    }
+    let Some(slot) = RANGED.get(i as usize) else {
+        return RangedGuard::Whole(arm_guard());
+    };
+    let mine = pack_range(lo, hi);
+    let mut waited = false;
+    loop {
+        slot.store(mine, Ordering::SeqCst);
+        if !overlaps(mine, REMAP_WORD.load(Ordering::SeqCst)) {
+            RANGED_STATS[waited as usize ^ 1].fetch_add(1, Ordering::Relaxed);
+            return RangedGuard::Slot(slot);
+        }
+        // (A change of this range: out of its way, then wait for it to end.)
+        slot.store(0, Ordering::SeqCst);
+        waited = true;
+        drop(arm_read(true));
+    }
 }
 
 /// `arm_guard` within `d`, else None.
@@ -3558,7 +3692,7 @@ pub fn apply_masks_copy(out: *const u32, cap: u32) -> u32 {
     // holds the first across mapping changes, which take the others).
     let st = crate::mem::MEM.lock();
     let _readers = crate::mem::GUEST_READERS.read();
-    let _arming = ARM_LOCK.read();
+    let _arming = arm_read(false);
     for &(ra, rk) in &runs {
         let a = MIRROR_BASE + order[ra].0 as u64 * PAGE;
         let e = a + rk as u64 * PAGE;
@@ -3740,7 +3874,7 @@ pub fn own_begin(ranges: &[(u64, u64)]) -> Option<std::sync::Arc<Owned>> {
     if !mirror_mode() || !lazy_writebacks() || ranges.is_empty() {
         return None;
     }
-    let _arming = ARM_LOCK.read();
+    let _arming = arm_read(false);
     let mut runs: Vec<(u64, u64)> = Vec::new();
     for &(a, e) in ranges {
         let (lo, hi) = ((a & !(PAGE - 1)).max(MIRROR_BASE), e.next_multiple_of(PAGE).min(MIRROR_END));
@@ -3874,7 +4008,7 @@ fn settle(page: u64, fault: bool) -> bool {
     }
     // Owned but not written by GPU work: its protection back (after a
     // protection change in progress: `own_begin` holds the page busy).
-    let _arming = ARM_LOCK.read();
+    let _arming = arm_read(false);
     busy_range(page, page + PAGE);
     if !is_gprot(c, i) {
         unbusy_range(page, page + PAGE);
@@ -3918,7 +4052,7 @@ pub fn apply_masks(out: *const u32, cap: u32) -> u32 {
     // The batch whose completion this is (its masks of pages remapped since
     // it was submitted belong to the old mapping).
     let seq = super::cp::after_batch();
-    let _arming = ARM_LOCK.read();
+    let _arming = arm_read(false);
     let mut g = DIRTY.lock();
     let map = g.get_or_insert_with(Default::default);
     // Pages newly dirty, in runs, protected after their marks are noted
@@ -4229,7 +4363,7 @@ fn release_dirty(page: u64, fault: bool) -> bool {
         crate::error!("resident: reading back {a:#x}..{e:#x}: {err}");
         return false;
     }
-    let _arming = ARM_LOCK.read();
+    let _arming = arm_read(false);
     busy_range(a, e);
     let mut dg = DIRTY.lock();
     let map = dg.get_or_insert_with(Default::default);
