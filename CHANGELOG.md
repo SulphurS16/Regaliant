@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.9
 
 - The launcher checks for a new version of Regaliant at every start. When one is out, Update
   downloads it, checks that it is a genuine Regaliant release and restarts the launcher. Nothing
