@@ -377,8 +377,9 @@ pub fn linux_fault(addr: u64, write: bool, rip: u64) -> bool {
     if !on() || !in_range(addr) || !is_armed(addr & !(PAGE - 1)) {
         return false;
     }
-    if !crate::gpu::resident::signal_admit() {
+    if !crate::gpu::resident::signal_admit_page(addr & !(PAGE - 1)) {
         STATS[F_REFUSED].fetch_add(1, Ordering::Relaxed);
+        REFUSED_AT.with(|t| t.set(now_ns()));
         return false;
     }
     let ok = answer(addr, write, rip);
@@ -387,6 +388,30 @@ pub fn linux_fault(addr: u64, write: bool, rip: u64) -> bool {
         STATS[F_SIGNAL].fetch_add(1, Ordering::Relaxed);
     }
     ok
+}
+
+thread_local! {
+    /// When this thread's last fault was refused during a remap (0: none waiting).
+    static REFUSED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Refused faults' wait for the service: [count, total ns, longest ns].
+pub static REFUSED_WAIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::syscall(libc::SYS_clock_gettime, libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The signal handler is done with a fault (async-signal-safe): a refused one's wait counted.
+pub fn refused_done() {
+    let at = REFUSED_AT.with(|t| t.replace(0));
+    if at != 0 {
+        let ns = now_ns().saturating_sub(at);
+        REFUSED_WAIT[0].fetch_add(1, Ordering::Relaxed);
+        REFUSED_WAIT[1].fetch_add(ns, Ordering::Relaxed);
+        REFUSED_WAIT[2].fetch_max(ns, Ordering::Relaxed);
+    }
 }
 
 /// The fault service thread's arming path (outside signal context; may wait for a remap).
@@ -463,7 +488,9 @@ pub fn status() -> String {
     }
     let s = |i: usize| STATS[i].load(Ordering::Relaxed);
     format!(
-        "Linux page arming: {} armed pages now; {} arms, {} disarms, {} failures; faults answered {} in the handler, {} by the service ({} refused during remaps); {} ring overflows",
-        s(S_ARMED_PAGES), s(S_ARMS), s(S_DISARMS), s(S_FAILED), s(F_SIGNAL), s(F_SERVICE), s(F_REFUSED), s(S_OVERFLOW)
+        "Linux page arming: {} armed pages now; {} arms, {} disarms, {} failures; faults answered {} in the handler, {} by the service ({} refused during remaps, waiting {:.1} ms in all, {:.2} ms at most; {} let through during remaps, outside their range); {} ring overflows",
+        s(S_ARMED_PAGES), s(S_ARMS), s(S_DISARMS), s(S_FAILED), s(F_SIGNAL), s(F_SERVICE), s(F_REFUSED),
+        REFUSED_WAIT[1].load(Ordering::Relaxed) as f64 / 1e6, REFUSED_WAIT[2].load(Ordering::Relaxed) as f64 / 1e6,
+        crate::gpu::resident::REMAP_OUTSIDE.load(Ordering::Relaxed), s(S_OVERFLOW)
     )
 }

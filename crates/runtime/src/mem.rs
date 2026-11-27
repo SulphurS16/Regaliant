@@ -1351,7 +1351,7 @@ fn mixed_views_make(addr: u64, size: u64, phys: u64, prot: u32) -> u64 {
         }
         let off = phys + (w - addr);
         mapped_over_gpu_writes(w, win, true, off);
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(w, win);
         match sec::map_new_view(w, win, Sec::Dmem, off, win_prot(prot)) {
             Ok(()) => match sec::map_alias(w, win, Sec::Dmem, off) {
                 Ok(slot) => {
@@ -1380,7 +1380,7 @@ fn mixed_view_release(w: u64) {
     let win = mixed_window();
     {
         let _readers_out = GUEST_READERS.write();
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(w, win);
         if let Err(e) = crate::sections::unmap_view(w) {
             crate::warn!("mem: {e}");
         }
@@ -1409,7 +1409,7 @@ fn mixed_view_privatize(w: u64, prot: u32) {
     let mut copy = vec![0u8; win as usize];
     {
         let _readers_out = GUEST_READERS.write();
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(w, win);
         // (Readable first: the guest's protection may forbid our reads.)
         let mut old = 0u32;
         unsafe {
@@ -1427,7 +1427,7 @@ fn mixed_view_privatize(w: u64, prot: u32) {
     }
     let ok = mixed_make(w, w + win).is_ok() && {
         let _readers_out = GUEST_READERS.write();
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(w, win);
         let p = unsafe { VirtualAlloc(w as _, win as usize, MEM_COMMIT, PAGE_READWRITE) };
         if !p.is_null() {
             let mut old = 0u32;
@@ -2055,7 +2055,7 @@ fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     // protection.)
     crate::gpu::fe2::c4_release_sync(addr, size, false);
     let t = std::time::Instant::now();
-    let _arm = crate::gpu::resident::remap_guard();
+    let _arm = crate::gpu::resident::remap_guard_for(addr, size);
     note_since(Mirror, t, || format!("a commit of {addr:#x}+{size:#x} waiting for armings"));
     // Pages armed through the host read-write first: whether committing
     // already committed pages resets their protection is not ours to rely
@@ -2151,7 +2151,7 @@ pub fn retry_deferred() {
             continue;
         }
         let _readers_out = GUEST_READERS.write();
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(a, e - a);
         for (a, e) in host_pieces(a, e) {
             unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
         }
@@ -2424,7 +2424,7 @@ fn host_decommit(addr: u64, size: u64) {
             continue;
         }
         let _readers_out = GUEST_READERS.write();
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(addr, size);
         for (a, e) in host_pieces(addr, addr + size) {
             unsafe { VirtualFree(a as _, (e - a) as usize, MEM_DECOMMIT) };
         }
@@ -2447,7 +2447,7 @@ pub fn host_protect(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
     crate::gpu::track::remapped(addr, size, crate::gpu::track::REMAP_PROTECT);
     let mut old = 0u32;
     let _readers_out = GUEST_READERS.write();
-    let _arm = crate::gpu::resident::remap_guard();
+    let _arm = crate::gpu::resident::remap_guard_for(addr, size);
     let (mut ok, mut done) = (1, addr);
     for (a, e) in host_pieces(addr, addr + size) {
         ok = unsafe { VirtualProtect(a as _, (e - a) as usize, win_prot(prot), &mut old) };
@@ -2575,7 +2575,7 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
     repaged(addr, size);
     let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
     mapped_over_gpu_writes(addr, size, which == Sec::Dmem, off);
-    let _arm = crate::gpu::resident::remap_guard();
+    let _arm = crate::gpu::resident::remap_guard_for(addr, size);
     if let Err(e) = sec::map_new_view(addr, size, which, off, win_prot(prot)) {
         crate::warn!("mem: {e}");
         if which == Sec::Anon {
@@ -2601,7 +2601,7 @@ fn section_release(v: &Vma) {
     repaged(v.start, v.size);
     {
         let _readers_out = GUEST_READERS.write();
-        let _arm = crate::gpu::resident::remap_guard();
+        let _arm = crate::gpu::resident::remap_guard_for(v.start, v.size);
         if let Err(e) = crate::sections::unmap_view(v.start) {
             crate::warn!("mem: {e}");
         }
@@ -2742,7 +2742,7 @@ fn section_split(v: &Vma, at: u64, why: usize) {
     let (which, off) = if v.kind == VmaKind::Direct { (Sec::Dmem, v.phys) } else { (Sec::Anon, v.off) };
     crate::gpu::track::remapped(v.start, v.size, crate::gpu::track::REMAP_PROTECT);
     let _readers_out = GUEST_READERS.write();
-    let _arm = crate::gpu::resident::remap_guard();
+    let _arm = crate::gpu::resident::remap_guard_for(v.start, v.size);
     sec::split_begin(v.start, v.end(), why);
     let lo = at - v.start;
     let r = sec::unmap_view(v.start)

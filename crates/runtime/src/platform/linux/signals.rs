@@ -125,6 +125,7 @@ unsafe extern "C" fn handler(signal: i32, info: *mut libc::siginfo_t, context: *
                 )
             }
         {
+            crate::hosted::refused_done();
             unsafe {
                 *errno = saved_errno;
             }

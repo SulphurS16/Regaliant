@@ -428,6 +428,8 @@ pub fn init_linux_faults() {
     LINUX_VOLATILE_BACKOFF.store(backoff, Ordering::Release);
     LINUX_FAULT_TIMING.store(std::env::var("DS_LINUX_FAULT_TIMING").ok().as_deref() == Some("1"), Ordering::Release);
     LINUX_DIRECT.store(on, Ordering::Release);
+    REMAP_RANGE_GATE.store(std::env::var("DS_REMAP_RANGE_GATE").ok().as_deref() != Some("0"), Ordering::Release);
+    crate::info!("Linux signal readers during remaps: {}", if REMAP_RANGE_GATE.load(Ordering::Relaxed) { "admitted outside the remap's range" } else { "all wait (DS_REMAP_RANGE_GATE=0)" });
     crate::info!("Linux resident direct write-fault recovery: {on} (section tracking only)");
     crate::info!("Linux resident volatile backoff: {backoff} (false: exact dirty tracking; true: legacy 32..1024-frame cooldown)");
 }
@@ -452,6 +454,48 @@ pub fn signal_admit() -> bool {
     let gate = LINUX_REMAP.load(Ordering::Acquire);
     gate & LINUX_WRITER == 0 && LINUX_REMAP.compare_exchange(gate, gate + 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
 }
+
+/// `signal_admit` for a reader of page `page` alone: admitted during a remap too, when the
+/// page lies outside the range the remap changes (`remap_guard_for`). The reader counts as
+/// admitted before it reads the range, so a remap that publishes its range later waits for
+/// it; a range read while a later remap replaces it belongs to one that has not begun its
+/// change (it is still waiting for this reader). Pair with `signal_leave`.
+#[cfg(target_os = "linux")]
+pub fn signal_admit_page(page: u64) -> bool {
+    if !REMAP_RANGE_GATE.load(Ordering::Relaxed) {
+        return signal_admit();
+    }
+    let mut gate = LINUX_REMAP.load(Ordering::Acquire);
+    loop {
+        match LINUX_REMAP.compare_exchange_weak(gate, gate + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(g) => gate = g,
+        }
+    }
+    if gate & LINUX_WRITER == 0 {
+        return true;
+    }
+    let (lo, hi) = (REMAP_LO.load(Ordering::Acquire), REMAP_HI.load(Ordering::Acquire));
+    if page.saturating_add(PAGE) > lo && page < hi {
+        LINUX_REMAP.fetch_sub(1, Ordering::Release);
+        return false;
+    }
+    REMAP_OUTSIDE.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// The range the remap holding (or taking) `remap_guard` changes; the whole space for one
+/// that names none.
+#[cfg(target_os = "linux")]
+static REMAP_LO: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static REMAP_HI: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Signal readers admitted during a remap, their page outside its range.
+#[cfg(target_os = "linux")]
+pub static REMAP_OUTSIDE: AtomicU64 = AtomicU64::new(0);
+/// `DS_REMAP_RANGE_GATE=0`: every signal reader waits out every remap (the old gate).
+#[cfg(target_os = "linux")]
+pub static REMAP_RANGE_GATE: AtomicBool = AtomicBool::new(true);
 
 #[cfg(target_os = "linux")]
 pub fn signal_leave() {
@@ -1090,7 +1134,8 @@ pub struct RemapGuard {
 #[cfg(target_os = "linux")]
 impl Drop for RemapGuard {
     fn drop(&mut self) {
-        LINUX_REMAP.store(0, Ordering::Release);
+        // (Readers of pages outside the range may still be in: only the writer bit goes.)
+        LINUX_REMAP.fetch_and(!LINUX_WRITER, Ordering::AcqRel);
         // Every take and check waits while this is held (`arm_guard`): a long hold is a
         // hitch on all of them at once (2026-11-26: four gfx workers' one-page checks
         // at 107-108 ms together, after mapping changes).
@@ -1116,9 +1161,30 @@ pub static REMAP_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 #[cfg(target_os = "linux")]
 #[track_caller]
 pub fn remap_guard() -> RemapGuard {
-    let at = std::panic::Location::caller();
+    remap_guard_at(0, u64::MAX, std::panic::Location::caller())
+}
+
+/// `remap_guard` for a change of [base, base+len) alone: signal readers of other pages go on.
+#[cfg(target_os = "linux")]
+#[track_caller]
+pub fn remap_guard_for(base: u64, len: u64) -> RemapGuard {
+    let lo = base & !(PAGE - 1);
+    remap_guard_at(lo, base.saturating_add(len).saturating_add(PAGE - 1) & !(PAGE - 1), std::panic::Location::caller())
+}
+
+#[cfg(windows)]
+pub fn remap_guard_for(_base: u64, _len: u64) -> parking_lot::RwLockWriteGuard<'static, ()> {
+    ARM_LOCK.write()
+}
+
+#[cfg(target_os = "linux")]
+fn remap_guard_at(lo: u64, hi: u64, at: &'static std::panic::Location<'static>) -> RemapGuard {
     let t = std::time::Instant::now();
     let lock = ARM_LOCK.write();
+    // (Published before the writer bit: a reader that sees the bit reads this range or a
+    // later remap's, `signal_admit_page`.)
+    REMAP_LO.store(lo, Ordering::Release);
+    REMAP_HI.store(hi, Ordering::Release);
     // Only one writer holds ARM_LOCK. Stop admitting signal readers, then wait for the
     // at most one syscall each already admitted reader performs.
     LINUX_REMAP.fetch_or(LINUX_WRITER, Ordering::AcqRel);

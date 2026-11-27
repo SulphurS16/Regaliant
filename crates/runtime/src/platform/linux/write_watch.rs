@@ -467,7 +467,57 @@ fn arming_check(a: u64, pages: u64) -> Result<(), String> {
     }
     if (0..8u64).any(|i| crate::hosted::armed(a + i*PAGE)) { return Err("arming: pages still armed after the I/O preparation".into()); }
     drain(&mut faults)?;
-    // 4. Cost: arm all, one write per page, timed.
+    // 4. Remaps and armed writes at once. Outside the faulting pages' range the handler
+    // answers them during the remap; inside it they wait for the remap's end (the service).
+    if pages >= 512 {
+        crate::hosted::disarm(a, size);
+        let half = 256*PAGE;
+        let outside0 = crate::gpu::resident::REMAP_OUTSIDE.load(std::sync::atomic::Ordering::Relaxed);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        for round in 0..20u64 {
+            crate::hosted::arm(a, half)?;
+            std::thread::scope(|sc| {
+                let stop = &stop;
+                sc.spawn(move || while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let _g = crate::gpu::resident::remap_guard_for(a + half, half);
+                    unsafe { libc::mprotect((a + half) as _, half as usize, libc::PROT_READ | libc::PROT_WRITE) };
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                });
+                let writers: Vec<_> = (0..4u64).map(|t| sc.spawn(move || for i in (t..256).step_by(4) {
+                    unsafe { std::ptr::write_volatile((a + i*PAGE + 16) as *mut u64, round*1000 + i); }
+                })).collect();
+                for w in writers { let _ = w.join(); }
+                stop.store(true, std::sync::atomic::Ordering::Release);
+            });
+            stop.store(false, std::sync::atomic::Ordering::Release);
+            for i in 0..256u64 {
+                if unsafe { std::ptr::read_volatile((a + i*PAGE + 16) as *const u64) } != round*1000 + i { return Err(format!("arming: write during remaps lost (round {round}, page {i})")); }
+            }
+            let got = drain(&mut faults)?;
+            if got.len() != 256 { return Err(format!("arming: {} faults posted during remaps, expected 256", got.len())); }
+        }
+        let outside = crate::gpu::resident::REMAP_OUTSIDE.load(std::sync::atomic::Ordering::Relaxed) - outside0;
+        // Inside: the write waits until the remap of its own page ends.
+        crate::hosted::arm(a + half, PAGE)?;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let waited = std::thread::scope(|sc| {
+            let g = crate::gpu::resident::remap_guard_for(a + half, PAGE);
+            let done = &done;
+            sc.spawn(move || { unsafe { std::ptr::write_volatile((a + half) as *mut u64, 42); } done.store(true, std::sync::atomic::Ordering::Release); });
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let early = done.load(std::sync::atomic::Ordering::Acquire);
+            drop(g);
+            !early
+        });
+        if !waited { return Err("arming: a write inside a remap's range went on during it".into()); }
+        if unsafe { std::ptr::read_volatile((a + half) as *const u64) } != 42 { return Err("arming: write after the remap lost".into()); }
+        if drain(&mut faults)? != vec![a + half] { return Err("arming: the write inside the remap's range was not posted once".into()); }
+        if crate::gpu::resident::REMAP_RANGE_GATE.load(std::sync::atomic::Ordering::Relaxed) && outside == 0 {
+            return Err("arming: no fault was answered during a remap outside its range".into());
+        }
+        println!("arming check: remaps beside armed writes: {outside} faults answered during remaps outside their range");
+    }
+    // 4b. Cost: arm all, one write per page, timed.
     crate::hosted::disarm(a, size);
     let t = std::time::Instant::now();
     crate::hosted::arm(a, size)?;
