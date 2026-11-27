@@ -142,7 +142,16 @@ pub fn import(from: &Path, saves: &Path, title: &str, stamp: &str) -> Report {
         let dst = base.join(&name);
         let had = dst.is_dir();
         if had {
-            let keep = saves.parent().unwrap_or(saves).join("save-backups").join(USER).join(title).join(&name).join(format!("{stamp}-before-import"));
+            // (A folder of its own: two imports within the same second, two misplaced folders
+            // holding the same save at one start, wrote the second backup over the first, the
+            // player's own save then nowhere: the review of 2026-11-27.)
+            let dir = saves.parent().unwrap_or(saves).join("save-backups").join(USER).join(title).join(&name);
+            let mut keep = dir.join(format!("{stamp}-before-import"));
+            let mut k = 2;
+            while keep.exists() {
+                keep = dir.join(format!("{stamp}-before-import-{k}"));
+                k += 1;
+            }
             if let Err(e) = copy_tree(&dst, &keep) {
                 r.notes.push(format!("keeping {} failed ({e}): {name} not imported", dst.display()));
                 continue;
@@ -194,10 +203,16 @@ pub fn import(from: &Path, saves: &Path, title: &str, stamp: &str) -> Report {
 /// (another program's `_SaveData`, a title's folder without the user folder above it, save
 /// folders themselves): what a player copied there by hand. The port's own (`<USER>\<title>`), other
 /// users' folders and folders an import renamed are left alone.
+/// The file a misplaced folder gets when it was imported but could not be renamed
+/// (`misplaced` passes it over).
+pub const IMPORTED_MARK: &str = "imported-by-regaliant.txt";
+
 pub fn misplaced(saves: &Path, title: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let is_user = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     let skip = |n: &str| n.starts_with('.') || n.contains(" (imported ");
+    // (Marked when it could not be renamed after its import: not again at every start.)
+    let marked = |p: &Path| p.join(IMPORTED_MARK).is_file();
     let holds = |p: &Path| {
         let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
         (save_name(&name).is_some() && p.join("USR-DATA").is_file()) || !find(p).is_empty()
@@ -212,11 +227,11 @@ pub fn misplaced(saves: &Path, title: &str) -> Vec<PathBuf> {
         if n == USER {
             for u in std::fs::read_dir(&p).into_iter().flatten().flatten() {
                 let un = u.file_name().to_string_lossy().to_string();
-                if u.path().is_dir() && un != title && !skip(&un) && holds(&u.path()) {
+                if u.path().is_dir() && un != title && !skip(&un) && !marked(&u.path()) && holds(&u.path()) {
                     out.push(u.path());
                 }
             }
-        } else if !is_user(&n) && holds(&p) {
+        } else if !is_user(&n) && !marked(&p) && holds(&p) {
             out.push(p);
         }
     }
@@ -335,6 +350,39 @@ mod tests {
         let m = misplaced(&saves, "PPSA01341");
         let names: Vec<String> = m.iter().map(|p| p.strip_prefix(&saves).unwrap().display().to_string()).collect();
         assert_eq!(names, vec![format!("1{}PPSA01342", std::path::MAIN_SEPARATOR), "PPSA01342".to_string(), "_SaveData".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn two_imports_in_one_second_keep_both_backups() {
+        // (The review of 2026-11-27: the second backup wrote over the first, the player's own save
+        // then nowhere.)
+        let base = tmp("twice");
+        let saves = base.join("saves");
+        let cur = saves.join(USER).join("PPSA01341").join("SAVEDATA0PlayerProfile0");
+        save(&cur, "the player's own");
+        let a = base.join("a");
+        save(&a.join("PPSA01341").join("SAVEDATA0PlayerProfile0"), "first import");
+        let b = base.join("b");
+        save(&b.join("PPSA01341").join("SAVEDATA0PlayerProfile0"), "second import");
+        let r1 = import(&a, &saves, "PPSA01341", "20261127-080000");
+        let r2 = import(&b, &saves, "PPSA01341", "20261127-080000");
+        assert_eq!((r1.kept.len(), r2.kept.len()), (1, 1));
+        assert_ne!(r1.kept[0], r2.kept[0]);
+        assert_eq!(std::fs::read_to_string(r1.kept[0].join("USR-DATA")).unwrap(), "the player's own");
+        assert_eq!(std::fs::read_to_string(r2.kept[0].join("USR-DATA")).unwrap(), "first import");
+        assert_eq!(std::fs::read_to_string(cur.join("USR-DATA")).unwrap(), "second import");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_marked_folder_is_not_found_again() {
+        let base = tmp("marked");
+        let saves = base.join("saves");
+        save(&saves.join("_SaveData").join("PPSA01341").join("SAVEDATA0PlayerProfile0"), "emu");
+        assert_eq!(misplaced(&saves, "PPSA01341").len(), 1);
+        std::fs::write(saves.join("_SaveData").join(IMPORTED_MARK), "imported").unwrap();
+        assert!(misplaced(&saves, "PPSA01341").is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 

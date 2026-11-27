@@ -100,7 +100,8 @@ pub fn picture(frame_h: u32, hdr: bool) -> Option<Arc<Picture>> {
 
 /// The frame rate over the last second, and the 1% and 0.1% lows over the flips kept.
 fn rates(now: u64) -> Option<(f64, f64, f64)> {
-    let q = FLIPS.lock();
+    // (Copied: the flip thread takes this lock at every flip, the sorting is done outside it.)
+    let q: Vec<u64> = FLIPS.lock().iter().copied().collect();
     if q.len() < 3 {
         return None;
     }
@@ -357,7 +358,8 @@ fn render(lines: &[Line], frame_h: u32) -> (Vec<u8>, u32, u32) {
         };
         let (pad, pitch) = (px(9.0), px(25.0));
         let widest = lines.iter().map(|l| l.iter().map(|(t, _)| width_of(t)).sum::<i32>()).max().unwrap_or(0);
-        let (w, h) = ((widest + 2 * pad).max(1) as u32, (lines.len() as i32 * pitch + 2 * pad - px(4.0)).max(1) as u32);
+        // (The width in steps of 64 pixels: a new width makes the presenter's image again.)
+        let (w, h) = (((widest + 2 * pad).max(1) as u32).div_ceil(64) * 64, (lines.len() as i32 * pitch + 2 * pad - px(4.0)).max(1) as u32);
         let mut out = vec![0u8; (w * h * 4) as usize];
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;

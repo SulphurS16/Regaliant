@@ -3249,7 +3249,9 @@ impl Exec {
                         e.2.image_layout = vk::ImageLayout::GENERAL;
                         n += 1;
                     }
-                    if let Some((r, o)) = self.up_consts {
+                    // (Its size constants only with its view swapped: else it reads the title's
+                    // composite, at the render size.)
+                    if let Some((r, o)) = self.up_consts.filter(|_| n > 0) {
                         let patched = patch_size_consts(&mut p.sgpr_data, r, o);
                         if super::super::upcomp::READ.fetch_add(1, Ordering::Relaxed) == 0 {
                             crate::info!("upscaler: the output pass reads the composite at {}x{} ({n} view(s) swapped, {patched} size constant block(s) given for it)", o.0, o.1);

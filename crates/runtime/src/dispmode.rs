@@ -406,6 +406,10 @@ fn effective_size() -> u64 {
     (w as u64) << 32 | h as u64
 }
 
+/// The upscaler's output size asked for and the ticks it has held (`tick`).
+static OUT_PENDING: AtomicU64 = AtomicU64::new(0);
+static OUT_TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn tick() {
     apply_aspect();
     // (The textures' bias for the upscaler's ratio, from the sizes in effect.)
@@ -432,8 +436,18 @@ pub fn tick() {
         let (ow, oh) = output_size();
         let (uw, uh) = (uw.min(ow), uh.min(oh));
         let out = (uw as u64) << 32 | uh as u64;
-        if UPSCALE_OUT.swap(out, Ordering::Relaxed) != out {
-            crate::info!("upscaler: output {uw}x{uh} for the screen, render {rw}x{rh} (Upscaling at {:.2}x)", UPSCALE_FACTOR.load(Ordering::Relaxed) as f32 / 100.0);
+        // (A new output size once it held 20 ticks, as the render size: a window's edge dragged
+        // gave every frame another one, each a new upscaler context and new images; the review
+        // of 2026-11-27.)
+        let cur = UPSCALE_OUT.load(Ordering::Relaxed);
+        if out != cur {
+            if OUT_PENDING.swap(out, Ordering::Relaxed) != out {
+                OUT_TICKS.store(0, Ordering::Relaxed);
+            }
+            if cur == 0 || OUT_TICKS.fetch_add(1, Ordering::Relaxed) >= 20 {
+                UPSCALE_OUT.store(out, Ordering::Relaxed);
+                crate::info!("upscaler: output {uw}x{uh} for the screen, render {rw}x{rh} (Upscaling at {:.2}x)", UPSCALE_FACTOR.load(Ordering::Relaxed) as f32 / 100.0);
+            }
         }
         // (The title's own size needs no pulse while the port holds none.)
         let title = TITLE_MODE.load(Ordering::Relaxed);

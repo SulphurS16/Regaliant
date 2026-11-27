@@ -414,6 +414,9 @@ fn vblank_thread() {
         }
         if let Some(n) = flipped {
             crate::gpu::timeline::flipped(n as u64);
+            // (The upscalers' contexts of earlier sizes or of one no longer chosen, issue #26:
+            // outside the display's lock, which the completion thread needs.)
+            crate::gpu::upscale::free_retired();
         }
         if let Some(b) = show {
             let (n, attr) = PORT.lock().as_ref().map(|p| (p.count, p.sets.get(b.set as usize).copied().flatten())).unwrap_or((0, None));

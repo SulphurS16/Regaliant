@@ -94,7 +94,12 @@ pub fn start(paths: &dsconfig::paths::Paths, title: &str) -> PathBuf {
             let to = m.with_file_name(format!("{} (imported {stamp})", m.file_name().unwrap_or_default().to_string_lossy()));
             match std::fs::rename(&m, &to) {
                 Ok(()) => crate::info!("saves: {} renamed to {}", m.display(), to.display()),
-                Err(e) => crate::warn!("saves: renaming {} failed: {e}", m.display()),
+                Err(e) => {
+                    // (Else it is imported again at every start, over the progress made since:
+                    // the review of 2026-11-27.)
+                    let marked = std::fs::write(m.join(dsconfig::saves::IMPORTED_MARK), format!("imported {stamp}\n")).is_ok();
+                    crate::warn!("saves: renaming {} failed: {e}; {}", m.display(), if marked { "marked as imported instead" } else { "it could not be marked either: it is imported again at the next start" });
+                }
             }
         }
     }

@@ -902,6 +902,13 @@ fn hand_over(app: &mut App) {
                 let handles: [HANDLE; 2] = [ev as HANDLE, child.as_raw_handle() as HANDLE];
                 let r = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, START_WAIT_MS) };
                 unsafe { CloseHandle(ev as HANDLE) };
+                // (Not up in time: ended before the earlier version's files go back under it,
+                // which it could be reading or moving meanwhile; the review of 2026-11-27.)
+                let mut child = child;
+                if r != WAIT_OBJECT_0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
                 drop(child);
                 unsafe { PostMessageW(hwnd as HWND, WM_STARTED, (r == WAIT_OBJECT_0) as usize, 0) };
             });

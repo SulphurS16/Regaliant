@@ -1113,7 +1113,11 @@ pub fn run_host() -> ! {
                     if e.dwFirstChance == 0 && fatal.is_none() {
                         fatal = Some(describe_fatal(pi.hProcess, ev.dwThreadId, &rec, &modules));
                     }
-                    last_passed = Some((exc, addr, rec.ExceptionAddress as u64, ev.dwThreadId, rec.ExceptionInformation[0] as u64, std::time::Instant::now()));
+                    // (Only an exception that can end a process: not a C++ exception, a thread's
+                    // name or a debug string the game handles itself.)
+                    if exc >= 0xC000_0000 || exc == 0x8000_0003 {
+                        last_passed = Some((exc, addr, rec.ExceptionAddress as u64, ev.dwThreadId, rec.ExceptionInformation[0] as u64, std::time::Instant::now()));
+                    }
                     let k = s.passed.fetch_add(1, Ordering::Relaxed) as usize;
                     if k < PASSED_LOG {
                         let l = &s.passed_log[k];
