@@ -26,6 +26,21 @@ segments work in folders or archives; encrypted or compressed SELF segments are 
 NVIDIA is preferred when several GPUs are available. SDL selects Wayland or X11;
 `SDL_VIDEO_DRIVER=wayland` or `SDL_VIDEO_DRIVER=x11` selects one explicitly.
 
+### Before the first start
+
+- **Open files.** The game opens many files at once; with the common soft limit of 1024 it
+  dies opening `.cani` files. Raise it in the shell that starts dsport: `ulimit -n 524288`
+  (check with `ulimit -n`; some distributions already default to 524288). If the hard limit
+  is lower, raise `nofile` in `/etc/security/limits.conf` or `DefaultLimitNOFILE` in systemd's
+  `system.conf`.
+- **SDL3 link.** The build links against `libSDL3.so`. Distributions that ship only
+  `libSDL3.so.0` in the runtime package put the unversioned link in the development package
+  (Ubuntu/Debian: `libsdl3-dev`; Arch's `sdl3` includes it). Install that rather than making
+  the link by hand.
+- **Memory overcommit.** One RADV system needed `sudo sysctl vm.overcommit_memory=1` (the
+  NVIDIA test machine runs with the default, 0). If start-up fails with allocation or mapping
+  errors, try it; what fails without it is not known yet.
+
 On first start, select a language, adjust brightness, choose Continue Offline, and create a
 character. Shaders compile as new scenes and effects appear, so initial visits can stutter.
 Preparation can compile those shaders before playing; its duration depends on hardware and
