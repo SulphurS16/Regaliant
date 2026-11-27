@@ -1351,23 +1351,29 @@ fn mixed_views_make(addr: u64, size: u64, phys: u64, prot: u32) -> u64 {
         }
         let off = phys + (w - addr);
         mapped_over_gpu_writes(w, win, true, off);
+        // (The alias first, outside the guard, as in `section_commit`.)
+        let slot = match sec::map_alias(w, win, Sec::Dmem, off) {
+            Ok(slot) => slot,
+            Err(e) => {
+                crate::warn!("mem: the mixed range's view at {w:#x}: {e} (the window stays private)");
+                w += win;
+                continue;
+            }
+        };
         let _arm = crate::gpu::resident::remap_guard_for(w, win);
         match sec::map_new_view(w, win, Sec::Dmem, off, win_prot(prot)) {
-            Ok(()) => match sec::map_alias(w, win, Sec::Dmem, off) {
-                Ok(slot) => {
-                    VIEW_SLOTS.lock().insert(w, slot);
-                    VIEWS_ON.store(true, Ordering::Release);
-                    set_view(w, true);
-                    crate::gpu::resident::settled(w, win);
-                    VIEW_STATS[0].fetch_add(1, Ordering::Relaxed);
-                    made += 1;
-                }
-                Err(e) => {
-                    crate::warn!("mem: the mixed range's view at {w:#x}: {e} (the window stays private)");
-                    let _ = sec::unmap_view(w);
-                }
-            },
-            Err(e) => crate::warn!("mem: the mixed range's view at {w:#x}: {e} (the window stays private)"),
+            Ok(()) => {
+                VIEW_SLOTS.lock().insert(w, slot);
+                VIEWS_ON.store(true, Ordering::Release);
+                set_view(w, true);
+                crate::gpu::resident::settled(w, win);
+                VIEW_STATS[0].fetch_add(1, Ordering::Relaxed);
+                made += 1;
+            }
+            Err(e) => {
+                crate::warn!("mem: the mixed range's view at {w:#x}: {e} (the window stays private)");
+                sec::alias_unref(w, win, slot, |_, _| false);
+            }
         }
         w += win;
     }
@@ -2577,31 +2583,39 @@ fn section_commit(addr: u64, size: u64, kind: VmaKind, prot: u32, phys: u64) -> 
     repaged(addr, size);
     let (which, off) = if kind == VmaKind::Direct { (Sec::Dmem, phys) } else { (Sec::Anon, sec::anon_alloc(size).ok_or(MemError::NoSpace)?) };
     mapped_over_gpu_writes(addr, size, which == Sec::Dmem, off);
+    // The alias first, outside the mapping guard: it maps the same section bytes at another
+    // address, which no take, check or arming covers, and nothing uses it before this
+    // returns its slot. (Under the guard its mmap held every reader of the range 3-12 ms
+    // more, waiting for the kernel's mm lock.)
+    let t = std::time::Instant::now();
+    let alias = sec::map_alias(addr, size, which, off);
+    let alias_us = t.elapsed().as_micros();
     let _arm = crate::gpu::resident::remap_guard_for(addr, size);
     let t0 = std::time::Instant::now();
     let z0 = sec::zeroed_bytes();
     if let Err(e) = sec::map_new_view(addr, size, which, off, win_prot(prot)) {
         crate::warn!("mem: {e}");
+        if let Ok(slot) = alias {
+            sec::alias_unref(addr, size, slot, |_, _| false);
+        }
         if which == Sec::Anon {
             sec::anon_free(off, size);
         }
         return Err(MemError::HostFailure(0));
     }
     let t1 = std::time::Instant::now();
-    let view_phases = sec::VIEW_PHASES.with(|p| p.get());
-    let slots = match sec::map_alias(addr, size, which, off) {
+    let [iso, map, zero, protect] = sec::VIEW_PHASES.with(|p| p.get());
+    let slots = match alias {
         Ok(s) => 1u8 << s,
         Err(e) => {
             crate::warn!("mem: {e} (the GPU cannot import it)");
             0
         }
     };
-    let t2 = std::time::Instant::now();
     crate::gpu::resident::settled(addr, size);
     let total = t0.elapsed();
     if total.as_micros() >= 5_000 && COMMIT_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-        let [iso, map, zero, protect] = view_phases;
-        crate::info!("section commit {addr:#x}+{size:#x}: {} us under the mapping guard (view {} us: isolate {iso}, map {map}, zero {zero} for {} bytes, protect {protect}; alias {} us; settling {} us)", total.as_micros(), (t1 - t0).as_micros(), sec::zeroed_bytes() - z0, (t2 - t1).as_micros(), t2.elapsed().as_micros());
+        crate::info!("section commit {addr:#x}+{size:#x}: {} us under the mapping guard (view {} us: isolate {iso}, map {map}, zero {zero} for {} bytes, protect {protect}; settling {} us; the alias before it {alias_us} us)", total.as_micros(), (t1 - t0).as_micros(), sec::zeroed_bytes() - z0, t1.elapsed().as_micros());
     }
     Ok((slots, if which == Sec::Anon { off } else { 0 }))
 }
