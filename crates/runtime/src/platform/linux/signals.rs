@@ -92,7 +92,7 @@ unsafe extern "C" fn handler(signal: i32, info: *mut libc::siginfo_t, context: *
     if signal == libc::SIGSEGV && !info.is_null() && !context.is_null() {
         let uc = unsafe { &*(context as *const libc::ucontext_t) };
         let error = uc.uc_mcontext.gregs[libc::REG_ERR as usize] as u64;
-        // An armed page (`hosted`, on unless `DS_LINUX_ARMING=0`): a data access (an armed page never
+        // An armed page (`hosted`, `DS_LINUX_ARMING=1`): a data access (an armed page never
         // touched yet faults as not present, so the present bit is not asked for).
         if error & (16 | 32 | 64) == 0
             && crate::hosted::linux_fault(unsafe { (*info).si_addr() } as u64, error & 2 != 0, uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64)

@@ -1,4 +1,5 @@
-//! Page arming on Linux, in-process (on by default; `DS_LINUX_ARMING=0` turns it off).
+//! Page arming on Linux, in-process (`DS_LINUX_ARMING=1`; off by default: texture flicker at
+//! level start with it on, 2026-11-26).
 //!
 //! Windows arms guest pages through a debugger-host process: a fault handled inside the process
 //! overwrites the 128 bytes below the faulting thread's stack pointer, where the title's leaf
@@ -73,7 +74,7 @@ static ARM: ReentrantMutex<()> = ReentrantMutex::new(());
 
 fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DS_LINUX_ARMING").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| std::env::var("DS_LINUX_ARMING").ok().as_deref() == Some("1"))
 }
 
 /// Whether pages are armed (front end 2 then arms, and its checks pass armed pages).
@@ -192,7 +193,7 @@ pub fn arm_noaccess(base: u64, len: u64) -> Result<(), String> {
 
 fn arm_as(base: u64, len: u64, prot: i32) -> Result<(), String> {
     if !on() {
-        return Err("Linux page arming is off (DS_LINUX_ARMING=0)".into());
+        return Err("Linux page arming is off (DS_LINUX_ARMING=1 turns it on)".into());
     }
     let _lock = arm_lock();
     let (lo, hi) = (base & !(PAGE - 1), base.saturating_add(len).next_multiple_of(PAGE));
@@ -484,7 +485,7 @@ pub fn faults() -> u64 {
 
 pub fn status() -> String {
     if !on() {
-        return "Linux page arming off (DS_LINUX_ARMING=0)".into();
+        return "Linux page arming off (DS_LINUX_ARMING=1 turns it on)".into();
     }
     let s = |i: usize| STATS[i].load(Ordering::Relaxed);
     format!(
