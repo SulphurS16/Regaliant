@@ -67,6 +67,7 @@ mod active;
 mod alu;
 pub mod gs;
 mod mem;
+pub mod native;
 
 use crate::analysis::{Plan, ResKind};
 use crate::{Enc, Inst};

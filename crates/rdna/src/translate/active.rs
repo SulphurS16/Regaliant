@@ -192,6 +192,13 @@ fn step(st: &mut State, ins: &Inst, wide_waves: bool, sg: &Appends) -> bool {
                 st[OP_EXEC_HI as usize] = ZERO;
                 return true;
             }
+            // (A constant lane mask sliced at each lane, `native::exec_constant_slice`: this
+            // lane's bit not known after it.)
+            if super::native::slices_exec_constant(ins) {
+                st[OP_EXEC_LO as usize] = V { b0: Tri::U, rest: Tri::Z };
+                st[OP_EXEC_HI as usize] = ZERO;
+                return true;
+            }
             match name {
                 "s_mov_b32" => set(st, d, slo),
                 "s_mov_b64" => {

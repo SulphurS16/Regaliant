@@ -404,6 +404,10 @@ fn sop1(tr: &mut T, ins: &Inst, name: &str) -> R<()> {
         }
         return Ok(());
     }
+    // (Per lane, a constant lane mask moved into EXEC: this lane's bit of it, `native::exec_constant_slice`.)
+    if super::native::exec_constant_slice(tr, ins, name)? {
+        return Ok(());
+    }
     match name {
         "s_mov_b32" => {
             let v = tr.operand(ins, s)?;
